@@ -1,6 +1,8 @@
 defmodule BedrockJobQueue.MixProject do
   use Mix.Project
 
+  @source_url "https://github.com/bedrock-kv/job_queue"
+
   def project do
     [
       app: :bedrock_job_queue,
@@ -10,6 +12,7 @@ defmodule BedrockJobQueue.MixProject do
       deps: deps(),
       description: description(),
       package: package(),
+      docs: docs(),
       elixirc_paths: elixirc_paths(Mix.env()),
       dialyzer: dialyzer(),
       aliases: aliases(),
@@ -65,12 +68,44 @@ defmodule BedrockJobQueue.MixProject do
     "Durable job queue for Bedrock - transactional, priority-ordered job processing modeled after Apple's QuiCK."
   end
 
+  defp docs do
+    [
+      main: "Bedrock.JobQueue",
+      source_url: @source_url,
+      extras: [
+        "README.md": [title: "Overview"],
+        "CHANGELOG.md": [title: "Changelog"],
+        "livebooks/coffee_shop.livemd": [title: "Tutorial: Coffee Shop"]
+      ],
+      groups_for_modules: [
+        Core: [
+          Bedrock.JobQueue,
+          Bedrock.JobQueue.Job,
+          Bedrock.JobQueue.Supervisor
+        ],
+        Consumer: [
+          Bedrock.JobQueue.Consumer,
+          Bedrock.JobQueue.Consumer.Manager,
+          Bedrock.JobQueue.Consumer.Scanner,
+          Bedrock.JobQueue.Consumer.Worker
+        ],
+        Storage: [
+          Bedrock.JobQueue.Store,
+          Bedrock.JobQueue.Item,
+          Bedrock.JobQueue.Lease,
+          Bedrock.JobQueue.Payload
+        ]
+      ]
+    ]
+  end
+
   defp package do
     [
       name: "bedrock_job_queue",
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/bedrock-kv/job_queue"},
-      maintainers: ["Jason Allum"]
+      links: %{"GitHub" => @source_url},
+      maintainers: ["Jason Allum"],
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md livebooks)
     ]
   end
 

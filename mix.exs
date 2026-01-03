@@ -75,6 +75,7 @@ defmodule BedrockJobQueue.MixProject do
       extras: [
         "README.md": [title: "Overview"],
         "CHANGELOG.md": [title: "Changelog"],
+        "LICENSE": [title: "License"],
         "livebooks/coffee_shop.livemd": [title: "Tutorial: Coffee Shop"]
       ],
       groups_for_modules: [

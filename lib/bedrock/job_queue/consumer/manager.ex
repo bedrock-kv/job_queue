@@ -18,7 +18,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   - `:lease_duration` - Item lease duration in ms (default: 30_000)
   - `:queue_lease_duration` - Queue lease duration in ms (default: 5_000)
   - `:holder_id` - Unique identifier for this consumer (default: random bytes)
-  - `:backoff_fn` - Retry backoff function (default: `Config.default_backoff/1`)
+  - `:backoff_fn` - Retry backoff function (default: `Bedrock.JobQueue.Config.default_backoff/1`)
 
   ## Message Protocol
 

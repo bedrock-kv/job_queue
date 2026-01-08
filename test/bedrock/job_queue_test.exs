@@ -44,6 +44,23 @@ defmodule Bedrock.JobQueueTest do
       refute Item.leased?(item)
     end
 
+    test "leased? returns true when lease is active" do
+      now = 10_000
+      item = %{Item.new("tenant_1", "test", %{}) | lease_id: "lease_123", lease_expires_at: 20_000}
+      assert Item.leased?(item, now: now)
+    end
+
+    test "leased? returns false when lease has expired" do
+      now = 30_000
+      item = %{Item.new("tenant_1", "test", %{}) | lease_id: "lease_123", lease_expires_at: 20_000}
+      refute Item.leased?(item, now: now)
+    end
+
+    test "leased? returns false for invalid state (lease_id but no expires_at)" do
+      item = %{Item.new("tenant_1", "test", %{}) | lease_id: "lease_123", lease_expires_at: nil}
+      refute Item.leased?(item)
+    end
+
     test "exhausted? returns true when error_count >= max_retries" do
       item = %{Item.new("tenant_1", "test", %{}) | error_count: 3}
       assert Item.exhausted?(item)

@@ -40,7 +40,6 @@ defmodule Bedrock.JobQueue do
 
       children = [
         MyApp.Cluster,
-        MyApp.Repo,
         {MyApp.JobQueue, concurrency: 10, batch_size: 5}
       ]
 

@@ -66,7 +66,6 @@ end
 ```elixir
 children = [
   MyApp.Cluster,
-  MyApp.Repo,
   {MyApp.JobQueue, concurrency: 10, batch_size: 5}
 ]
 ```
@@ -74,25 +73,27 @@ children = [
 ### 4. Enqueue jobs
 
 ```elixir
+alias MyApp.JobQueue
+
 # Immediate processing
-MyApp.JobQueue.enqueue("tenant_1", "email:send", %{
+JobQueue.enqueue("tenant_1", "email:send", %{
   to: "user@example.com",
   subject: "Hello",
   body: "Welcome!"
 })
 
 # Schedule for a specific time
-MyApp.JobQueue.enqueue("tenant_1", "email:send", payload,
+JobQueue.enqueue("tenant_1", "email:send", payload,
   at: ~U[2024-01-15 10:00:00Z]
 )
 
 # Delay by duration
-MyApp.JobQueue.enqueue("tenant_1", "cleanup", payload,
+JobQueue.enqueue("tenant_1", "cleanup", payload,
   in: :timer.hours(1)
 )
 
 # With priority (lower = higher priority)
-MyApp.JobQueue.enqueue("tenant_1", "urgent", payload,
+JobQueue.enqueue("tenant_1", "urgent", payload,
   priority: 0
 )
 ```
@@ -102,7 +103,7 @@ MyApp.JobQueue.enqueue("tenant_1", "urgent", payload,
 Jobs can return the following values from `perform/2`:
 
 | Return Value | Behavior |
-|--------------|----------|
+| ------------ | -------- |
 | `:ok` | Job completed successfully |
 | `{:ok, result}` | Job completed with result |
 | `{:error, reason}` | Job failed, will retry with backoff |

@@ -1,7 +1,7 @@
 # Bedrock Job Queue
 
 [![Elixir CI](https://github.com/bedrock-kv/job_queue/actions/workflows/elixir_ci.yaml/badge.svg)](https://github.com/bedrock-kv/job_queue/actions/workflows/elixir_ci.yaml)
-[![Coverage Status](https://coveralls.io/repos/github/bedrock-kv/job_queue/badge.png?branch=main)](https://coveralls.io/github/bedrock-kv/job_queue?branch=main)
+[![Coverage Status](https://coveralls.io/repos/github/bedrock-kv/job_queue/badge.svg?branch=main)](https://coveralls.io/github/bedrock-kv/job_queue?branch=main)
 [![Hex.pm](https://img.shields.io/hexpm/v/bedrock_job_queue.svg)](https://hex.pm/packages/bedrock_job_queue)
 [![Docs](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/bedrock_job_queue)
 

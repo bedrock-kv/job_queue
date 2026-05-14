@@ -84,6 +84,8 @@ defmodule Bedrock.JobQueue do
   - `:otp_app` - The OTP application name (required)
   - `:repo` - The Bedrock Repo module (required)
   - `:workers` - Map of topic strings to job modules (default: %{})
+  - `:on_action` - Optional `{module, function, extra_args}` hook invoked in
+    the same transaction as queue completion/requeue actions
 
   ## Example
 
@@ -104,6 +106,7 @@ defmodule Bedrock.JobQueue do
       @otp_app Keyword.fetch!(unquote(opts), :otp_app)
       @repo Keyword.fetch!(unquote(opts), :repo)
       @workers Keyword.get(unquote(opts), :workers, %{})
+      @action_hook Keyword.get(unquote(opts), :on_action)
 
       @doc """
       Returns a child specification for this JobQueue.
@@ -157,7 +160,8 @@ defmodule Bedrock.JobQueue do
       def stats(queue_id, opts \\ []), do: Internal.stats(__MODULE__, queue_id, opts)
 
       @doc false
-      def __config__, do: %{otp_app: @otp_app, repo: @repo, workers: @workers}
+      def __config__,
+        do: %{otp_app: @otp_app, repo: @repo, workers: @workers, action_hook: @action_hook}
     end
   end
 end

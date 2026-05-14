@@ -37,6 +37,7 @@ defmodule Bedrock.JobQueue.Supervisor do
        repo: config.repo,
        root: root,
        workers: config.workers,
+       action_hook: Keyword.get(opts, :action_hook, Map.get(config, :action_hook)),
        concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
        batch_size: Keyword.get(opts, :batch_size, 10)}
     ]

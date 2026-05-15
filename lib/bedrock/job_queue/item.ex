@@ -91,6 +91,9 @@ defmodule Bedrock.JobQueue.Item do
 
   def visible?(%__MODULE__{vesting_time: vt, lease_id: nil}, now), do: now >= vt
 
+  def visible?(%__MODULE__{vesting_time: vt, lease_expires_at: exp}, now) when not is_nil(exp),
+    do: now >= vt and exp <= now
+
   def visible?(%__MODULE__{}, _now), do: false
 
   @doc """

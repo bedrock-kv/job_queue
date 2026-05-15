@@ -17,12 +17,15 @@ defmodule Bedrock.JobQueue.Supervisor do
 
   - `:concurrency` - Number of concurrent workers (default: System.schedulers_online())
   - `:batch_size` - Items to dequeue per batch (default: 10)
+  - `:scan_interval` - Scanner interval in ms (default: 100)
+  - `:lease_duration` - Item lease duration in ms (default: 30_000)
+  - `:queue_lease_duration` - Queue lease duration in ms (default: 5_000)
+  - `:root` - Optional precomputed queue root keyspace. When omitted, the
+    supervisor initializes the queue directory through Bedrock.
   """
   def start_link(job_queue_module, opts \\ []) do
     config = job_queue_module.__config__()
-
-    # Initialize the directory and cache the keyspace before starting supervisor
-    {:ok, root} = Internal.init_root(config.repo, job_queue_module)
+    root = Keyword.get_lazy(opts, :root, fn -> init_root!(config.repo, job_queue_module) end)
 
     Supervisor.start_link(__MODULE__, {job_queue_module, root, opts}, name: job_queue_module)
   end
@@ -37,10 +40,22 @@ defmodule Bedrock.JobQueue.Supervisor do
        repo: config.repo,
        root: root,
        workers: config.workers,
+       action_hook: Keyword.get(opts, :action_hook, Map.get(config, :action_hook)),
        concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
-       batch_size: Keyword.get(opts, :batch_size, 10)}
+       batch_size: Keyword.get(opts, :batch_size, 10),
+       scan_interval: Keyword.get(opts, :scan_interval, 100),
+       lease_duration: Keyword.get(opts, :lease_duration, 30_000),
+       queue_lease_duration: Keyword.get(opts, :queue_lease_duration, 5_000),
+       backoff_fn: Keyword.get(opts, :backoff_fn, &Bedrock.JobQueue.Config.default_backoff/1),
+       gc_interval: Keyword.get(opts, :gc_interval, 60_000),
+       gc_grace_period: Keyword.get(opts, :gc_grace_period, 60_000)}
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp init_root!(repo, job_queue_module) do
+    {:ok, root} = Internal.init_root(repo, job_queue_module)
+    root
   end
 end

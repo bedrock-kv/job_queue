@@ -9,6 +9,7 @@ defmodule Bedrock.JobQueue.StoreTest do
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
   alias Bedrock.JobQueue.Store
+  alias Bedrock.KeyRange
   alias Bedrock.Keyspace
 
   setup :verify_on_exit!
@@ -17,6 +18,17 @@ defmodule Bedrock.JobQueue.StoreTest do
   setup do
     stub(MockRepo, :transact, fn callback -> callback.() end)
     :ok
+  end
+
+  defmodule RealRepoShape do
+    @moduledoc false
+
+    def __cluster__, do: :test_cluster
+
+    def get_range({start_key, end_key}, opts) when is_binary(start_key) and is_binary(end_key) do
+      send(Process.get({__MODULE__, :test_pid}), {:raw_get_range, start_key, end_key, opts})
+      [{start_key, :erlang.term_to_binary(Process.get({__MODULE__, :item}))}]
+    end
   end
 
   defp root, do: Keyspace.new("job_queue/")
@@ -81,6 +93,24 @@ defmodule Bedrock.JobQueue.StoreTest do
   end
 
   describe "peek/4 priority ordering" do
+    test "scans raw key ranges for real Bedrock repos" do
+      item = Item.new("tenant_1", "topic", %{}, priority: 10, vesting_time: 1_000)
+
+      Process.put({RealRepoShape, :test_pid}, self())
+      Process.put({RealRepoShape, :item}, item)
+
+      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
+      prefix = Keyspace.prefix(keyspaces.items)
+
+      assert [^item] = Store.peek(RealRepoShape, root(), "tenant_1", limit: 2, now: 2_000)
+      assert_received {:raw_get_range, start_key, end_key, opts}
+      assert {start_key, end_key} == KeyRange.from_prefix(prefix)
+      assert opts[:limit] == 20
+
+      Process.delete({RealRepoShape, :test_pid})
+      Process.delete({RealRepoShape, :item})
+    end
+
     test "returns items in priority order (lowest number first)" do
       # Create items with different priorities
       high_priority = Item.new("tenant_1", "topic", %{}, priority: 10, vesting_time: 1000)
@@ -151,6 +181,18 @@ defmodule Bedrock.JobQueue.StoreTest do
       item = %{Item.new("queue", "topic", %{}, vesting_time: 9_000) | lease_id: <<1, 2, 3>>}
 
       refute Item.visible?(item, now)
+    end
+
+    test "items with expired leases are visible for recovery" do
+      now = 10_000
+
+      item = %{
+        Item.new("queue", "topic", %{}, vesting_time: 9_000)
+        | lease_id: <<1, 2, 3>>,
+          lease_expires_at: 9_000
+      }
+
+      assert Item.visible?(item, now)
     end
   end
 

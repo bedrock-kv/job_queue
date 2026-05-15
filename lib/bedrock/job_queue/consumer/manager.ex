@@ -11,6 +11,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   - `:repo` - Required. The Bedrock Repo module
   - `:workers` - Required. Map of topic strings to job modules
   - `:worker_pool` - Required. The Task.Supervisor for spawning job tasks
+  - `:action_hook` - Optional hook invoked inside queue action transactions
   - `:name` - Process name (default: `Bedrock.JobQueue.Consumer.Manager`)
   - `:root` - Root keyspace (default: `Keyspace.new("job_queue/")`)
   - `:concurrency` - Max concurrent workers (default: `System.schedulers_online()`)
@@ -39,6 +40,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
     :repo,
     :root,
     :workers,
+    :action_hook,
     :worker_pool,
     :concurrency,
     :batch_size,
@@ -66,6 +68,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
       repo: Keyword.fetch!(opts, :repo),
       root: Keyword.fetch!(opts, :root),
       workers: Keyword.fetch!(opts, :workers),
+      action_hook: Keyword.get(opts, :action_hook),
       worker_pool: Keyword.fetch!(opts, :worker_pool),
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
       batch_size: Keyword.get(opts, :batch_size, @default_batch_size),
@@ -252,36 +255,70 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   defp handle_worker_result(state, lease, result) do
     case result do
       success when success in [:ok] or (is_tuple(success) and elem(success, 0) == :ok) ->
-        run_job_action(state, lease, :complete)
+        run_job_action(state, lease, :complete, result)
 
       {:error, _reason} ->
-        run_job_action(state, lease, :requeue)
+        run_job_action(state, lease, :requeue, result)
 
       {:discard, reason} ->
         Logger.info(
           "Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}"
         )
 
-        run_job_action(state, lease, :complete)
+        run_job_action(state, lease, :complete, result)
 
       {:snooze, delay_ms} ->
-        run_job_action(state, lease, {:snooze, delay_ms})
+        run_job_action(state, lease, {:snooze, delay_ms}, result)
     end
   end
 
-  defp run_job_action(state, lease, action) do
+  defp run_job_action(state, lease, action, handler_result) do
     state.repo.transact(fn ->
-      case action do
-        :complete ->
-          Store.complete(state.repo, state.root, lease)
+      queue_result =
+        case action do
+          :complete ->
+            Store.complete(state.repo, state.root, lease)
 
-        :requeue ->
-          Store.requeue(state.repo, state.root, lease, backoff_fn: state.backoff_fn)
+          :requeue ->
+            Store.requeue(state.repo, state.root, lease, backoff_fn: state.backoff_fn)
 
-        {:snooze, delay_ms} ->
-          # Snooze uses explicit delay, bypassing backoff_fn
-          Store.requeue(state.repo, state.root, lease, base_delay: delay_ms, max_delay: delay_ms)
+          {:snooze, delay_ms} ->
+            # Snooze uses explicit delay, bypassing backoff_fn
+            Store.requeue(state.repo, state.root, lease, base_delay: delay_ms, max_delay: delay_ms)
+        end
+
+      with :ok <- normalize_queue_result(queue_result),
+           :ok <- run_action_hook(state, lease, action, handler_result, queue_result) do
+        queue_result
+      else
+        {:error, reason} -> state.repo.rollback(reason)
       end
     end)
+  end
+
+  defp normalize_queue_result(:ok), do: :ok
+  defp normalize_queue_result({:ok, _status}), do: :ok
+  defp normalize_queue_result({:error, reason}), do: {:error, reason}
+
+  defp run_action_hook(%{action_hook: nil}, _lease, _action, _handler_result, _queue_result), do: :ok
+
+  defp run_action_hook(state, lease, action, handler_result, queue_result) do
+    hook_args = [state.repo, state.root, lease, action, handler_result, queue_result]
+
+    hook_result =
+      case state.action_hook do
+        {module, function} ->
+          apply(module, function, hook_args)
+
+        {module, function, extra_args} when is_list(extra_args) ->
+          apply(module, function, hook_args ++ extra_args)
+      end
+
+    case hook_result do
+      :ok -> :ok
+      {:ok, _value} -> :ok
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_action_hook_return, other}}
+    end
   end
 end

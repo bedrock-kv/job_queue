@@ -25,11 +25,14 @@ defmodule Bedrock.JobQueue.Consumer do
 
   - `:repo` - Required. The Bedrock Repo module
   - `:workers` - Required. Map of topic strings to job modules
+  - `:action_hook` - Optional hook invoked inside queue action transactions
   - `:name` - Process name (default: `Bedrock.JobQueue.Consumer`)
   - `:root` - Required. Root keyspace (from Directory)
   - `:concurrency` - Number of concurrent workers (default: `System.schedulers_online()`)
   - `:batch_size` - Items to dequeue per batch (default: 10)
   - `:scan_interval` - How often to scan for ready queues in ms (default: 100)
+  - `:lease_duration` - Item lease duration in ms (default: 30_000)
+  - `:queue_lease_duration` - Queue lease duration in ms (default: 5_000)
   - `:backoff_fn` - Retry backoff function (default: `Bedrock.JobQueue.Config.default_backoff/1`)
   - `:gc_interval` - How often to garbage collect stale pointers in ms (default: 60_000)
   - `:gc_grace_period` - Grace period before GC considers pointer stale in ms (default: 60_000)
@@ -62,6 +65,8 @@ defmodule Bedrock.JobQueue.Consumer do
     concurrency = Keyword.get(opts, :concurrency, System.schedulers_online())
     batch_size = Keyword.get(opts, :batch_size, 10)
     scan_interval = Keyword.get(opts, :scan_interval, 100)
+    lease_duration = Keyword.get(opts, :lease_duration, 30_000)
+    queue_lease_duration = Keyword.get(opts, :queue_lease_duration, 5_000)
     backoff_fn = Keyword.get(opts, :backoff_fn, &Config.default_backoff/1)
 
     # Generate unique names for child processes
@@ -81,9 +86,12 @@ defmodule Bedrock.JobQueue.Consumer do
        repo: repo,
        root: root,
        workers: workers,
+       action_hook: Keyword.get(opts, :action_hook),
        worker_pool: pool_name,
        concurrency: concurrency,
        batch_size: batch_size,
+       lease_duration: lease_duration,
+       queue_lease_duration: queue_lease_duration,
        backoff_fn: backoff_fn},
       {Scanner,
        name: scanner_name,

@@ -16,16 +16,37 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   @holder_id <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16>>
 
   defmodule SuccessJob do
+    @moduledoc false
     def perform(_args, _meta), do: :ok
     def timeout, do: 1000
   end
 
+  defmodule ErrorJob do
+    @moduledoc false
+    def perform(_args, _meta), do: {:error, :failed}
+    def timeout, do: 1000
+  end
+
+  defmodule DiscardJob do
+    @moduledoc false
+    def perform(_args, _meta), do: {:discard, :bad_payload}
+    def timeout, do: 1000
+  end
+
+  defmodule SnoozeJob do
+    @moduledoc false
+    def perform(_args, _meta), do: {:snooze, 123}
+    def timeout, do: 1000
+  end
+
   defmodule CrashingJob do
+    @moduledoc false
     def perform(_args, _meta), do: exit(:crash)
     def timeout, do: 1000
   end
 
   defmodule ActionHook do
+    @moduledoc false
     def apply(repo, root, lease, action, handler_result, queue_result, test_pid) do
       send(test_pid, {:action_hook, repo, root, lease.item_id, action, handler_result, queue_result})
       :ok
@@ -33,6 +54,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   end
 
   defmodule FailingActionHook do
+    @moduledoc false
     def apply(_repo, _root, _lease, _action, _handler_result, _queue_result, test_pid) do
       send(test_pid, :failing_action_hook_called)
       {:error, :hook_failed}
@@ -49,6 +71,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
     workers = %{
       "test:success" => SuccessJob,
+      "test:error" => ErrorJob,
+      "test:discard" => DiscardJob,
+      "test:snooze" => SnoozeJob,
       "test:crash" => CrashingJob
     }
 
@@ -148,6 +173,36 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
       assert_receive {:action_hook, MockRepo, root, item_id, :complete, :ok, :ok}
       assert root == ctx.root
+      assert item_id == item.id
+    end
+
+    test "runs action hook with requeue action for failed jobs", ctx do
+      item = enqueue_item(ctx, "test:error")
+      manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive {:action_hook, MockRepo, _root, item_id, :requeue, {:error, :failed}, {:ok, :requeued}}
+      assert item_id == item.id
+    end
+
+    test "runs action hook with snooze action for delayed jobs", ctx do
+      item = enqueue_item(ctx, "test:snooze")
+      manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive {:action_hook, MockRepo, _root, item_id, {:snooze, 123}, {:snooze, 123}, {:ok, :requeued}}
+      assert item_id == item.id
+    end
+
+    test "runs action hook with complete action for discarded jobs", ctx do
+      item = enqueue_item(ctx, "test:discard")
+      manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive {:action_hook, MockRepo, _root, item_id, :complete, {:discard, :bad_payload}, :ok}
       assert item_id == item.id
     end
 

@@ -192,6 +192,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         capture_log(fn ->
           pid = LeaseExtender.start(MockRepo, ctx.root, ctx.lease, 30_000, interval: 10)
           assert_receive :done, 100
+          Process.sleep(10)
           LeaseExtender.stop(pid)
         end)
 

@@ -126,6 +126,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         send(test_pid, :done)
         result
       end)
+
       expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.lease) end)
       expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.leased_item) end)
       expect(MockRepo, :clear, fn _, _ -> :ok end)
@@ -134,9 +135,37 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       expect(MockRepo, :max, fn _, _ -> :ok end)
 
       log =
-        capture_log(fn ->
+        capture_log([level: :debug], fn ->
           pid = LeaseExtender.start(MockRepo, ctx.root, ctx.lease, 30_000, interval: 10)
           assert_receive :done, 100
+          Process.sleep(10)
+          LeaseExtender.stop(pid)
+        end)
+
+      assert log =~ "Extended lease for item"
+    end
+
+    test "accepts a direct successful transaction result from real Bedrock repos", ctx do
+      test_pid = self()
+
+      expect(MockRepo, :transact, fn callback ->
+        result = callback.()
+        send(test_pid, :done)
+        result
+      end)
+
+      expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.lease) end)
+      expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.leased_item) end)
+      expect(MockRepo, :clear, fn _, _ -> :ok end)
+      expect(MockRepo, :put, fn _, _, _ -> :ok end)
+      expect(MockRepo, :put, fn _, _, _ -> :ok end)
+      expect(MockRepo, :max, fn _, _ -> :ok end)
+
+      log =
+        capture_log([level: :debug], fn ->
+          pid = LeaseExtender.start(MockRepo, ctx.root, ctx.lease, 30_000, interval: 10)
+          assert_receive :done, 100
+          Process.sleep(10)
           LeaseExtender.stop(pid)
         end)
 
@@ -151,6 +180,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         send(test_pid, :done)
         result
       end)
+
       # verify_lease returns nil -> :lease_not_found
       expect(MockRepo, :get, fn ks, key ->
         assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases)
@@ -179,15 +209,23 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
 
       log =
         capture_log(fn ->
-          pid = LeaseExtender.start(MockRepo, Keyspace.new("test/"), %Lease{
-            id: "lease_id",
-            item_id: <<1, 2, 3>>,
-            item_key: {100, 0, <<1, 2, 3>>},
-            queue_id: "tenant_1",
-            holder: @holder_id,
-            obtained_at: System.system_time(:millisecond),
-            expires_at: System.system_time(:millisecond) + 30_000
-          }, 30_000, interval: 10)
+          pid =
+            LeaseExtender.start(
+              MockRepo,
+              Keyspace.new("test/"),
+              %Lease{
+                id: "lease_id",
+                item_id: <<1, 2, 3>>,
+                item_key: {100, 0, <<1, 2, 3>>},
+                queue_id: "tenant_1",
+                holder: @holder_id,
+                obtained_at: System.system_time(:millisecond),
+                expires_at: System.system_time(:millisecond) + 30_000
+              },
+              30_000,
+              interval: 10
+            )
+
           assert_receive :done, 100
           LeaseExtender.stop(pid)
           # Allow time for log to be captured

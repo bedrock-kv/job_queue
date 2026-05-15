@@ -33,6 +33,7 @@ defmodule Bedrock.JobQueue.Store do
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
+  alias Bedrock.KeyRange
   alias Bedrock.Keyspace
 
   @type repo :: module()
@@ -191,8 +192,8 @@ defmodule Bedrock.JobQueue.Store do
     # Scan items in priority order, collect visible ones
     # Uses Stream to avoid loading all items into memory
     # Stops early once we have enough visible items OR hit max_scan
-    keyspaces.items
-    |> repo.get_range(limit: max_scan)
+    repo
+    |> item_rows(keyspaces, limit: max_scan)
     |> Stream.map(fn {_key, value} -> decode(value) end)
     |> Stream.filter(&Item.visible?(&1, now))
     |> Enum.take(limit)
@@ -546,8 +547,8 @@ defmodule Bedrock.JobQueue.Store do
 
     # Scan all items and find minimum vesting_time
     # Items are sorted by {priority, vesting_time, id}, so we need to check all
-    keyspaces.items
-    |> repo.get_range(limit: limit)
+    repo
+    |> item_rows(keyspaces, limit: limit)
     |> Enum.reduce(nil, fn {_key, value}, acc ->
       item = decode(value)
 
@@ -692,10 +693,21 @@ defmodule Bedrock.JobQueue.Store do
 
   defp queue_empty?(repo, root, queue_id) do
     keyspaces = queue_keyspaces(root, queue_id)
-    repo.get_range(keyspaces.items, limit: 1) == []
+    item_rows(repo, keyspaces, limit: 1) == []
   end
 
   # Private helpers
+
+  defp item_rows(repo, keyspaces, opts) do
+    if function_exported?(repo, :__cluster__, 0) do
+      keyspaces.items
+      |> Keyspace.prefix()
+      |> KeyRange.from_prefix()
+      |> repo.get_range(opts)
+    else
+      repo.get_range(keyspaces.items, opts)
+    end
+  end
 
   defp encode(term), do: :erlang.term_to_binary(term)
   defp decode(binary), do: :erlang.binary_to_term(binary)

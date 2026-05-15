@@ -80,9 +80,20 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
       end)
 
     case result do
-      {:ok, {:ok, updated_lease}} ->
+      {:ok, updated_lease = %Lease{}} ->
         Logger.debug("Extended lease for item #{Base.encode16(lease.item_id, case: :lower)}")
         updated_lease
+
+      {:ok, {:ok, updated_lease = %Lease{}}} ->
+        Logger.debug("Extended lease for item #{Base.encode16(lease.item_id, case: :lower)}")
+        updated_lease
+
+      {:error, reason} when reason in [:not_found, :expired, :not_holder] ->
+        Logger.warning(
+          "Failed to extend lease for item #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}"
+        )
+
+        lease
 
       {:ok, {:error, reason}} ->
         Logger.warning(

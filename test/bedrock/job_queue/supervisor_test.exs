@@ -57,6 +57,15 @@ defmodule Bedrock.JobQueue.SupervisorTest do
       Supervisor.stop(pid)
       :persistent_term.erase({Bedrock.JobQueue.Internal, TestJobQueue})
     end
+
+    test "accepts a precomputed root keyspace without initializing the directory" do
+      root = Keyspace.new("job_queue/precomputed/")
+
+      assert {:ok, pid} = JQSupervisor.start_link(TestJobQueue, root: root)
+      assert Process.alive?(pid)
+
+      Supervisor.stop(pid)
+    end
   end
 
   describe "init/1" do

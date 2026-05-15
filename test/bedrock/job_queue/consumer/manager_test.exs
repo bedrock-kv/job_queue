@@ -32,6 +32,13 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     end
   end
 
+  defmodule FailingActionHook do
+    def apply(_repo, _root, _lease, _action, _handler_result, _queue_result, test_pid) do
+      send(test_pid, :failing_action_hook_called)
+      {:error, :hook_failed}
+    end
+  end
+
   setup do
     pool_name = :"TestPool_#{System.unique_integer()}"
     {:ok, pool} = Task.Supervisor.start_link(name: pool_name, max_children: 5)
@@ -142,6 +149,23 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       assert_receive {:action_hook, MockRepo, root, item_id, :complete, :ok, :ok}
       assert root == ctx.root
       assert item_id == item.id
+    end
+
+    test "rolls back the queue transaction when the action hook fails", ctx do
+      _item = enqueue_item(ctx, "test:success")
+      test_pid = self()
+
+      expect(MockRepo, :rollback, fn :hook_failed ->
+        send(test_pid, {:rollback_called, :hook_failed})
+        {:error, :hook_failed}
+      end)
+
+      manager = start_manager(ctx, action_hook: {FailingActionHook, :apply, [self()]})
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive :failing_action_hook_called
+      assert_receive {:rollback_called, :hook_failed}
     end
   end
 end

@@ -152,6 +152,18 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       refute Item.visible?(item, now)
     end
+
+    test "items with expired leases are visible for recovery" do
+      now = 10_000
+
+      item = %{
+        Item.new("queue", "topic", %{}, vesting_time: 9_000)
+        | lease_id: <<1, 2, 3>>,
+          lease_expires_at: 9_000
+      }
+
+      assert Item.visible?(item, now)
+    end
   end
 
   describe "Lease creation" do

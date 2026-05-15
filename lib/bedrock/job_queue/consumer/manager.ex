@@ -290,6 +290,8 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
       with :ok <- normalize_queue_result(queue_result),
            :ok <- run_action_hook(state, lease, action, handler_result, queue_result) do
         queue_result
+      else
+        {:error, reason} -> state.repo.rollback(reason)
       end
     end)
   end

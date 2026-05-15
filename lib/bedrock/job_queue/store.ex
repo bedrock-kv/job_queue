@@ -174,7 +174,7 @@ defmodule Bedrock.JobQueue.Store do
 
   Items are visible when:
   - vesting_time <= now
-  - lease_id is nil (not currently leased)
+  - lease_id is nil, or the item lease has expired
 
   Options:
   - :limit - Maximum items to return (default: 10)
@@ -228,13 +228,11 @@ defmodule Bedrock.JobQueue.Store do
     lease_duration = Keyword.get(opts, :lease_duration, 30_000)
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
 
-    # Peek for visible items
     items = peek(repo, root, queue_id, limit: limit, now: now)
 
-    # Obtain leases on each item
     leases =
       Enum.reduce(items, [], fn item, acc ->
-        case obtain_lease(repo, root, item, holder, lease_duration) do
+        case obtain_lease(repo, root, item, holder, lease_duration, now: now) do
           {:ok, lease} -> [lease | acc]
           {:error, _} -> acc
         end
@@ -271,38 +269,46 @@ defmodule Bedrock.JobQueue.Store do
       value ->
         current_item = decode(value)
 
-        if current_item.lease_id == nil do
-          # Create lease
-          lease = Lease.new(current_item, holder, duration_ms: duration_ms, now: now)
-          lease_expires_at = now + duration_ms
+        cond do
+          current_item.lease_id == nil ->
+            create_lease(repo, root, keyspaces, pointers, current_item, item_key, holder, duration_ms, now,
+              stats_delta: {-1, 1}
+            )
 
-          # Update item with lease info and new vesting_time
-          updated_item = %{
-            current_item
-            | lease_id: lease.id,
-              lease_expires_at: lease_expires_at,
-              vesting_time: lease_expires_at
-          }
+          not Item.leased?(current_item, now: now) ->
+            create_lease(repo, root, keyspaces, pointers, current_item, item_key, holder, duration_ms, now,
+              stats_delta: {0, 0}
+            )
 
-          # Delete old item key (vesting_time changed)
-          repo.clear(keyspaces.items, item_key)
-
-          # Write with new key (new vesting_time)
-          new_item_key = Item.key(updated_item)
-          repo.put(keyspaces.items, new_item_key, encode(updated_item))
-
-          # Write lease record
-          repo.put(keyspaces.leases, lease.item_id, encode(lease))
-
-          # Update pointer and stats
-          update_pointer(repo, pointers, lease_expires_at, item.queue_id, now)
-          update_stats(repo, keyspaces, -1, 1)
-
-          {:ok, lease}
-        else
-          {:error, :already_leased}
+          true ->
+            {:error, :already_leased}
         end
     end
+  end
+
+  defp create_lease(repo, _root, keyspaces, pointers, item, item_key, holder, duration_ms, now, opts) do
+    {pending_delta, processing_delta} = Keyword.fetch!(opts, :stats_delta)
+    lease = Lease.new(item, holder, duration_ms: duration_ms, now: now)
+    lease_expires_at = now + duration_ms
+
+    updated_item = %{
+      item
+      | lease_id: lease.id,
+        lease_expires_at: lease_expires_at,
+        vesting_time: lease_expires_at
+    }
+
+    repo.clear(keyspaces.items, item_key)
+
+    new_item_key = Item.key(updated_item)
+    repo.put(keyspaces.items, new_item_key, encode(updated_item))
+
+    repo.put(keyspaces.leases, lease.item_id, encode(lease))
+
+    update_pointer(repo, pointers, lease_expires_at, item.queue_id, now)
+    update_stats(repo, keyspaces, pending_delta, processing_delta)
+
+    {:ok, lease}
   end
 
   @doc """

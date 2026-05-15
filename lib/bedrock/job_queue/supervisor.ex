@@ -17,12 +17,12 @@ defmodule Bedrock.JobQueue.Supervisor do
 
   - `:concurrency` - Number of concurrent workers (default: System.schedulers_online())
   - `:batch_size` - Items to dequeue per batch (default: 10)
+  - `:root` - Optional precomputed queue root keyspace. When omitted, the
+    supervisor initializes the queue directory through Bedrock.
   """
   def start_link(job_queue_module, opts \\ []) do
     config = job_queue_module.__config__()
-
-    # Initialize the directory and cache the keyspace before starting supervisor
-    {:ok, root} = Internal.init_root(config.repo, job_queue_module)
+    root = Keyword.get_lazy(opts, :root, fn -> init_root!(config.repo, job_queue_module) end)
 
     Supervisor.start_link(__MODULE__, {job_queue_module, root, opts}, name: job_queue_module)
   end
@@ -43,5 +43,10 @@ defmodule Bedrock.JobQueue.Supervisor do
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp init_root!(repo, job_queue_module) do
+    {:ok, root} = Internal.init_root(repo, job_queue_module)
+    root
   end
 end

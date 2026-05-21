@@ -43,7 +43,7 @@ defmodule Bedrock.JobQueue.Job do
   - `{:ok, result}` - Job completed with a result (logged but otherwise ignored)
   - `{:error, reason}` - Job failed, will be retried if attempts remain
   - `{:discard, reason}` - Job failed permanently, won't be retried
-  - `{:snooze, delay_ms}` - Reschedule job for later without counting as a retry
+  - `{:snooze, delay_ms}` - Reschedule job for later and count it in retry accounting
 
   ## Meta
 

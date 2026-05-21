@@ -107,8 +107,19 @@ Jobs can return the following values from `perform/2`:
 | `:ok` | Job completed successfully |
 | `{:ok, result}` | Job completed with result |
 | `{:error, reason}` | Job failed, will retry with backoff |
-| `{:snooze, ms}` | Reschedule job after delay |
+| `{:snooze, ms}` | Reschedule job after delay and count it in retry accounting |
 | `{:discard, reason}` | Discard job without retrying |
+
+## Job Metadata
+
+The second argument to `perform/2` is a metadata map for the current job:
+
+| Field | Description |
+| ----- | ----------- |
+| `:topic` | Topic string used to route the job |
+| `:queue_id` | Queue or tenant identifier used for fairness |
+| `:item_id` | Unique identifier for the queued item |
+| `:attempt` | Current 1-based attempt number |
 
 ## Interactive Tutorial
 

@@ -37,7 +37,7 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   - `{:ok, result}` - Job completed with result (logged but otherwise same as `:ok`)
   - `{:error, reason}` - Job failed, will be requeued with backoff
   - `{:discard, reason}` - Job failed permanently, removed without retry
-  - `{:snooze, delay_ms}` - Reschedule for later without counting as failure
+  - `{:snooze, delay_ms}` - Reschedule for later and count it in retry accounting
   - `{:error, :timeout}` - Job exceeded timeout, will be requeued
   - `{:discard, :no_handler}` - No worker configured for this topic
 

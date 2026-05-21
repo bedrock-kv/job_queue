@@ -8,7 +8,13 @@ defmodule Bedrock.JobQueue do
   - Two-level sharding (per-queue zones + pointer index)
   - Priority ordering and scheduled/delayed jobs
   - Fault-tolerant leasing via vesting time
+  - Automatic lease extension for long-running jobs
   - Scanner/Manager/Worker consumer architecture
+
+  Jobs are delivered with at-least-once semantics. Consumers lease jobs before
+  execution and periodically extend active leases while workers are running. If
+  a worker stops before completing the job, lease extension stops and the job
+  eventually becomes visible for another consumer to claim.
 
   ## Quick Start
 

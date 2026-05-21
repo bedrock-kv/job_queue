@@ -13,8 +13,38 @@ A durable, distributed job queue for Elixir built on [Bedrock](https://github.co
 - **Priority ordering** - Lower priority numbers are processed first
 - **Scheduled jobs** - Delay jobs or schedule for a specific time
 - **Automatic retries** - Failed jobs retry with exponential backoff
+- **Lease-based recovery** - Running jobs are leased and become visible again if
+  a worker stops before completion
+- **Automatic lease extension** - Long-running jobs keep their lease alive while
+  the worker is still running
 - **Multi-tenant** - Isolate jobs by queue ID (tenant, shop, etc.)
 - **Transactional** - Jobs are enqueued atomically within Bedrock transactions
+
+## How It Works
+
+Bedrock Job Queue follows the broad shape of Apple's QuiCK design:
+
+1. Jobs are stored in per-queue item ranges, ordered by priority and visibility
+   time.
+2. A pointer index lets scanners find queues with visible work without scanning
+   every queue.
+3. A manager leases one ready queue at a time to avoid a thundering herd across
+   consumers.
+4. The manager leases individual jobs before dispatching them to workers.
+5. While a job is running, a lease extender periodically extends the job lease.
+6. Successful jobs are completed and removed; failed jobs are requeued with
+   backoff or moved to dead letter storage after retries are exhausted.
+
+The queue provides at-least-once delivery. Job handlers should be idempotent
+when they perform external side effects.
+
+## Long-Running Jobs
+
+Workers do not need to predict exactly how long a job will take. When a job is
+leased for execution, the consumer starts a lease extender that refreshes the
+lease before it expires. If the worker crashes, exits, or the node goes away,
+lease extension stops and the job eventually becomes visible for another
+consumer to claim.
 
 ## Installation
 

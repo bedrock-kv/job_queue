@@ -6,7 +6,7 @@ defmodule BedrockJobQueue.MixProject do
   def project do
     [
       app: :bedrock_job_queue,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -54,7 +54,7 @@ defmodule BedrockJobQueue.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bedrock, "~> 0.4"},
+      {:bedrock, "~> 0.5"},
       {:mox, "~> 1.0", only: :test},
       {:ex_doc, "~> 0.39", only: :dev, runtime: false, warn_if_outdated: true},
       {:styler, "~> 1.0", only: [:dev, :test], runtime: false},

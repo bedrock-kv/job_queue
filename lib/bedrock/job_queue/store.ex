@@ -44,6 +44,7 @@ defmodule Bedrock.JobQueue.Store do
   Returns a map with keyspaces for items, leases, and stats.
   """
   @spec queue_keyspaces(root_keyspace(), String.t()) :: %{
+          dead_letter: Keyspace.t(),
           items: Keyspace.t(),
           leases: Keyspace.t(),
           stats: Keyspace.t()
@@ -52,6 +53,7 @@ defmodule Bedrock.JobQueue.Store do
     queue_ks = Keyspace.partition(root, "queues/#{queue_id}/")
 
     %{
+      dead_letter: Keyspace.partition(queue_ks, "dead_letter/"),
       items: Keyspace.partition(queue_ks, "items/", key_encoding: TupleEncoding),
       leases: Keyspace.partition(queue_ks, "leases/"),
       stats: Keyspace.partition(queue_ks, "stats/")
@@ -192,7 +194,7 @@ defmodule Bedrock.JobQueue.Store do
     # Uses Stream to avoid loading all items into memory
     # Stops early once we have enough visible items OR hit max_scan
     keyspaces.items
-    |> repo.get_range(limit: max_scan)
+    |> item_keyspace_range(repo, limit: max_scan)
     |> Stream.map(fn {_key, value} -> decode(value) end)
     |> Stream.filter(&Item.visible?(&1, now))
     |> Enum.take(limit)
@@ -387,8 +389,7 @@ defmodule Bedrock.JobQueue.Store do
 
     case verify_lease(repo, keyspaces, lease) do
       {:ok, stored_lease} ->
-        # Use provided item_key or fall back to stored lease's item_key
-        item_key = lease.item_key || stored_lease.item_key
+        item_key = stored_lease.item_key
         repo.clear(keyspaces.items, item_key)
         repo.clear(keyspaces.leases, lease.item_id)
 
@@ -430,15 +431,11 @@ defmodule Bedrock.JobQueue.Store do
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
 
-    # Get item_key from lease or fetch from stored lease
     with {:ok, item_key} <- resolve_item_key(repo, keyspaces, lease),
          {:ok, item} <- fetch_item(repo, keyspaces, item_key) do
       do_requeue(repo, keyspaces, pointers, lease, item, item_key, opts, now)
     end
   end
-
-  defp resolve_item_key(_repo, _keyspaces, %Lease{item_key: item_key}) when item_key != nil,
-    do: {:ok, item_key}
 
   defp resolve_item_key(repo, keyspaces, %Lease{} = lease) do
     case verify_lease(repo, keyspaces, lease) do
@@ -542,7 +539,7 @@ defmodule Bedrock.JobQueue.Store do
     # Scan all items and find minimum vesting_time
     # Items are sorted by {priority, vesting_time, id}, so we need to check all
     keyspaces.items
-    |> repo.get_range(limit: limit)
+    |> item_keyspace_range(repo, limit: limit)
     |> Enum.reduce(nil, fn {_key, value}, acc ->
       item = decode(value)
 
@@ -687,7 +684,7 @@ defmodule Bedrock.JobQueue.Store do
 
   defp queue_empty?(repo, root, queue_id) do
     keyspaces = queue_keyspaces(root, queue_id)
-    repo.get_range(keyspaces.items, limit: 1) == []
+    Enum.empty?(item_keyspace_range(keyspaces.items, repo, limit: 1))
   end
 
   # Private helpers
@@ -720,6 +717,37 @@ defmodule Bedrock.JobQueue.Store do
   defp decode_timestamp(nil), do: 0
   defp decode_timestamp(<<time::64-little>>), do: time
 
+  defp item_keyspace_range(keyspace, repo, opts) do
+    prefix = Keyspace.prefix(keyspace)
+
+    prefix
+    |> Bedrock.KeyRange.from_prefix()
+    |> repo.get_range(opts)
+    |> Stream.filter(fn {key, _value} -> item_storage_key?(key, prefix) end)
+  end
+
+  defp item_storage_key?(key, prefix) do
+    prefix_len = byte_size(prefix)
+
+    case key do
+      <<^prefix::binary-size(prefix_len), suffix::binary>> -> item_key_suffix?(suffix)
+      _ -> false
+    end
+  end
+
+  defp item_key_suffix?(suffix) do
+    case TupleEncoding.unpack(suffix) do
+      {priority, vesting_time, id}
+      when is_integer(priority) and is_integer(vesting_time) and is_binary(id) ->
+        true
+
+      _ ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
   # Atomically updates pending and processing stats
   defp update_stats(repo, keyspaces, pending_delta, processing_delta) do
     if pending_delta != 0 do
@@ -749,11 +777,9 @@ defmodule Bedrock.JobQueue.Store do
   defp decode_counter(_), do: 0
 
   defp move_to_dead_letter(repo, keyspaces, item_key, item, now) do
-    dead_letter_ks = Keyspace.partition(keyspaces.items, "../dead_letter/")
-
     # Write to dead letter with failed_at timestamp
     dl_key = "#{now}/#{item.id}"
-    repo.put(dead_letter_ks, dl_key, encode(item))
+    repo.put(keyspaces.dead_letter, dl_key, encode(item))
 
     # Delete from main queue and update stats
     repo.clear(keyspaces.items, item_key)

@@ -25,9 +25,11 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
   import ExUnit.Assertions
   import Mox
 
+  alias Bedrock.Encoding.Tuple, as: TupleEncoding
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
+  alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
 
   # ============================================================================
@@ -123,17 +125,19 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
   # ============================================================================
 
   @doc """
-  Expects a get_range on the items keyspace for a specific queue_id.
-  Verifies the keyspace contains items path and returns the given items.
+  Expects a raw get_range over the items keyspace for a specific queue_id.
+  Verifies the key range contains the queue items path and returns the given items.
 
   Items should be a list of `{key, encoded_value}` tuples.
   """
   def expect_peek(repo, queue_id, items) do
-    expect(repo, :get_range, fn %Keyspace{} = ks, opts ->
-      prefix = Keyspace.prefix(ks)
+    root = Keyspace.new("job_queue/")
+    keyspaces = Store.queue_keyspaces(root, queue_id)
+    prefix = Keyspace.prefix(keyspaces.items)
 
-      assert String.contains?(prefix, "queues/#{queue_id}/items/"),
-             "Expected items keyspace for queue #{queue_id}, got: #{prefix}"
+    expect(repo, :get_range, fn {start_key, end_key}, opts ->
+      assert start_key == prefix
+      assert end_key > prefix
 
       assert is_list(opts), "Expected opts to be a list"
       items
@@ -347,7 +351,10 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
   defp key_in_range?(_, _, _), do: false
 
-  defp extract_key_value({{prefix, _k}, v}), do: {prefix, v}
+  defp extract_key_value({{prefix, key}, v}) when is_tuple(key),
+    do: {prefix <> TupleEncoding.pack(key), v}
+
+  defp extract_key_value({{prefix, key}, v}) when is_binary(key), do: {prefix <> key, v}
   defp extract_key_value({k, v}), do: {k, v}
 
   @doc """

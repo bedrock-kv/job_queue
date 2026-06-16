@@ -29,15 +29,23 @@ defmodule Bedrock.JobQueue.StoreTest do
     test "creates keyspaces with proper structure" do
       keyspaces = Store.queue_keyspaces(root(), "tenant_1")
 
-      assert %{items: items, leases: leases, stats: stats} = keyspaces
+      assert %{
+               dead_letter: dead_letter,
+               items: items,
+               leases: leases,
+               stats: stats
+             } = keyspaces
+      assert dead_letter.key_encoding == nil
       assert items.key_encoding == TupleEncoding
       assert leases.key_encoding == nil
       assert stats.key_encoding == nil
 
       # Verify prefix contains expected path components
+      assert String.contains?(Keyspace.prefix(dead_letter), "dead_letter/")
       assert String.contains?(Keyspace.prefix(items), "items/")
       assert String.contains?(Keyspace.prefix(leases), "leases/")
       assert String.contains?(Keyspace.prefix(stats), "stats/")
+      refute String.starts_with?(Keyspace.prefix(dead_letter), Keyspace.prefix(items))
     end
   end
 
@@ -81,21 +89,60 @@ defmodule Bedrock.JobQueue.StoreTest do
   end
 
   describe "peek/4 priority ordering" do
+    test "ignores non-item rows under the item scan prefix" do
+      queue_id = "tenant_1"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "topic", %{}, priority: 100, vesting_time: 1000)
+      encoded_item = :erlang.term_to_binary(item)
+      packed_item_key = Keyspace.pack(keyspaces.items, Item.key(item))
+      legacy_dead_letter_key =
+        Keyspace.prefix(keyspaces.items) <>
+          TupleEncoding.pack("../dead_letter/") <> TupleEncoding.pack("1000/#{item.id}")
+      legacy_dead_letter_item = :erlang.term_to_binary(%{item | id: "dead-lettered"})
+
+      expect(MockRepo, :get_range, fn
+        %Keyspace{}, _opts ->
+          flunk("tuple-encoded item keyspaces must be scanned as raw ranges")
+
+        {start_key, end_key}, _opts when is_binary(start_key) and is_binary(end_key) ->
+          assert packed_item_key >= start_key
+          assert packed_item_key < end_key
+
+          [
+            {legacy_dead_letter_key, legacy_dead_letter_item},
+            {packed_item_key, encoded_item}
+          ]
+      end)
+
+      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2000)
+      assert item_id == item.id
+    end
+
     test "returns items in priority order (lowest number first)" do
       # Create items with different priorities
       high_priority = Item.new("tenant_1", "topic", %{}, priority: 10, vesting_time: 1000)
       medium_priority = Item.new("tenant_1", "topic", %{}, priority: 50, vesting_time: 1000)
       low_priority = Item.new("tenant_1", "topic", %{}, priority: 200, vesting_time: 1000)
+      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
 
       # Encode items
       items = [
-        {Item.key(low_priority), :erlang.term_to_binary(low_priority)},
-        {Item.key(high_priority), :erlang.term_to_binary(high_priority)},
-        {Item.key(medium_priority), :erlang.term_to_binary(medium_priority)}
+        {
+          Keyspace.pack(keyspaces.items, Item.key(low_priority)),
+          :erlang.term_to_binary(low_priority)
+        },
+        {
+          Keyspace.pack(keyspaces.items, Item.key(high_priority)),
+          :erlang.term_to_binary(high_priority)
+        },
+        {
+          Keyspace.pack(keyspaces.items, Item.key(medium_priority)),
+          :erlang.term_to_binary(medium_priority)
+        }
       ]
 
       # Mock returns items in arbitrary order - peek should sort by key
-      expect(MockRepo, :get_range, fn %Keyspace{}, _opts ->
+      expect(MockRepo, :get_range, fn {_start_key, _end_key}, _opts ->
         # Return sorted by key (simulating DB behavior)
         Enum.sort_by(items, fn {key, _} -> key end)
       end)
@@ -113,13 +160,20 @@ defmodule Bedrock.JobQueue.StoreTest do
         Item.new("tenant_1", "topic", %{data: "earlier"}, priority: 100, vesting_time: 1000)
 
       later = Item.new("tenant_1", "topic", %{data: "later"}, priority: 100, vesting_time: 2000)
+      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
 
       items = [
-        {Item.key(later), :erlang.term_to_binary(later)},
-        {Item.key(earlier), :erlang.term_to_binary(earlier)}
+        {
+          Keyspace.pack(keyspaces.items, Item.key(later)),
+          :erlang.term_to_binary(later)
+        },
+        {
+          Keyspace.pack(keyspaces.items, Item.key(earlier)),
+          :erlang.term_to_binary(earlier)
+        }
       ]
 
-      expect(MockRepo, :get_range, fn %Keyspace{}, _opts ->
+      expect(MockRepo, :get_range, fn {_start_key, _end_key}, _opts ->
         Enum.sort_by(items, fn {key, _} -> key end)
       end)
 
@@ -395,6 +449,35 @@ defmodule Bedrock.JobQueue.StoreTest do
     end
   end
 
+  describe "complete/3" do
+    test "uses the stored lease item key when the caller lease is stale" do
+      now = 10_000
+      queue_id = "tenant_1"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "topic", %{n: 1}, vesting_time: now)
+      stale_lease = Lease.new(item, "holder", duration_ms: 5_000, now: now)
+      extended_expires_at = stale_lease.expires_at + 5_000
+      current_item_key = {item.priority, extended_expires_at, item.id}
+      stored_lease = %{stale_lease | expires_at: extended_expires_at, item_key: current_item_key}
+
+      current_item = %{
+        item
+        | lease_id: stale_lease.id,
+          lease_expires_at: extended_expires_at,
+          vesting_time: extended_expires_at
+      }
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      store_item(store, keyspaces.items, current_item)
+      MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
+
+      assert :ok = Store.complete(MockRepo, root(), stale_lease)
+      assert MockRepo.get(keyspaces.items, current_item_key) == nil
+      assert MockRepo.get(keyspaces.leases, stale_lease.item_id) == nil
+    end
+  end
+
   describe "requeue/4" do
     test "uses base_delay for the first retry visibility time" do
       now = 10_000
@@ -413,12 +496,82 @@ defmodule Bedrock.JobQueue.StoreTest do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, leased_item)
+      MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
 
       assert {:ok, :requeued} = Store.requeue(MockRepo, root(), lease, now: now, base_delay: 1_000)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 999)
       assert [%Item{id: item_id, error_count: 1}] =
                Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
 
+      assert item_id == item.id
+    end
+
+    test "uses the stored lease item key when the caller lease is stale" do
+      now = 10_000
+      queue_id = "tenant_1"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "topic", %{n: 1}, max_retries: 3, vesting_time: now)
+      stale_lease = Lease.new(item, "holder", duration_ms: 5_000, now: now)
+      extended_expires_at = stale_lease.expires_at + 5_000
+      current_item_key = {item.priority, extended_expires_at, item.id}
+      stored_lease = %{stale_lease | expires_at: extended_expires_at, item_key: current_item_key}
+
+      current_item = %{
+        item
+        | lease_id: stale_lease.id,
+          lease_expires_at: extended_expires_at,
+          vesting_time: extended_expires_at
+      }
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      store_item(store, keyspaces.items, current_item)
+      MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
+
+      assert {:ok, :requeued} =
+               Store.requeue(MockRepo, root(), stale_lease, now: now, base_delay: 1_000)
+
+      assert MockRepo.get(keyspaces.items, current_item_key) == nil
+
+      assert [%Item{id: item_id, error_count: 1, lease_id: nil}] =
+               Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
+
+      assert item_id == item.id
+    end
+
+    test "dead letters max-retry items outside the item scan prefix" do
+      now = 10_000
+      queue_id = "tenant_1"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "topic", %{n: 1}, max_retries: 1, vesting_time: now)
+      lease = Lease.new(item, "holder", duration_ms: 5_000, now: now)
+
+      leased_item = %{
+        item
+        | lease_id: lease.id,
+          lease_expires_at: lease.expires_at,
+          vesting_time: lease.expires_at
+      }
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      store_item(store, keyspaces.items, leased_item)
+      MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
+
+      assert {:ok, :dead_lettered} = Store.requeue(MockRepo, root(), lease, now: now)
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
+      assert MockRepo.get(keyspaces.items, Item.key(leased_item)) == nil
+      assert MockRepo.get(keyspaces.leases, lease.item_id) == nil
+
+      dead_letter_entries =
+        Agent.get(store, fn state ->
+          Enum.filter(state, fn {{prefix, _key}, _value} ->
+            prefix == Keyspace.prefix(keyspaces.dead_letter)
+          end)
+        end)
+
+      assert [{_storage_key, encoded_item}] = dead_letter_entries
+      assert %Item{id: item_id} = :erlang.binary_to_term(encoded_item)
       assert item_id == item.id
     end
   end

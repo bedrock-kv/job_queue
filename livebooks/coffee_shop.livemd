@@ -2,8 +2,8 @@
 
 ```elixir
 Mix.install([
-  {:bedrock, "~> 0.4"},
-  {:bedrock_job_queue, "~> 0.1"},
+  {:bedrock, "~> 0.5"},
+  {:bedrock_job_queue, "~> 0.3"},
   {:kino, "~> 0.16.0"}
 ])
 ```

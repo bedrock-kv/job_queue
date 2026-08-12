@@ -53,7 +53,7 @@ Add `bedrock_job_queue` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:bedrock_job_queue, "~> 0.1"}
+    {:bedrock_job_queue, "~> 0.3"}
   ]
 end
 ```

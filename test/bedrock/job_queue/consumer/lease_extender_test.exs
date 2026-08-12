@@ -57,7 +57,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       expect(MockRepo, :transact, fn callback ->
         result = callback.()
         send(test_pid, :extension_complete)
-        {:ok, result}
+        result
       end)
 
       # 2. verify_lease: get lease from leases keyspace
@@ -122,10 +122,11 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       test_pid = self()
 
       expect(MockRepo, :transact, fn callback ->
-        result = {:ok, callback.()}
+        result = callback.()
         send(test_pid, :done)
         result
       end)
+
       expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.lease) end)
       expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.leased_item) end)
       expect(MockRepo, :clear, fn _, _ -> :ok end)
@@ -149,10 +150,11 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       test_pid = self()
 
       expect(MockRepo, :transact, fn callback ->
-        result = {:ok, callback.()}
+        result = callback.()
         send(test_pid, :done)
         result
       end)
+
       # verify_lease returns nil -> :lease_not_found
       expect(MockRepo, :get, fn ks, key ->
         assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases)
@@ -183,22 +185,31 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
 
       log =
         capture_log(fn ->
-          pid = LeaseExtender.start(MockRepo, Keyspace.new("test/"), %Lease{
-            id: "lease_id",
-            item_id: <<1, 2, 3>>,
-            item_key: {100, 0, <<1, 2, 3>>},
-            queue_id: "tenant_1",
-            holder: @holder_id,
-            obtained_at: System.system_time(:millisecond),
-            expires_at: System.system_time(:millisecond) + 30_000
-          }, 30_000, interval: 50)
+          pid =
+            LeaseExtender.start(
+              MockRepo,
+              Keyspace.new("test/"),
+              %Lease{
+                id: "lease_id",
+                item_id: <<1, 2, 3>>,
+                item_key: {100, 0, <<1, 2, 3>>},
+                queue_id: "tenant_1",
+                holder: @holder_id,
+                obtained_at: System.system_time(:millisecond),
+                expires_at: System.system_time(:millisecond) + 30_000
+              },
+              30_000,
+              interval: 50
+            )
+
           assert_receive :done, 100
           Process.sleep(10)
           Logger.flush()
           LeaseExtender.stop(pid)
         end)
 
-      assert log =~ "Transaction failed extending lease"
+      assert log =~ "Failed to extend lease"
+      assert log =~ ":transaction_failed"
     end
   end
 end

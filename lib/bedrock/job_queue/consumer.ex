@@ -25,6 +25,7 @@ defmodule Bedrock.JobQueue.Consumer do
 
   - `:repo` - Required. The Bedrock Repo module
   - `:workers` - Required. Map of topic strings to job modules
+  - `:action_hook` - Optional hook invoked inside queue action transactions
   - `:name` - Process name (default: `Bedrock.JobQueue.Consumer`)
   - `:root` - Required. Root keyspace (from Directory)
   - `:concurrency` - Number of concurrent workers (default: `System.schedulers_online()`)
@@ -81,6 +82,7 @@ defmodule Bedrock.JobQueue.Consumer do
        repo: repo,
        root: root,
        workers: workers,
+       action_hook: Keyword.get(opts, :action_hook),
        worker_pool: pool_name,
        concurrency: concurrency,
        batch_size: batch_size,

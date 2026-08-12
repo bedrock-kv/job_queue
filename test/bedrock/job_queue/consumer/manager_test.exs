@@ -25,6 +25,13 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     def timeout, do: 1000
   end
 
+  defmodule ActionHook do
+    def apply(repo, root, lease, action, handler_result, queue_result, test_pid) do
+      send(test_pid, {:action_hook, repo, root, lease.item_id, action, handler_result, queue_result})
+      :ok
+    end
+  end
+
   setup do
     pool_name = :"TestPool_#{System.unique_integer()}"
     {:ok, pool} = Task.Supervisor.start_link(name: pool_name, max_children: 5)
@@ -124,6 +131,17 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       # Sync to ensure message processed
       _ = :sys.get_state(manager)
       assert Process.alive?(manager)
+    end
+
+    test "runs action hook inside successful queue action", ctx do
+      item = enqueue_item(ctx, "test:success")
+      manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive {:action_hook, MockRepo, root, item_id, :complete, :ok, :ok}
+      assert root == ctx.root
+      assert item_id == item.id
     end
   end
 end

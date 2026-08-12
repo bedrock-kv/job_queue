@@ -1,0 +1,15 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-01-03T17:20:37.696368-05:00",
+  "description": "",
+  "id": "jq-c91",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 1,
+  "status": "in_progress",
+  "title": "Test scanner.ex (0% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-04T11:29:33.02781-05:00"
+}

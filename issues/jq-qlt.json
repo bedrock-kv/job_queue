@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:33:44.466587-05:00",
+  "close_reason": "Added unit tests for timeout, exit, and edge cases - now at 90.4%",
+  "created": "2026-01-03T17:20:39.20765-05:00",
+  "description": "",
+  "id": "jq-qlt",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 3,
+  "status": "closed",
+  "title": "Test worker.ex (80.9% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:33:44.466587-05:00"
+}

@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:27:53.25149-05:00",
+  "close_reason": "Added comprehensive tests - now at 100%",
+  "created": "2026-01-03T17:20:38.776721-05:00",
+  "description": "",
+  "id": "jq-dj1",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 3,
+  "status": "closed",
+  "title": "Test expirable.ex (50% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:27:53.25149-05:00"
+}

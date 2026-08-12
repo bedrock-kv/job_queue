@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:25:38.05257-05:00",
+  "close_reason": "Added test for Application.start/2 - now at 100%",
+  "created": "2026-01-03T17:20:38.48696-05:00",
+  "description": "",
+  "id": "jq-lz6",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 2,
+  "status": "closed",
+  "title": "Test application.ex (0% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:25:38.05257-05:00"
+}

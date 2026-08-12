@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:38:48.048023-05:00",
+  "close_reason": "Added tests for crash handler and edge cases - now at 91.1%",
+  "created": "2026-01-03T17:20:39.349853-05:00",
+  "description": "",
+  "id": "jq-4ar",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 3,
+  "status": "closed",
+  "title": "Test manager.ex (81% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:38:48.048023-05:00"
+}

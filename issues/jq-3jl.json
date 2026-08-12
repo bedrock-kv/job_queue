@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-04T11:29:32.939336-05:00",
+  "close_reason": "Already at 100% - covered by integration tests",
+  "created": "2026-01-03T17:20:37.962297-05:00",
+  "description": "",
+  "id": "jq-3jl",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 1,
+  "status": "closed",
+  "title": "Test consumer.ex (0% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-04T11:29:32.939336-05:00"
+}

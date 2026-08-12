@@ -1,0 +1,15 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-01-03T17:20:38.098483-05:00",
+  "description": "",
+  "id": "jq-02n",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 1,
+  "status": "open",
+  "title": "Test store.ex (62.8% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:20:38.098483-05:00"
+}

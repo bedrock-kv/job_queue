@@ -1,0 +1,14 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-01-03T17:34:35.188181-05:00",
+  "description": "## Objective\nSystematic analysis of the codebase for code quality improvements.\n\n## Analysis Findings\n\n### 1. DUPLICATED CODE (~36 lines)\n- `lease.ex:76-81` + `queue_lease.ex:67-72`: Identical `derive_id/3` functions\n- `lease.ex:90-104` + `queue_lease.ex:81-94`: Identical Expirable delegation\n- `manager.ex:99-102` + `manager.ex:115-119`: Task completion handling\n\n### 2. OVERLY COMPLEX MODULES\n- **store.ex (773 lines, 32% of codebase)**: Handles 6+ responsibilities (items, leases, pointers, stats, dead letter, GC)\n- **manager.ex (287 lines)**: Complex task orchestration with duplicated event handling\n\n### 3. CODE IN WRONG PLACE\n| Code | Current | Better |\n|------|---------|--------|\n| Pointer index ops | store.ex:556-667 | New PointerIndex module |\n| Dead letter logic | store.ex:750-759 | New DeadLetterQueue module |\n| calculate_backoff_delay | store.ex:495-508 | config.ex |\n| verify_lease helper | store.ex:698-707 | Lease module (public) |\n| Encoding utilities | store.ex:694-745 | New Encoding module |\n\n### 4. OVERLAPPING RESPONSIBILITIES\n- Lease + QueueLease: Near-identical structures, same derive_id, expired?, remaining_ms\n\n### 5. RECOMMENDED EXTRACTIONS (Priority Order)\n1. **LeaseUtils** - eliminate duplicate derive_id and expirable delegation\n2. **Encoding** - centralize binary encoding (encode/decode, timestamps, counters)\n3. **PointerIndex** - biggest Store reduction (scan_visible_queues, gc_stale_pointers, update_queue_pointer)\n4. Move backoff to Config (consolidate retry policy)\n5. **DeadLetterQueue** - explicit operational concept\n\n## Impact Estimate\n- Store.ex reduction: 773 → ~550 lines\n- Total redundant code removed: 150-250 lines\n- New modules: 3-4 focused modules with single responsibility",
+  "id": "jq-5cr",
+  "labels": [],
+  "priority": 2,
+  "status": "open",
+  "title": "Analyze codebase for duplication, redundancy, and structural improvements",
+  "type": "task",
+  "updated_at": "2026-01-03T17:39:14.997593-05:00"
+}

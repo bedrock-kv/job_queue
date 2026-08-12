@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:27:53.253122-05:00",
+  "close_reason": "Added comprehensive tests - now at 100%",
+  "created": "2026-01-03T17:20:38.63926-05:00",
+  "description": "",
+  "id": "jq-csc",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 3,
+  "status": "closed",
+  "title": "Test payload.ex (50% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:27:53.253122-05:00"
+}

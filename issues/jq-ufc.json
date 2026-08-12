@@ -1,0 +1,15 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-01-03T17:20:37.831802-05:00",
+  "description": "",
+  "id": "jq-ufc",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 1,
+  "status": "open",
+  "title": "Test internal.ex (0% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:20:37.831802-05:00"
+}

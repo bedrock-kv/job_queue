@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:40:36.646129-05:00",
+  "close_reason": "Added comprehensive tests for lease extension loop - now at 100%",
+  "created": "2026-01-03T17:20:38.230733-05:00",
+  "description": "",
+  "id": "jq-9sg",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 2,
+  "status": "closed",
+  "title": "Test lease_extender.ex (38% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:40:36.646129-05:00"
+}

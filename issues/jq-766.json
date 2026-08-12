@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:30:43.587997-05:00",
+  "close_reason": "Added tests for leased? - now at 92.3%",
+  "created": "2026-01-03T17:20:38.91486-05:00",
+  "description": "",
+  "id": "jq-766",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 3,
+  "status": "closed",
+  "title": "Test item.ex (69.2% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:30:43.587997-05:00"
+}

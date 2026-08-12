@@ -1,0 +1,17 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "closed_at": "2026-01-03T17:26:40.30936-05:00",
+  "close_reason": "Added tests for Config.new/1 - now at 100%",
+  "created": "2026-01-03T17:20:39.065404-05:00",
+  "description": "",
+  "id": "jq-gsx",
+  "labels": [],
+  "parent": "jq-uyy",
+  "priority": 3,
+  "status": "closed",
+  "title": "Test config.ex (75% → 90%)",
+  "type": "task",
+  "updated_at": "2026-01-03T17:26:40.30936-05:00"
+}

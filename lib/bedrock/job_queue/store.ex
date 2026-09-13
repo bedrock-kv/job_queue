@@ -13,7 +13,7 @@ defmodule Bedrock.JobQueue.Store do
           priority_index/{sign, level, node} # -> earliest vesting time in priority range
           priority_index/{"root"}            # -> earliest vesting time in queue
           priority_index/{"initialized"}     # -> complete index marker
-          priority_index/{"migration"}       # -> resumable legacy cursor
+          priority_index/{"migration"}       # -> fenced, resumable legacy cursor
           identities/{item_id}           # -> canonical custom-ID Item
           identity_metadata/state         # -> current | legacy
           leases/{item_id}               # -> Lease
@@ -59,6 +59,7 @@ defmodule Bedrock.JobQueue.Store do
 
   @type repo :: module()
   @type root_keyspace :: Keyspace.t()
+  @type priority_index_status :: :writer_fence_required | :migrating | :ready | :empty
 
   @doc """
   Creates keyspaces for a queue.
@@ -99,6 +100,59 @@ defmodule Bedrock.JobQueue.Store do
   """
   @spec queue_lease_keyspace(root_keyspace()) :: Keyspace.t()
   def queue_lease_keyspace(root), do: Keyspace.partition(root, "queue_leases/")
+
+  @doc """
+  Returns the scheduling-index state for a queue.
+
+  `:writer_fence_required` means the queue contains pre-index work (or an
+  untrusted pre-marker index). It is deliberately held until an administrator
+  calls `migrate_priority_index/4` after fencing all old writers. A marker
+  written by new code cannot fence an older writer that does not read it.
+  """
+  @spec priority_index_status(repo(), root_keyspace(), String.t()) :: priority_index_status()
+  def priority_index_status(repo, root, queue_id) do
+    root
+    |> queue_keyspaces(queue_id)
+    |> priority_index_state(repo)
+  end
+
+  @doc """
+  Advances one bounded chunk of an explicitly writer-fenced legacy migration.
+
+  Before the first call with `writer_fence: :offline`, the operator must stop
+  every pre-index producer and consumer for this queue and ensure none can
+  resume. This is an operational precondition: an old writer cannot observe a
+  new marker, so no in-band key can enforce the fence for it.
+
+  Call repeatedly until `:ready` or `:empty`. Each call scans at most
+  #{@migration_chunk_size} raw item rows. New-code writers may operate while
+  the status is `:migrating`; they update their priority leaf transactionally
+  but do not advance the migration cursor.
+  """
+  @spec migrate_priority_index(repo(), root_keyspace(), String.t(), keyword()) ::
+          :more | :ready | :empty | {:error, :writer_fence_required}
+  def migrate_priority_index(repo, root, queue_id, opts \\ []) do
+    keyspaces = queue_keyspaces(root, queue_id)
+
+    case priority_index_state(keyspaces, repo) do
+      :writer_fence_required ->
+        if Keyword.get(opts, :writer_fence) == :offline do
+          start_priority_index_migration(repo, keyspaces)
+        else
+          {:error, :writer_fence_required}
+        end
+
+      :migrating ->
+        {:building, cursor} = migration_cursor(repo, keyspaces.priority_index)
+        advance_priority_migration(repo, keyspaces, cursor)
+
+      :ready ->
+        :ready
+
+      :empty ->
+        :empty
+    end
+  end
 
   @doc """
   Obtains an exclusive lease on a queue for dequeuing.
@@ -197,6 +251,13 @@ defmodule Bedrock.JobQueue.Store do
   active item rejects a custom ID with `:legacy_custom_id_unknown`, rather than
   risk recreating completed work whose ID was not historically recorded.
 
+  A nonempty queue written before the scheduling index is held with
+  `{:error, :priority_index_migration_required}` until an administrator runs
+  the explicit writer-fenced migration. A genuinely empty queue is initialized
+  atomically by its first enqueue. Only use that automatic bootstrap for a
+  queue ID that no pre-index writer can subsequently target; otherwise fence
+  old writers and migrate it explicitly before enqueuing.
+
   Within a transaction:
   1. Writes item to queue zone with key {priority, vesting_time, id}
   2. Updates pointer index with atomic min for vesting_time
@@ -204,7 +265,12 @@ defmodule Bedrock.JobQueue.Store do
   """
   @spec enqueue(repo(), root_keyspace(), Item.t(), keyword()) ::
           :ok
-          | {:error, :legacy_custom_id_unknown | :legacy_duplicate_custom_id}
+          | {
+              :error,
+              :legacy_custom_id_unknown
+              | :legacy_duplicate_custom_id
+              | :priority_index_migration_required
+            }
   def enqueue(repo, root, %Item{} = item, opts \\ []) do
     case enqueue_with_item(repo, root, item, opts) do
       {:ok, _item} -> :ok
@@ -217,22 +283,31 @@ defmodule Bedrock.JobQueue.Store do
 
   This companion to `enqueue/4` is for callers that need the item created by
   the first enqueue rather than the retry input. `enqueue/4` preserves its
-  established `:ok` return value.
+  established `:ok` return value. Nonempty pre-index queues return
+  `{:error, :priority_index_migration_required}` until explicitly migrated.
   """
   @spec enqueue_with_item(repo(), root_keyspace(), Item.t(), keyword()) ::
           {:ok, Item.t()}
-          | {:error, :legacy_custom_id_unknown | :legacy_duplicate_custom_id}
+          | {
+              :error,
+              :legacy_custom_id_unknown
+              | :legacy_duplicate_custom_id
+              | :priority_index_migration_required
+            }
   def enqueue_with_item(repo, root, %Item{} = item, opts \\ []) do
     Item.validate_priority!(item.priority)
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
-    identity_state = identity_state(repo, keyspaces)
 
-    if custom_id?(item, opts) do
-      enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state)
-    else
-      write_new_item(repo, keyspaces, pointers, item, now)
+    with :ok <- initialize_empty_priority_index(repo, keyspaces) do
+      identity_state = identity_state(repo, keyspaces)
+
+      if custom_id?(item, opts) do
+        enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state)
+      else
+        write_new_item(repo, keyspaces, pointers, item, now)
+      end
     end
   end
 
@@ -329,9 +404,11 @@ defmodule Bedrock.JobQueue.Store do
   The priority index stores the earliest vesting time for each range of
   priorities. It makes it possible to find the next ready priority with a
   fixed number of point reads, rather than scanning future items before
-  filtering them for visibility. A queue written before this index migrates in
-  fixed chunks: `peek/4` returns no jobs until the final empty chunk proves
-  the index covers every item, preserving global priority order throughout.
+  filtering them for visibility. A nonempty queue written before this index is
+  held (returns `[]`) until an administrator starts an explicit writer-fenced
+  migration. Check `priority_index_status/3` to distinguish this state from an
+  empty queue. During a fenced migration `peek/4` advances at most one fixed
+  chunk and returns no jobs until the final empty chunk proves coverage.
   """
   @spec peek(repo(), root_keyspace(), String.t(), keyword()) :: [Item.t()]
   def peek(repo, root, queue_id, opts \\ []) do
@@ -339,18 +416,18 @@ defmodule Bedrock.JobQueue.Store do
     limit = Keyword.get(opts, :limit, 10)
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
 
-    case ensure_priority_index(repo, keyspaces) do
-      :migrating -> []
+    case priority_index_state(keyspaces, repo) do
+      :writer_fence_required -> []
+      :migrating -> advance_from_peek(repo, keyspaces, limit, now)
       :empty -> []
-      :indexed -> peek_ready_items(repo, keyspaces, limit, now)
+      :ready -> peek_ready_items(repo, keyspaces, limit, now)
     end
   end
 
   @doc false
   @spec migration_in_progress?(repo(), root_keyspace(), String.t()) :: boolean()
   def migration_in_progress?(repo, root, queue_id) do
-    keyspaces = queue_keyspaces(root, queue_id)
-    match?({:building, _cursor}, migration_cursor(repo, keyspaces.priority_index))
+    priority_index_status(repo, root, queue_id) == :migrating
   end
 
   defp peek_ready_items(_repo, _keyspaces, 0, _now), do: []
@@ -447,28 +524,30 @@ defmodule Bedrock.JobQueue.Store do
     read (default: `System.system_time/1`)
   """
   @spec obtain_lease(repo(), root_keyspace(), Item.t(), binary(), pos_integer(), keyword()) ::
-          {:ok, Lease.t()} | {:error, :already_leased | :not_found}
+          {:ok, Lease.t()} | {:error, :already_leased | :not_found | :priority_index_migration_required}
   def obtain_lease(repo, root, %Item{} = item, holder, duration_ms, opts \\ []) do
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
     clock = clock(opts)
 
-    # Read current item state
-    item_key = Item.key(item)
+    with :ok <- require_priority_index(repo, keyspaces) do
+      # Read current item state
+      item_key = Item.key(item)
 
-    case repo.get(keyspaces.items, item_key) do
-      nil ->
-        {:error, :not_found}
+      case repo.get(keyspaces.items, item_key) do
+        nil ->
+          {:error, :not_found}
 
-      value ->
-        current_item = decode(value)
-        now = clock.()
+        value ->
+          current_item = decode(value)
+          now = clock.()
 
-        if Item.leased?(current_item, now: now) do
-          {:error, :already_leased}
-        else
-          do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now)
-        end
+          if Item.leased?(current_item, now: now) do
+            {:error, :already_leased}
+          else
+            do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now)
+          end
+      end
     end
   end
 
@@ -527,21 +606,29 @@ defmodule Bedrock.JobQueue.Store do
   """
   @spec extend_lease(repo(), root_keyspace(), Lease.t(), pos_integer(), keyword()) ::
           {:ok, Lease.t()}
-          | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
+          | {
+              :error,
+              :lease_not_found
+              | :lease_mismatch
+              | :lease_expired
+              | :item_not_found
+              | :priority_index_migration_required
+            }
   def extend_lease(repo, root, %Lease{} = lease, extension_ms, opts \\ []) do
     clock = clock(opts)
+    keyspaces = queue_keyspaces(root, lease.queue_id)
 
-    if lease.expires_at <= clock.() do
-      {:error, :lease_expired}
-    else
-      keyspaces = queue_keyspaces(root, lease.queue_id)
+    with :ok <- require_priority_index(repo, keyspaces) do
+      if lease.expires_at <= clock.() do
+        {:error, :lease_expired}
+      else
+        case verify_active_lease(repo, keyspaces, lease, clock) do
+          {:ok, stored_lease, _now} ->
+            do_extend_lease(repo, root, keyspaces, stored_lease, extension_ms, clock)
 
-      case verify_active_lease(repo, keyspaces, lease, clock) do
-        {:ok, stored_lease, _now} ->
-          do_extend_lease(repo, root, keyspaces, stored_lease, extension_ms, clock)
-
-        error ->
-          error
+          error ->
+            error
+        end
       end
     end
   end
@@ -613,12 +700,13 @@ defmodule Bedrock.JobQueue.Store do
     `System.system_time/1`)
   """
   @spec complete(repo(), root_keyspace(), Lease.t(), keyword()) ::
-          :ok | {:error, :lease_not_found | :lease_mismatch | :lease_expired}
+          :ok | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :priority_index_migration_required}
   def complete(repo, root, %Lease{} = lease, opts \\ []) do
     keyspaces = queue_keyspaces(root, lease.queue_id)
     clock = clock(opts)
 
-    with {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
+    with :ok <- require_priority_index(repo, keyspaces),
+         {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
          {:ok, _now} <- active_now(stored_lease, clock) do
       item_key = stored_lease.item_key
       repo.clear(keyspaces.items, item_key)
@@ -658,13 +746,15 @@ defmodule Bedrock.JobQueue.Store do
   """
   @spec requeue(repo(), root_keyspace(), Lease.t(), keyword()) ::
           {:ok, :requeued | :dead_lettered}
-          | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
+          | {:error,
+             :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found | :priority_index_migration_required}
   def requeue(repo, root, %Lease{} = lease, opts) do
     keyspaces = queue_keyspaces(root, lease.queue_id)
     pointers = pointer_keyspace(root)
     clock = clock(opts)
 
-    with {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
+    with :ok <- require_priority_index(repo, keyspaces),
+         {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
          item_key = stored_lease.item_key,
          {:ok, item} <- fetch_item(repo, keyspaces, item_key) do
       do_requeue(repo, keyspaces, pointers, {lease, stored_lease}, item, item_key, opts, clock)
@@ -767,26 +857,22 @@ defmodule Bedrock.JobQueue.Store do
 
   The priority index root stores this value exactly, so indexed queues need one
   point read rather than a bounded approximation over priority-ordered item
-  rows. While an upgraded queue is migrating in fixed chunks, this returns `0`
+  rows. While an explicitly fenced migration is in progress, this returns `0`
   as an immediate-rescan sentinel; it is not an exact minimum until migration
-  completes.
-
-  ## Options
-
-  - `:advance_migration?` - Whether this call may process one migration chunk
-    (default: `true`). The consumer passes `false` after `peek/4` so one
-    manager transaction cannot consume multiple chunks.
+  completes. A pre-index queue that has not been writer-fenced returns
+  `{:error, :priority_index_migration_required}` rather than pretending to be
+  empty or returning a partial minimum.
   """
   @spec min_vesting_time(repo(), root_keyspace(), String.t(), keyword()) ::
-          non_neg_integer() | nil
-  def min_vesting_time(repo, root, queue_id, opts \\ []) do
+          non_neg_integer() | nil | {:error, :priority_index_migration_required}
+  def min_vesting_time(repo, root, queue_id, _opts \\ []) do
     keyspaces = queue_keyspaces(root, queue_id)
-    advance_migration? = Keyword.get(opts, :advance_migration?, true)
 
-    case minimum_priority_index_status(repo, keyspaces, advance_migration?) do
+    case priority_index_state(keyspaces, repo) do
+      :writer_fence_required -> {:error, :priority_index_migration_required}
       :migrating -> 0
       :empty -> nil
-      :indexed -> priority_index_minimum(repo, keyspaces)
+      :ready -> priority_index_minimum(repo, keyspaces)
     end
   end
 
@@ -918,7 +1004,7 @@ defmodule Bedrock.JobQueue.Store do
 
   defp queue_empty?(repo, root, queue_id) do
     keyspaces = queue_keyspaces(root, queue_id)
-    ensure_priority_index(repo, keyspaces) == :empty
+    priority_index_state(keyspaces, repo) == :empty
   end
 
   # Private helpers
@@ -1056,76 +1142,64 @@ defmodule Bedrock.JobQueue.Store do
 
   defp priority_index_present?(repo, keyspaces), do: not is_nil(priority_index_minimum(repo, keyspaces))
 
-  # A root is exact only after the initialized marker has been written. Older
-  # queues are migrated in resumable chunks; their partial tree is deliberately
-  # never used to dispatch work or report a precise minimum.
-  defp ensure_priority_index(repo, keyspaces) do
+  # A root is exact only after the initialized marker has been written. No
+  # marker (including an old root without one) is untrusted legacy state: a
+  # pre-index writer cannot see or obey a new marker, so only an explicitly
+  # writer-fenced administrator may transition it to :migrating.
+  defp priority_index_state(keyspaces, repo) do
     index = keyspaces.priority_index
 
     case migration_cursor(repo, index) do
-      {:building, cursor} ->
-        advance_priority_migration(repo, keyspaces, cursor)
-
-      nil ->
-        cond do
-          priority_index_initialized?(repo, index) ->
-            priority_index_status(repo, keyspaces)
-
-          priority_index_present?(repo, keyspaces) ->
-            # Indexes written by the first indexed release have a complete
-            # root but no lifecycle marker. Adopt them without rebuilding.
-            put_priority_index_initialized(repo, index)
-            :indexed
-
-          true ->
-            start_priority_migration(repo, keyspaces)
-        end
-    end
-  end
-
-  # Manager transactions call peek/4 followed by min_vesting_time/4. A
-  # migration marker means peek already consumed this transaction's one chunk,
-  # so minimum reads the progress sentinel rather than consuming another.
-  # A direct minimum query still starts and advances a migration when needed.
-  defp minimum_priority_index_status(repo, keyspaces, true) do
-    case migration_cursor(repo, keyspaces.priority_index) do
-      {:building, cursor} -> advance_priority_migration(repo, keyspaces, cursor)
-      nil -> ensure_priority_index(repo, keyspaces)
-    end
-  end
-
-  defp minimum_priority_index_status(repo, keyspaces, false) do
-    case migration_cursor(repo, keyspaces.priority_index) do
       {:building, _cursor} ->
         :migrating
 
       nil ->
-        index = keyspaces.priority_index
-
-        cond do
-          priority_index_initialized?(repo, index) ->
-            priority_index_status(repo, keyspaces)
-
-          priority_index_present?(repo, keyspaces) ->
-            # This is the complete root written by the first indexed release;
-            # adopting it does not scan or advance a migration chunk.
-            put_priority_index_initialized(repo, index)
-            :indexed
-
-          true ->
-            # `advance_migration?: false` is used only after peek/4 by the
-            # manager. Do not let it start a migration outside that bounded
-            # peek step if a caller uses it independently.
-            :migrating
-        end
+        initialized_priority_index_state(repo, keyspaces, index)
     end
   end
 
-  defp start_priority_migration(repo, keyspaces) do
+  defp initialized_priority_index_state(repo, keyspaces, index) do
+    if priority_index_initialized?(repo, index) do
+      if priority_index_present?(repo, keyspaces), do: :ready, else: :empty
+    else
+      :writer_fence_required
+    end
+  end
+
+  # Initializing a truly empty queue is safe and ergonomic: the bounded empty
+  # range read and marker write are in the caller's transaction. A nonempty
+  # marker-less queue is held instead of guessing that no old writer exists.
+  defp initialize_empty_priority_index(repo, keyspaces) do
+    case priority_index_state(keyspaces, repo) do
+      :writer_fence_required ->
+        if keyspace_has_entries?(repo, keyspaces.items) do
+          {:error, :priority_index_migration_required}
+        else
+          repo.clear_range(keyspaces.priority_index)
+          put_priority_index_initialized(repo, keyspaces.priority_index)
+          :ok
+        end
+
+      _current_or_migrating ->
+        :ok
+    end
+  end
+
+  defp start_priority_index_migration(repo, keyspaces) do
     index = keyspaces.priority_index
     repo.clear_range(index)
     put_migration_cursor(repo, index, nil)
     advance_priority_migration(repo, keyspaces, nil)
+  end
+
+  defp advance_from_peek(repo, keyspaces, limit, now) do
+    {:building, cursor} = migration_cursor(repo, keyspaces.priority_index)
+
+    case advance_priority_migration(repo, keyspaces, cursor) do
+      :more -> []
+      :empty -> []
+      :ready -> peek_ready_items(repo, keyspaces, limit, now)
+    end
   end
 
   defp advance_priority_migration(repo, keyspaces, cursor) do
@@ -1143,11 +1217,11 @@ defmodule Bedrock.JobQueue.Store do
         index = keyspaces.priority_index
         repo.clear(index, @priority_index_migration_key)
         put_priority_index_initialized(repo, index)
-        priority_index_status(repo, keyspaces)
+        priority_index_state(keyspaces, repo)
 
       {last_key, _value} ->
         put_migration_cursor(repo, keyspaces.priority_index, last_key)
-        :migrating
+        :more
     end
   end
 
@@ -1172,10 +1246,6 @@ defmodule Bedrock.JobQueue.Store do
     end
   end
 
-  defp priority_index_status(repo, keyspaces) do
-    if priority_index_present?(repo, keyspaces), do: :indexed, else: :empty
-  end
-
   defp priority_index_initialized?(repo, index), do: repo.get(index, @priority_index_initialized_key) == "ready"
 
   defp put_priority_index_initialized(repo, index), do: repo.put(index, @priority_index_initialized_key, "ready")
@@ -1190,12 +1260,17 @@ defmodule Bedrock.JobQueue.Store do
   defp put_migration_cursor(repo, index, cursor),
     do: repo.put(index, @priority_index_migration_key, encode({:building, cursor}))
 
-  defp refresh_priority_index_after_mutation(repo, keyspaces, priority) do
-    case ensure_priority_index(repo, keyspaces) do
-      :empty -> :ok
-      _status -> refresh_priority_index(repo, keyspaces, priority)
+  defp require_priority_index(repo, keyspaces) do
+    case priority_index_state(keyspaces, repo) do
+      :writer_fence_required -> {:error, :priority_index_migration_required}
+      _current_or_migrating -> :ok
     end
   end
+
+  # Writers that have entered a fenced migration update their own complete
+  # priority leaf, but only migration drivers advance the raw cursor.
+  defp refresh_priority_index_after_mutation(repo, keyspaces, priority),
+    do: refresh_priority_index(repo, keyspaces, priority)
 
   defp refresh_priority_index(repo, keyspaces, priority) do
     minimum = priority_minimum(repo, keyspaces.items, priority)

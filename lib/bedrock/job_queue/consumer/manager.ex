@@ -189,37 +189,49 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   end
 
   defp dequeue_with_lease(state, queue_id, limit) do
-    case Store.obtain_queue_lease(
-           state.repo,
-           state.root,
-           queue_id,
-           state.holder_id,
-           state.queue_lease_duration
-         ) do
-      {:ok, queue_lease} ->
-        result = do_dequeue(state, queue_id, limit)
-        # Release the queue lease after dequeuing to allow subsequent dequeue attempts
-        Store.release_queue_lease(state.repo, state.root, queue_lease)
-        result
+    case Store.priority_index_status(state.repo, state.root, queue_id) do
+      :writer_fence_required ->
+        # A marker cannot fence an older writer. Hold this queue until the
+        # explicit administrative migration starts; do not reschedule or touch
+        # its pointer in a tight loop.
+        {:ok, {[], []}}
 
-      {:error, :queue_leased} ->
-        {:skip, :queue_leased}
+      _current_or_migrating ->
+        case Store.obtain_queue_lease(
+               state.repo,
+               state.root,
+               queue_id,
+               state.holder_id,
+               state.queue_lease_duration
+             ) do
+          {:ok, queue_lease} ->
+            result = do_dequeue(state, queue_id, limit)
+            # Release the queue lease after dequeuing to allow subsequent dequeue attempts
+            Store.release_queue_lease(state.repo, state.root, queue_lease)
+            result
+
+          {:error, :queue_leased} ->
+            {:skip, :queue_leased}
+        end
     end
   end
 
   defp do_dequeue(state, queue_id, limit) do
     items = Store.peek(state.repo, state.root, queue_id, limit: limit)
-    migrating? = Store.migration_in_progress?(state.repo, state.root, queue_id)
-    leases = obtain_item_leases(state, items)
-    update_pointer_for_remaining(state, queue_id)
+    index_status = Store.priority_index_status(state.repo, state.root, queue_id)
 
-    # A legacy queue advances one bounded index-migration chunk per store call.
-    # Requeueing the queue message makes progress without an unbounded loop in
-    # this callback; Store.peek/4 still dispatches nothing until the index is
-    # complete.
-    if migrating?, do: send(self(), {:queue_ready, queue_id})
+    if index_status == :writer_fence_required do
+      {:ok, {[], []}}
+    else
+      leases = obtain_item_leases(state, items)
+      update_pointer_for_remaining(state, queue_id)
 
-    {:ok, {items, leases}}
+      # A fenced legacy queue advances one bounded index-migration chunk per
+      # callback. Requeueing this one message yields before the next chunk.
+      if index_status == :migrating, do: send(self(), {:queue_ready, queue_id})
+
+      {:ok, {items, leases}}
+    end
   end
 
   defp obtain_item_leases(state, items) do
@@ -236,6 +248,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   # Per QuiCK Algorithm 2 lines 6-9: After dequeuing, update pointer to min vesting_time
   defp update_pointer_for_remaining(state, queue_id) do
     case Store.min_vesting_time(state.repo, state.root, queue_id, advance_migration?: false) do
+      {:error, :priority_index_migration_required} -> :ok
       nil -> :ok
       min_vesting -> Store.update_queue_pointer(state.repo, state.root, queue_id, min_vesting)
     end

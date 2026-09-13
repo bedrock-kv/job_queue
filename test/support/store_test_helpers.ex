@@ -93,7 +93,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     expected_key = Item.key(item)
 
     repo
-    |> expect(:get, 5, fn %Keyspace{} = ks, key ->
+    |> expect(:get, 133, fn %Keyspace{} = ks, key ->
       prefix = Keyspace.prefix(ks)
 
       cond do
@@ -108,7 +108,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
           flunk("Unexpected get keyspace: #{prefix}")
       end
     end)
-    |> expect(:put, 3, fn %Keyspace{} = ks, key, value ->
+    |> expect(:put, 2, fn %Keyspace{} = ks, key, value ->
       prefix = Keyspace.prefix(ks)
 
       if String.contains?(prefix, "items/") do
@@ -122,7 +122,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
         assert decoded.queue_id == item.queue_id
       else
         assert String.contains?(prefix, "priority_index/"), "Unexpected put keyspace: #{prefix}"
-        assert key in [{"migration"}, {"initialized"}]
+        assert key == {"initialized"}
       end
 
       :ok
@@ -339,7 +339,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
       {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
 
       Agent.update(store_agent, fn state ->
-        Enum.reject(state, &key_in_range?(&1, start_key, end_key)) |> Map.new()
+        state |> Enum.reject(&key_in_range?(&1, start_key, end_key)) |> Map.new()
       end)
 
       :ok
@@ -410,8 +410,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
   defp key_in_range?(_, _, _), do: false
 
-  defp extract_key_value({{prefix, key}, v}) when is_tuple(key),
-    do: {prefix <> TupleEncoding.pack(key), v}
+  defp extract_key_value({{prefix, key}, v}) when is_tuple(key), do: {prefix <> TupleEncoding.pack(key), v}
 
   defp extract_key_value({{prefix, key}, v}) when is_binary(key), do: {prefix <> key, v}
   defp extract_key_value({k, v}), do: {k, v}

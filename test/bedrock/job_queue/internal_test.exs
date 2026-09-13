@@ -1,8 +1,8 @@
 defmodule Bedrock.JobQueue.InternalTest do
   use ExUnit.Case, async: false
 
-  import Mox
   import Bedrock.JobQueue.Test.StoreHelpers
+  import Mox
 
   alias Bedrock.JobQueue.Internal
   alias Bedrock.JobQueue.Item
@@ -37,9 +37,8 @@ defmodule Bedrock.JobQueue.InternalTest do
 
   # Test module that simulates a JobQueue module
   defmodule TestJobQueue do
-    def __config__ do
-      %{repo: MockRepo}
-    end
+    @moduledoc false
+    use Bedrock.JobQueue, otp_app: :bedrock_job_queue, repo: MockRepo
   end
 
   describe "enqueue/5" do
@@ -58,7 +57,7 @@ defmodule Bedrock.JobQueue.InternalTest do
       end)
 
       # 2. Store.enqueue calls repo.put for item (keyspace, key, value)
-      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {priority, vesting_time, id} = key
           assert priority == 100
@@ -66,7 +65,7 @@ defmodule Bedrock.JobQueue.InternalTest do
           assert is_binary(id)
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key in [{"migration"}, {"initialized"}]
+          assert key == {"initialized"}
         end
 
         :ok
@@ -110,13 +109,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {_priority, vesting_time, _id} = key
           assert vesting_time == expected_vesting
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key in [{"migration"}, {"initialized"}]
+          assert key == {"initialized"}
         end
 
         :ok
@@ -145,13 +144,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {_priority, vesting_time, _id} = key
           assert vesting_time == expected_vesting
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key in [{"migration"}, {"initialized"}]
+          assert key == {"initialized"}
         end
 
         :ok
@@ -178,13 +177,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {priority, _vesting_time, _id} = key
           assert priority == 0
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key in [{"migration"}, {"initialized"}]
+          assert key == {"initialized"}
         end
 
         :ok
@@ -230,7 +229,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         callback.()
       end)
 
-      expect(MockRepo, :get, 6, fn %Keyspace{} = keyspace, key ->
+      expect(MockRepo, :get, 134, fn %Keyspace{} = keyspace, key ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do
@@ -251,13 +250,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         end
       end)
 
-      expect(MockRepo, :put, 4, fn %Keyspace{} = keyspace, key, _value ->
+      expect(MockRepo, :put, 3, fn %Keyspace{} = keyspace, key, _value ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do
           prefix =~ "identities/" -> assert key == "request-42"
           prefix =~ "items/" -> :ok
-          prefix =~ "priority_index/" -> assert key in [{"migration"}, {"initialized"}]
+          prefix =~ "priority_index/" -> assert key == {"initialized"}
           true -> flunk("Unexpected put: #{inspect({keyspace, key})}")
         end
 
@@ -275,6 +274,26 @@ defmodule Bedrock.JobQueue.InternalTest do
 
       assert_received :transaction_started
       assert_received :identity_point_read
+    end
+  end
+
+  describe "migrate_queue/2" do
+    test "runs one explicit writer-fenced migration chunk in a transaction" do
+      :persistent_term.erase({Internal, TestJobQueue})
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      expect(MockRepo, :transact, fn callback -> callback.() end)
+
+      assert :empty = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
+    end
+
+    test "requires the writer-fence acknowledgement before beginning" do
+      :persistent_term.erase({Internal, TestJobQueue})
+
+      expect(MockRepo, :transact, fn callback -> callback.() end)
+
+      assert {:error, :writer_fence_required} = TestJobQueue.migrate_queue("tenant_1")
     end
   end
 
@@ -344,7 +363,7 @@ defmodule Bedrock.JobQueue.InternalTest do
 
       # Verify keyspace was cached
       cached = :persistent_term.get({Internal, TestJobQueue}, nil)
-      assert cached != nil
+      assert cached
       assert Keyspace.prefix(cached) == expected_prefix
 
       # Clean up
@@ -381,6 +400,7 @@ defmodule Bedrock.JobQueue.InternalTest do
 
     test "fallback handles nested module names" do
       defmodule Deeply.Nested.Module do
+        @moduledoc false
         def __config__, do: %{repo: MockRepo}
       end
 

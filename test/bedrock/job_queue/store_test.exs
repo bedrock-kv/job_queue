@@ -191,6 +191,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       ])
 
       assert [] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
+      assert :ready = migrate_queue!(queue_id)
       assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
       assert item_id == item.id
     end
@@ -461,6 +462,107 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :ok = result
     end
 
+    test "atomically initializes an empty queue before accepting its first job" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      item = Item.new("brand-new", "topic", %{}, vesting_time: now)
+
+      assert {:ok, ^item} = Store.enqueue_with_item(MockRepo, root(), item, now: now)
+      assert :ready = Store.priority_index_status(MockRepo, root(), item.queue_id)
+      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), item.queue_id, now: now)
+      assert item_id == item.id
+    end
+
+    test "holds a nonempty pre-index queue until an administrator confirms its writer fence" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "legacy-fence-required"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      legacy = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: now)
+      new_item = Item.new(queue_id, "new", %{}, priority: 1, vesting_time: now)
+      store_item(store, keyspaces.items, legacy)
+
+      # A root written before the lifecycle marker is untrusted too: an older
+      # release could have built only a partial tree.
+      MockRepo.put(keyspaces.priority_index, {"root"}, <<now::64-little>>)
+
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.enqueue(MockRepo, root(), new_item, now: now)
+
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.obtain_lease(MockRepo, root(), legacy, "worker", 1_000, now: now)
+
+      lease = Lease.new(legacy, "worker", duration_ms: 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.extend_lease(MockRepo, root(), lease, 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} = Store.complete(MockRepo, root(), lease)
+      assert {:error, :priority_index_migration_required} = Store.requeue(MockRepo, root(), lease, now: now)
+
+      assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
+      assert MockRepo.get(keyspaces.priority_index, {"initialized"}) == nil
+    end
+
+    test "only an explicit fenced migration advances a legacy queue" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "fenced-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      for priority <- 0..15 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "future", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 10_000
+          )
+        )
+      end
+
+      # A pre-index writer can insert before any would-be cursor. Normal reads
+      # must keep holding the queue rather than claim an unsafe rolling upgrade.
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      old_writer = Item.new(queue_id, "old-writer", %{}, priority: -1, vesting_time: now)
+      store_item(store, keyspaces.items, old_writer)
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      # From this point the operational fence promises old writers are gone.
+      # New code may add an item before the stored raw cursor because it updates
+      # its own index leaf transactionally.
+      new_writer = Item.new(queue_id, "new-writer", %{}, priority: -2, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), new_writer, now: now)
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [first.id, second.id] == [new_writer.id, old_writer.id]
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
     test "migrates an upgraded queue in fixed chunks before dispatching or reporting an exact minimum" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
@@ -485,25 +587,28 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = Item.new(queue_id, "ready", %{}, priority: 1_000, vesting_time: now)
       store_item(store, keyspaces.items, ready)
 
-      # The first calls each process one bounded chunk. Until the final empty
-      # chunk proves coverage, the partial tree is never a dispatch source and
-      # the minimum is the immediate-rescan sentinel rather than a false exact
-      # value from the scanned prefix.
+      # Reads hold this legacy queue until an administrator explicitly confirms
+      # the old writers are fenced. Until the final empty chunk proves coverage,
+      # the partial tree is never a dispatch source and the minimum is the
+      # immediate-rescan sentinel rather than a false exact value.
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == 0
       assert MockRepo.get(keyspaces.priority_index, {"migration"})
 
       total_rows = 1_001
       nonempty_chunks = div(total_rows + @migration_chunk_size - 1, @migration_chunk_size)
 
-      # `peek` and this direct minimum query each process one nonempty chunk.
-      # Manager passes `advance_migration?: false`, so its callback still uses
-      # only the peek chunk. The remaining chunks are non-dispatching; the
-      # final empty chunk atomically marks the complete index ready.
-      for _ <- 1..(nonempty_chunks - 2) do
-        assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      # The administrator advances one chunk per transaction. The manager does
+      # the same after this explicit transition; neither path has an unbounded
+      # scan or dispatches from a partial index.
+      for _ <- 1..(nonempty_chunks - 1) do
+        assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       end
 
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert ready_id == ready.id
       assert MockRepo.get(keyspaces.priority_index, {"root"})
@@ -530,13 +635,16 @@ defmodule Bedrock.JobQueue.StoreTest do
         )
       end
 
-      # A manager-style minimum read never starts a migration by itself. It
-      # returns the sentinel and leaves the one-chunk advance to peek/4.
-      assert Store.min_vesting_time(MockRepo, root(), queue_id, advance_migration?: false) == 0
+      # A manager-style minimum read never starts a migration by itself. A
+      # marker-less queue reports the precise fence-required error and does no
+      # raw scan; the administrator starts the one-chunk transition.
+      assert {:error, :priority_index_migration_required} =
+               Store.min_vesting_time(MockRepo, root(), queue_id, advance_migration?: false)
+
       assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
       refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
 
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: 10_000)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       operations = drain_store_operations()
 
@@ -575,7 +683,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = Item.new(queue_id, "ready", %{}, priority: 1, vesting_time: now)
       Enum.each([future, ready], &store_item(store, keyspaces.items, &1))
 
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       # A real transaction retry rolls back both the tree writes and cursor
       # update. Replaying this already-merged chunk is stricter: it proves the
@@ -586,7 +694,8 @@ defmodule Bedrock.JobQueue.StoreTest do
         :erlang.term_to_binary({:building, nil})
       )
 
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert ready_id == ready.id
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
@@ -611,8 +720,8 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       Enum.each(static_items, &store_item(store, keyspaces.items, &1))
 
-      # The first chunk covers priorities 0..7.
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      # The explicitly fenced first chunk covers priorities 0..7.
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       # This mutation is before the persisted cursor and must update the
       # partial tree directly instead of waiting for a scan that will not
@@ -630,6 +739,10 @@ defmodule Bedrock.JobQueue.StoreTest do
       # index.
       behind_cursor = Item.new(queue_id, "behind", %{}, priority: 100, vesting_time: now)
       assert :ok = Store.enqueue(MockRepo, root(), behind_cursor, now: now)
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert [first.id, second.id] == [before_cursor.id, behind_cursor.id]
@@ -723,7 +836,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert 1 == identity_count(store, "tenant_2")
     end
 
-    test "migrates a queued legacy custom ID without creating another item" do
+    test "holds a queued legacy custom ID until the writer-fenced migration" do
       now = 10_000
       queue_id = "tenant_1"
       legacy = legacy_item(queue_id, "email-42", vesting_time: now)
@@ -734,12 +847,12 @@ defmodule Bedrock.JobQueue.StoreTest do
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, legacy)
 
-      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now)
+      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), retry, now: now)
       assert 1 == item_count(store, queue_id)
-      assert 1 == identity_count(store, queue_id)
+      assert 0 == identity_count(store, queue_id)
     end
 
-    test "migrates a leased legacy custom ID without sharing its lease record" do
+    test "holds a leased legacy custom ID until the writer-fenced migration" do
       now = 10_000
       queue_id = "tenant_1"
       legacy = legacy_item(queue_id, "email-42", vesting_time: now)
@@ -760,11 +873,11 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, leased_legacy)
       MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
 
-      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now)
+      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), retry, now: now)
 
       assert 1 == item_count(store, queue_id)
       assert 1 == lease_count(store, queue_id)
-      assert 1 == identity_count(store, queue_id)
+      assert 0 == identity_count(store, queue_id)
     end
 
     test "rejects an unknown custom ID in a legacy queue after completion" do
@@ -799,8 +912,6 @@ defmodule Bedrock.JobQueue.StoreTest do
 
   describe "dequeue/5" do
     test "returns empty list when no visible items" do
-      expect_dequeue_empty(MockRepo, "tenant_1")
-
       result =
         Store.dequeue(MockRepo, root(), "tenant_1", "holder", limit: 5, lease_duration: 5000)
 
@@ -825,7 +936,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, leased_item)
 
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert :ready = migrate_queue!(queue_id)
+
       assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert item_id == item.id
 
@@ -860,8 +972,11 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, current_item)
       MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
 
+      assert :ready = migrate_queue!(queue_id)
+
       assert :ok =
                Store.complete(MockRepo, root(), stale_lease, now: extended_expires_at - 1)
+
       assert MockRepo.get(keyspaces.items, current_item_key) == nil
       assert MockRepo.get(keyspaces.leases, stale_lease.item_id) == nil
     end
@@ -886,6 +1001,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, leased_item)
       MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
+
+      assert :ready = migrate_queue!(queue_id)
 
       assert {:ok, :requeued} = Store.requeue(MockRepo, root(), lease, now: now, base_delay: 1_000)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 999)
@@ -918,6 +1035,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, current_item)
       MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
 
+      assert :ready = migrate_queue!(queue_id)
+
       assert {:ok, :requeued} =
                Store.requeue(MockRepo, root(), stale_lease, now: now, base_delay: 1_000)
 
@@ -948,6 +1067,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, leased_item)
       MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
 
+      assert :ready = migrate_queue!(queue_id)
+
       assert {:ok, :dead_lettered} = Store.requeue(MockRepo, root(), lease, now: now)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
       assert MockRepo.get(keyspaces.items, Item.key(leased_item)) == nil
@@ -975,6 +1096,38 @@ defmodule Bedrock.JobQueue.StoreTest do
       result = Store.gc_stale_pointers(MockRepo, root(), limit: 10)
 
       assert result == 0
+    end
+
+    test "never starts one migration per stale legacy pointer" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store, [], observer: self())
+
+      now = 10_000
+      pointers = Store.pointer_keyspace(root())
+
+      Agent.update(store, fn state ->
+        Enum.reduce(1..100, state, fn sequence, acc ->
+          queue_id = "legacy-gc-#{sequence}"
+          Map.put(acc, {Keyspace.prefix(pointers), {0, queue_id}}, <<0::64-little>>)
+        end)
+      end)
+
+      assert 0 = Store.gc_stale_pointers(MockRepo, root(), limit: 100, grace_period: 1, now: now)
+
+      operations = drain_store_operations()
+
+      assert 1 == Enum.count(operations, &match?({:get_range, {_, _}, _}, &1))
+
+      refute Enum.any?(operations, fn
+               {:clear_range, _range} ->
+                 true
+
+               {:put, %Keyspace{} = keyspace, _key} ->
+                 String.contains?(Keyspace.prefix(keyspace), "priority_index/")
+
+               _ ->
+                 false
+             end)
     end
   end
 
@@ -1109,6 +1262,13 @@ defmodule Bedrock.JobQueue.StoreTest do
     |> Map.put(:__struct__, Item)
     |> :erlang.term_to_binary()
     |> :erlang.binary_to_term()
+  end
+
+  defp migrate_queue!(queue_id) do
+    case Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline) do
+      :more -> migrate_queue!(queue_id)
+      status when status in [:ready, :empty] -> status
+    end
   end
 
   defp drain_store_operations(operations \\ []) do

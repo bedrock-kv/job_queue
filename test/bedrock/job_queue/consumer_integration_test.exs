@@ -89,8 +89,7 @@ defmodule Bedrock.JobQueue.ConsumerIntegrationTest do
 
   defp enqueue_item(ctx, topic, payload \\ %{}) do
     item = Item.new("tenant_1", topic, payload)
-    keyspaces = Store.queue_keyspaces(ctx.root, "tenant_1")
-    store_item(ctx.store, keyspaces.items, item)
+    assert :ok = Store.enqueue(MockRepo, ctx.root, item)
     item
   end
 

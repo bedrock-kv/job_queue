@@ -122,8 +122,7 @@ defmodule Bedrock.JobQueue do
       - `:concurrency` - Number of concurrent workers (default: System.schedulers_online())
       - `:batch_size` - Items to dequeue per batch (default: 10)
       """
-      def child_spec(opts),
-        do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, type: :supervisor}
+      def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, type: :supervisor}
 
       @doc """
       Starts the JobQueue consumer supervisor.
@@ -145,6 +144,12 @@ defmodule Bedrock.JobQueue do
         item; an unknown ID returns `{:error, :legacy_custom_id_unknown}` to avoid
         recreating historical work.
 
+      A nonempty queue created before the priority index returns
+      `{:error, :priority_index_migration_required}` until it has been migrated
+      with `migrate_queue/2` after old writers have been fenced. The first
+      enqueue initializes an empty new queue atomically; use a queue ID that no
+      pre-index writer can later target, or migrate it explicitly instead.
+
       ## Examples
 
           # Immediate processing
@@ -163,6 +168,20 @@ defmodule Bedrock.JobQueue do
         do: Internal.enqueue(__MODULE__, queue_id, topic, payload, opts)
 
       @doc """
+      Advances one bounded chunk of a legacy queue's priority-index migration.
+
+      Before the first call, stop every producer and consumer running a version
+      that predates the priority index, and ensure none can resume for this
+      queue. Pass `writer_fence: :offline` to acknowledge that operational
+      precondition. Older writers cannot observe a new fence key, so migration
+      cannot safely begin as an automatic rolling upgrade.
+
+      Call repeatedly until it returns `:ready` or `:empty`; each call runs one
+      bounded transaction and processes at most one migration chunk.
+      """
+      def migrate_queue(queue_id, opts \\ []), do: Internal.migrate_queue(__MODULE__, queue_id, opts)
+
+      @doc """
       Gets queue statistics.
 
       Returns a map with `:pending_count` and `:processing_count`.
@@ -170,8 +189,7 @@ defmodule Bedrock.JobQueue do
       def stats(queue_id, opts \\ []), do: Internal.stats(__MODULE__, queue_id, opts)
 
       @doc false
-      def __config__,
-        do: %{otp_app: @otp_app, repo: @repo, workers: @workers, action_hook: @action_hook}
+      def __config__, do: %{otp_app: @otp_app, repo: @repo, workers: @workers, action_hook: @action_hook}
     end
   end
 end

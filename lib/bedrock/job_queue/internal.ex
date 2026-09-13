@@ -56,6 +56,24 @@ defmodule Bedrock.JobQueue.Internal do
     end)
   end
 
+  @doc """
+  Advances one bounded chunk of a writer-fenced scheduling-index migration.
+
+  The caller must first stop all pre-index producers and consumers for the
+  queue and ensure they cannot resume. The `:writer_fence` option is an
+  explicit acknowledgement of that operational precondition; it cannot be
+  enforced against an older binary that does not read the new fence marker.
+  Call repeatedly until the result is `:ready` or `:empty`.
+  """
+  def migrate_queue(job_queue_module, queue_id, opts \\ []) do
+    config = job_queue_module.__config__()
+    root = root_keyspace(job_queue_module)
+
+    config.repo.transact(fn ->
+      Store.migrate_priority_index(config.repo, root, queue_id, opts)
+    end)
+  end
+
   defp process_scheduling_opts(opts, now) do
     cond do
       scheduled_at = Keyword.get(opts, :at) ->

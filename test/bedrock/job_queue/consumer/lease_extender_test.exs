@@ -60,9 +60,9 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      # 2. Verify the lease and item, then advance an uninitialized index by
-      # one bounded migration chunk.
-      expect(MockRepo, :get, 6, fn ks, key ->
+      # 2. Verify the current index, lease, and item. The tree refresh has a
+      # fixed number of point reads for its 64-level path.
+      expect(MockRepo, :get, 135, fn ks, key ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases) ->
             assert key == ctx.item.id
@@ -73,28 +73,27 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             :erlang.term_to_binary(ctx.leased_item)
 
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
-            assert key in [{"migration"}, {"initialized"}, {"root"}]
-            nil
+            if key == {"initialized"}, do: "ready"
 
           true ->
             flunk("Unexpected get: #{inspect({ks, key})}")
         end
       end)
 
-      # 4. clear the old item key and the completed migration marker.
-      expect(MockRepo, :clear, 2, fn ks, key ->
+      # 4. Clear the old item key and the fixed-height index path.
+      expect(MockRepo, :clear, 67, fn ks, key ->
         if Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) do
           assert key == ctx.lease.item_key
         else
           assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index)
-          assert key == {"migration"}
+          assert is_tuple(key)
         end
 
         :ok
       end)
 
-      # 5. Write the item, lease, and two lifecycle markers.
-      expect(MockRepo, :put, 4, fn ks, key, value ->
+      # 5. Write the item and lease.
+      expect(MockRepo, :put, 2, fn ks, key, value ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
             {priority, vesting_time, id} = key
@@ -110,8 +109,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             assert updated_lease.expires_at > ctx.lease.expires_at
 
           true ->
-            assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index)
-            assert key in [{"migration"}, {"initialized"}]
+            flunk("Unexpected put: #{inspect({ks, key})}")
         end
 
         :ok
@@ -121,11 +119,6 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       expect(MockRepo, :max, fn key, _timestamp ->
         assert is_binary(key)
         assert String.contains?(key, "pointers/")
-        :ok
-      end)
-
-      expect(MockRepo, :clear_range, fn keyspace ->
-        assert Keyspace.prefix(keyspace) == Keyspace.prefix(ctx.keyspaces.priority_index)
         :ok
       end)
 
@@ -149,10 +142,10 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      expect(MockRepo, :get, 6, fn ks, _key ->
+      expect(MockRepo, :get, 135, fn ks, key ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
-            nil
+            if key == {"initialized"}, do: "ready"
 
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
             :erlang.term_to_binary(ctx.leased_item)
@@ -161,10 +154,10 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             :erlang.term_to_binary(ctx.lease)
         end
       end)
-      expect(MockRepo, :clear, 2, fn _, _ -> :ok end)
-      expect(MockRepo, :put, 4, fn _, _, _ -> :ok end)
+
+      expect(MockRepo, :clear, 67, fn _, _ -> :ok end)
+      expect(MockRepo, :put, 2, fn _, _, _ -> :ok end)
       expect(MockRepo, :max, fn _, _ -> :ok end)
-      expect(MockRepo, :clear_range, fn _keyspace -> :ok end)
       expect(MockRepo, :get_range, fn _range, _opts -> [] end)
 
       log =
@@ -188,11 +181,15 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      # verify_lease returns nil -> :lease_not_found
-      expect(MockRepo, :get, fn ks, key ->
-        assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases)
-        assert key == ctx.item.id
-        nil
+      # Current-index validation succeeds, then verify_lease returns nil.
+      expect(MockRepo, :get, 4, fn ks, key ->
+        if Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) do
+          if key == {"initialized"}, do: "ready"
+        else
+          assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases)
+          assert key == ctx.item.id
+          nil
+        end
       end)
 
       log =

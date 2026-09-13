@@ -265,12 +265,36 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
   defp enqueue_item(ctx, queue_id, topic, payload) do
     item = Item.new(queue_id, topic, payload)
-    keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
-    store_item(ctx.store, keyspaces.items, item)
+    assert :ok = Store.enqueue(MockRepo, ctx.root, item)
     item
   end
 
   describe "handle_info/2" do
+    test "holds a writer-fence-required queue without pointer mutation or self-reschedule", ctx do
+      queue_id = "legacy-hold"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+      legacy = Item.new(queue_id, "test:success", %{})
+      store_item(ctx.store, keyspaces.items, legacy)
+      manager = start_manager(ctx)
+
+      send(manager, {:queue_ready, queue_id})
+      Process.sleep(50)
+      _ = :sys.get_state(manager)
+
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+
+      refute Agent.get(ctx.store, fn state ->
+               Enum.any?(state, fn
+                 {{prefix, _key}, _value} ->
+                   prefix == Keyspace.prefix(keyspaces.priority_index) or
+                     prefix == Keyspace.prefix(Store.pointer_keyspace(ctx.root))
+
+                 _ ->
+                   false
+               end)
+             end)
+    end
+
     test "handles task crash with :DOWN message", ctx do
       _item = enqueue_item(ctx, "test:crash")
       manager = start_manager(ctx)
@@ -395,7 +419,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       transaction_calls = :counters.new(1, [])
       test_pid = self()
 
-      expect(MockRepo, :transact, 6, fn callback ->
+      expect(MockRepo, :transact, 4, fn callback ->
         :counters.add(transaction_calls, 1, 1)
 
         case :counters.get(transaction_calls, 1) do
@@ -403,9 +427,6 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
             callback.()
 
           2 ->
-            callback.()
-
-          3 ->
             result = callback.()
             send(test_pid, :action_transaction_ready)
 
@@ -532,7 +553,8 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
     values = %{
-      Keyspace.pack(keyspaces.leases, item.id) => :erlang.term_to_binary(lease)
+      Keyspace.pack(keyspaces.leases, item.id) => :erlang.term_to_binary(lease),
+      Keyspace.pack(keyspaces.priority_index, {"initialized"}) => "ready"
     }
 
     values =

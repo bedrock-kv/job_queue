@@ -128,8 +128,9 @@ defmodule Bedrock.JobQueue.Store do
   The queue must remain static for every call, until this function returns
   `:ready` or `:empty`. While the status is `:migrating`, normal queue
   operations are held with `{:error, :priority_index_migration_required}` and
-  the Manager does not dispatch it. Each call reads and indexes at most
-  #{@migration_chunk_size} raw item rows. A short final range proves the
+  the Manager does not dispatch it. The first call only clears the stale index
+  and persists an offline-prepared marker. Each later call reads and indexes at
+  most #{@migration_chunk_size} raw item rows. A short final range proves the
   static queue has been covered, so that same call completes the migration.
   """
   @spec migrate_priority_index(repo(), root_keyspace(), String.t(), keyword()) ::
@@ -143,16 +144,14 @@ defmodule Bedrock.JobQueue.Store do
     case priority_index_state(keyspaces, repo, migration_state) do
       :writer_fence_required ->
         if Keyword.get(opts, :writer_fence) == :offline do
-          repo.clear_range(keyspaces.priority_index)
-          advance_priority_migration(repo, keyspaces, nil)
+          prepare_priority_index_migration(repo, keyspaces)
         else
           {:error, :writer_fence_required}
         end
 
       :migrating ->
         if Keyword.get(opts, :writer_fence) == :offline do
-          {:offline_building, cursor} = migration_state(repo, keyspaces.priority_index)
-          advance_priority_migration(repo, keyspaces, cursor)
+          advance_offline_priority_migration(repo, keyspaces, migration_state(repo, keyspaces.priority_index))
         else
           {:error, :writer_fence_required}
         end
@@ -1170,6 +1169,9 @@ defmodule Bedrock.JobQueue.Store do
     index = keyspaces.priority_index
 
     case migration_state do
+      :offline_prepared ->
+        :migrating
+
       {:offline_building, _cursor} ->
         :migrating
 
@@ -1225,6 +1227,21 @@ defmodule Bedrock.JobQueue.Store do
       :ok
     end
   end
+
+  # Bedrock's range clears deliberately do not make old point values disappear
+  # from later Tx.get calls in the same transaction. Commit this preparation
+  # phase before reading or merging any min-tree node.
+  defp prepare_priority_index_migration(repo, keyspaces) do
+    repo.clear_range(keyspaces.priority_index)
+    repo.put(keyspaces.priority_index, @priority_index_migration_key, encode(:offline_prepared))
+    :more
+  end
+
+  defp advance_offline_priority_migration(repo, keyspaces, :offline_prepared),
+    do: advance_priority_migration(repo, keyspaces, nil)
+
+  defp advance_offline_priority_migration(repo, keyspaces, {:offline_building, cursor}),
+    do: advance_priority_migration(repo, keyspaces, cursor)
 
   defp advance_priority_migration(repo, keyspaces, cursor) do
     {start_key, end_key} = migration_item_range(keyspaces.items, cursor)
@@ -1300,6 +1317,7 @@ defmodule Bedrock.JobQueue.Store do
 
   defp require_not_migrating(repo, keyspaces) do
     case migration_state(repo, keyspaces.priority_index) do
+      :offline_prepared -> {:error, :priority_index_migration_required}
       {:offline_building, _cursor} -> {:error, :priority_index_migration_required}
       _not_current_migration -> :ok
     end

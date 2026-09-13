@@ -342,6 +342,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       assert %{pending_queues: pending_queues} = :sys.get_state(manager)
       assert pending_queues == MapSet.new()
 
+      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
       assert :ready = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
       send(manager, {:queue_ready, queue_id})
 

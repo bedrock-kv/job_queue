@@ -65,9 +65,10 @@ defmodule Bedrock.JobQueue.Internal do
   explicit acknowledgement of that operational precondition; it cannot be
   enforced against an older binary that does not read the new fence marker.
   Keep the queue offline for every migration call. While it is `:migrating`,
-  all normal queue operations are held; only this administrative function may
-  advance one bounded raw-item chunk. Call repeatedly until the result is
-  `:ready` or `:empty`, then resume writers and consumers.
+  all normal queue operations are held. The first administrative call commits
+  the index clear; later calls advance one bounded raw-item chunk. Call
+  repeatedly until the result is `:ready` or `:empty`, then resume writers and
+  consumers.
   """
   def migrate_queue(job_queue_module, queue_id, opts \\ []) do
     config = job_queue_module.__config__()

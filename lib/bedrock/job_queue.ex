@@ -178,7 +178,8 @@ defmodule Bedrock.JobQueue do
 
       Keep the queue offline for the whole migration, not just the first
       call. Call repeatedly until it returns `:ready` or `:empty`; each call
-      runs one bounded transaction and processes at most one migration chunk.
+      runs one bounded transaction. The first call prepares and commits the
+      cleared index; later calls process at most one migration chunk.
       While it is `:migrating`, all normal queue operations are held and the
       Manager will not dispatch jobs. Resume writers and consumers only after
       the terminal result.

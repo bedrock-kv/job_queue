@@ -17,6 +17,147 @@ defmodule Bedrock.JobQueue.StoreTest do
   alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
 
+  # Exercises Store against Bedrock's actual transaction accumulator. A range
+  # clear is intentionally not visible to later point reads in that
+  # accumulator, matching the pinned runtime behavior under review.
+  defmodule TxVisibilityRepo do
+    alias Bedrock.Internal.TransactionBuilder.Tx
+
+    @store_key {__MODULE__, :store}
+    @transaction_key {__MODULE__, :transaction}
+
+    def start_link(entries), do: Agent.start_link(fn -> %{data: Map.new(entries), operations: []} end)
+
+    def with_store(store, fun) do
+      Process.put(@store_key, store)
+
+      try do
+        fun.()
+      after
+        Process.delete(@store_key)
+      end
+    end
+
+    def transact(callback) do
+      Process.put(@transaction_key, Tx.new())
+
+      try do
+        result = callback.()
+        commit()
+        result
+      after
+        Process.delete(@transaction_key)
+      end
+    end
+
+    def abort(callback) do
+      Process.put(@transaction_key, Tx.new())
+
+      try do
+        callback.()
+      after
+        Process.delete(@transaction_key)
+      end
+    end
+
+    def get(%Keyspace{} = keyspace, key), do: get(Keyspace.pack(keyspace, key))
+
+    def get(key) when is_binary(key) do
+      record({:get, key})
+      {transaction, result, _store} = Tx.get(transaction!(), key, &fetch/2, store())
+      put_transaction(transaction)
+
+      case result do
+        {:ok, value} -> value
+        {:error, :not_found} -> nil
+      end
+    end
+
+    def put(%Keyspace{} = keyspace, key, value), do: put(Keyspace.pack(keyspace, key), value)
+
+    def put(key, value) when is_binary(key) and is_binary(value) do
+      record({:put, key})
+      transaction!() |> Tx.set(key, value) |> put_transaction()
+      :ok
+    end
+
+    def clear(%Keyspace{} = keyspace, key), do: clear(Keyspace.pack(keyspace, key))
+
+    def clear(key) when is_binary(key) do
+      record({:clear, key})
+      transaction!() |> Tx.clear(key) |> put_transaction()
+      :ok
+    end
+
+    def clear_range(range) do
+      {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
+      record({:clear_range, start_key, end_key})
+      transaction!() |> Tx.clear_range(start_key, end_key) |> put_transaction()
+      :ok
+    end
+
+    def get_range(range, opts \\ []) do
+      {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
+      record({:get_range, start_key, end_key, opts})
+
+      entries =
+        Agent.get(store(), fn %{data: data} ->
+          data
+          |> Enum.filter(fn {key, _value} -> key >= start_key and key < end_key end)
+          |> Enum.sort()
+        end)
+
+      case Keyword.get(opts, :limit) do
+        nil -> entries
+        limit -> Enum.take(entries, limit)
+      end
+    end
+
+    def operations(store), do: Agent.get(store, &Enum.reverse(&1.operations))
+    def clear_operations(store), do: Agent.update(store, &%{&1 | operations: []})
+
+    defp fetch(key, store) do
+      case Agent.get(store, &Map.get(&1.data, key)) do
+        nil -> {{:error, :not_found}, store}
+        value -> {{:ok, value}, store}
+      end
+    end
+
+    defp commit do
+      transaction = transaction!()
+
+      Agent.update(store(), fn %{data: data} = state ->
+        data =
+          transaction.mutations
+          |> Enum.reverse()
+          |> Enum.reduce(data, &apply_mutation/2)
+
+        %{state | data: data}
+      end)
+    end
+
+    defp apply_mutation({:set, key, value}, data), do: Map.put(data, key, value)
+    defp apply_mutation({:clear, key}, data), do: Map.delete(data, key)
+
+    defp apply_mutation({:clear_range, start_key, end_key}, data) do
+      data
+      |> Enum.reject(fn {key, _value} -> key >= start_key and key < end_key end)
+      |> Map.new()
+    end
+
+    defp record(operation), do: Agent.update(store(), &%{&1 | operations: [operation | &1.operations]})
+
+    defp store do
+      Process.get(@store_key) || raise "TxVisibilityRepo has no store"
+    end
+
+    defp transaction! do
+      Process.get(@transaction_key) || raise "TxVisibilityRepo has no transaction"
+    end
+
+    defp put_transaction(transaction), do: Process.put(@transaction_key, transaction)
+  end
+
   setup :verify_on_exit!
 
   @migration_chunk_size 8
@@ -552,6 +693,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
       assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
 
@@ -584,8 +726,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
       store_item(store, keyspaces.items, ready)
 
-      # The first administrative call is one bounded item chunk. From this
-      # point the declared offline fence holds both old and current writers.
+      # The first administrative call only prepares the clear. From this point
+      # the declared offline fence holds both old and current writers.
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
@@ -618,6 +760,77 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
+    test "prepares the clear in its own Bedrock transaction before indexing stale legacy trees" do
+      now = 10_000
+      queue_id = "transactional-clear-preparation"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      future = Item.new(queue_id, "future", %{}, priority: 0, vesting_time: now + 10_000)
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      stale_node_keys = for level <- 0..64, do: Keyspace.pack(keyspaces.priority_index, {1, level, 0})
+      stale_tree_keys = [Keyspace.pack(keyspaces.priority_index, {"root"}) | stale_node_keys]
+
+      entries =
+        [
+          {Keyspace.pack(keyspaces.items, Item.key(future)), :erlang.term_to_binary(future)},
+          {Keyspace.pack(keyspaces.items, Item.key(ready)), :erlang.term_to_binary(ready)}
+        ] ++ Enum.map(stale_tree_keys, &{&1, <<0::64-little>>})
+
+      {:ok, store} = TxVisibilityRepo.start_link(entries)
+
+      TxVisibilityRepo.with_store(store, fn ->
+        # Retrying the preparation transaction leaves the durable tree untouched.
+        assert :more =
+                 TxVisibilityRepo.abort(fn ->
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        assert :writer_fence_required =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        TxVisibilityRepo.clear_operations(store)
+
+        # Tx.clear_range/4 does not hide the old point values from Tx.get/4.
+        # Preparation therefore performs no raw-item scan or min-tree point read.
+        assert :more =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        operations = TxVisibilityRepo.operations(store)
+        refute Enum.any?(operations, &match?({:get_range, _, _, _}, &1))
+
+        refute Enum.any?(operations, fn
+                 {:get, key} -> key in stale_tree_keys
+                 _operation -> false
+               end)
+
+        assert :migrating =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert :ready =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        assert now ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: ready_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                 end)
+
+        assert ready_id == ready.id
+      end)
+    end
+
     test "migrates an empty queue with one raw forward range" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store, [], observer: self())
@@ -628,6 +841,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       # An unrelated row cannot affect a raw range bounded by the item prefix.
       MockRepo.put(keyspaces.identities, "unrelated", "value")
 
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :empty = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       current = Item.new(queue_id, "current", %{}, priority: 100, vesting_time: 10_000)
       assert :empty = Store.priority_index_status(MockRepo, root(), queue_id)
@@ -665,6 +879,7 @@ defmodule Bedrock.JobQueue.StoreTest do
         assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
         assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
 
+        assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
         assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
         assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
         assert item_id == item.id
@@ -710,7 +925,7 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       # The administrator advances one chunk per transaction; the final short
       # raw range proves static coverage and completes immediately.
-      for _ <- 1..(nonempty_chunks - 2) do
+      for _ <- 1..(nonempty_chunks - 1) do
         assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       end
 
@@ -749,6 +964,11 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
       refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+
+      preparation_operations = drain_store_operations()
+      refute Enum.any?(preparation_operations, &match?({:get_range, {_, _}, _}, &1))
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
@@ -798,6 +1018,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = List.last(items)
       Enum.each(items, &store_item(store, keyspaces.items, &1))
 
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       # A real transaction retry rolls back both the tree writes and marker
@@ -861,7 +1082,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = Item.new(queue_id, "ready", %{}, priority: 129, vesting_time: now)
       store_item(store, keyspaces.items, ready)
 
-      for _ <- 1..16 do
+      for _ <- 1..17 do
         assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       end
 

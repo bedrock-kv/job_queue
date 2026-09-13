@@ -31,17 +31,23 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert %{
                dead_letter: dead_letter,
+               identity_metadata: identity_metadata,
+               identities: identities,
                items: items,
                leases: leases,
                stats: stats
              } = keyspaces
       assert dead_letter.key_encoding == nil
+      assert identity_metadata.key_encoding == nil
+      assert identities.key_encoding == nil
       assert items.key_encoding == TupleEncoding
       assert leases.key_encoding == nil
       assert stats.key_encoding == nil
 
       # Verify prefix contains expected path components
       assert String.contains?(Keyspace.prefix(dead_letter), "dead_letter/")
+      assert String.contains?(Keyspace.prefix(identity_metadata), "identity_metadata/")
+      assert String.contains?(Keyspace.prefix(identities), "identities/")
       assert String.contains?(Keyspace.prefix(items), "items/")
       assert String.contains?(Keyspace.prefix(leases), "leases/")
       assert String.contains?(Keyspace.prefix(stats), "stats/")
@@ -408,6 +414,166 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert :ok = result
     end
+
+    test "uses a custom ID as a queue-scoped idempotency key before leasing" do
+      now = 10_000
+      queue_id = "tenant_1"
+      first = Item.new(queue_id, "email:send", %{attempt: 1}, id: "email-42", vesting_time: now)
+
+      retry =
+        Item.new(queue_id, "email:send", %{attempt: 2},
+          id: "email-42",
+          vesting_time: now + 1_000
+        )
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now + 1_000)
+      assert %{pending_count: 1, processing_count: 0} = Store.stats(MockRepo, root(), queue_id)
+      assert 1 == item_count(store, queue_id)
+    end
+
+    test "does not create another custom-ID item while the first is leased" do
+      now = 10_000
+      queue_id = "tenant_1"
+      first = Item.new(queue_id, "email:send", %{}, id: "email-42", vesting_time: now)
+      retry = Item.new(queue_id, "email:send", %{}, id: "email-42", vesting_time: now + 1_000)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert {:ok, [_lease]} = Store.dequeue(MockRepo, root(), queue_id, "worker", now: now)
+      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now + 1_000)
+      assert %{pending_count: 0, processing_count: 1} = Store.stats(MockRepo, root(), queue_id)
+      assert 1 == item_count(store, queue_id)
+      assert 1 == lease_count(store, queue_id)
+    end
+
+    test "keeps a custom ID idempotent after completion" do
+      now = 10_000
+      queue_id = "tenant_1"
+      first = Item.new(queue_id, "email:send", %{}, id: "email-42", vesting_time: now)
+      retry = Item.new(queue_id, "email:send", %{}, id: "email-42", vesting_time: now + 1_000)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert {:ok, [lease]} = Store.dequeue(MockRepo, root(), queue_id, "worker", now: now)
+      assert :ok = Store.complete(MockRepo, root(), lease)
+      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now + 1_000)
+      assert %{pending_count: 0, processing_count: 0} = Store.stats(MockRepo, root(), queue_id)
+      assert 0 == item_count(store, queue_id)
+      assert 1 == identity_count(store, queue_id)
+    end
+
+    test "continues to enqueue distinct generated IDs" do
+      now = 10_000
+      queue_id = "tenant_1"
+      first = Item.new(queue_id, "email:send", %{}, vesting_time: now)
+      second = Item.new(queue_id, "email:send", %{}, vesting_time: now)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert :ok = Store.enqueue(MockRepo, root(), second, now: now)
+      assert %{pending_count: 2, processing_count: 0} = Store.stats(MockRepo, root(), queue_id)
+      assert 2 == item_count(store, queue_id)
+      assert 0 == identity_count(store, queue_id)
+    end
+
+    test "allows the same custom ID in different queues" do
+      now = 10_000
+      first = Item.new("tenant_1", "email:send", %{}, id: "email-42", vesting_time: now)
+      second = Item.new("tenant_2", "email:send", %{}, id: "email-42", vesting_time: now)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert :ok = Store.enqueue(MockRepo, root(), second, now: now)
+      assert 1 == item_count(store, "tenant_1")
+      assert 1 == item_count(store, "tenant_2")
+      assert 1 == identity_count(store, "tenant_1")
+      assert 1 == identity_count(store, "tenant_2")
+    end
+
+    test "migrates a queued legacy custom ID without creating another item" do
+      now = 10_000
+      queue_id = "tenant_1"
+      legacy = legacy_item(queue_id, "email-42", vesting_time: now)
+      retry = Item.new(queue_id, "email:send", %{retry: true}, id: "email-42", vesting_time: now + 1_000)
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      store_item(store, keyspaces.items, legacy)
+
+      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now)
+      assert 1 == item_count(store, queue_id)
+      assert 1 == identity_count(store, queue_id)
+    end
+
+    test "migrates a leased legacy custom ID without sharing its lease record" do
+      now = 10_000
+      queue_id = "tenant_1"
+      legacy = legacy_item(queue_id, "email-42", vesting_time: now)
+      lease = Lease.new(legacy, "worker", now: now)
+
+      leased_legacy = %{
+        legacy
+        | lease_id: lease.id,
+          lease_expires_at: lease.expires_at,
+          vesting_time: lease.expires_at
+      }
+
+      retry = Item.new(queue_id, "email:send", %{retry: true}, id: "email-42", vesting_time: now + 1_000)
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      store_item(store, keyspaces.items, leased_legacy)
+      MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
+
+      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now)
+
+      assert 1 == item_count(store, queue_id)
+      assert 1 == lease_count(store, queue_id)
+      assert 1 == identity_count(store, queue_id)
+    end
+
+    test "rejects an unknown custom ID in a legacy queue after completion" do
+      now = 10_000
+      queue_id = "tenant_1"
+      retry = Item.new(queue_id, "email:send", %{retry: true}, id: "email-42", vesting_time: now)
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      store_counter(store, keyspaces.stats, "pending", 0)
+      store_counter(store, keyspaces.stats, "processing", 0)
+
+      assert {:error, :legacy_custom_id_unknown} = Store.enqueue(MockRepo, root(), retry, now: now)
+
+      assert 0 == item_count(store, queue_id)
+      assert 0 == identity_count(store, queue_id)
+    end
+
+    test "decodes a legacy serialized item without a custom-ID marker" do
+      legacy = legacy_item("tenant_1", "email-42", vesting_time: 1_000)
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      assert %Item{id: "email-42", vesting_time: 1_000} = legacy
+      refute Map.has_key?(legacy, :custom_id?)
+      assert Item.key(legacy) == {100, 1_000, "email-42"}
+      assert Item.visible?(legacy, 1_000)
+      assert :ok = Store.enqueue(MockRepo, root(), legacy, now: 1_000)
+    end
   end
 
   describe "dequeue/5" do
@@ -586,5 +752,38 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert result == 0
     end
+  end
+
+  defp item_count(store, queue_id) do
+    count_entries(store, root() |> Store.queue_keyspaces(queue_id) |> Map.fetch!(:items))
+  end
+
+  defp lease_count(store, queue_id) do
+    count_entries(store, root() |> Store.queue_keyspaces(queue_id) |> Map.fetch!(:leases))
+  end
+
+  defp identity_count(store, queue_id) do
+    count_entries(store, root() |> Store.queue_keyspaces(queue_id) |> Map.fetch!(:identities))
+  end
+
+  defp legacy_item(queue_id, id, opts) do
+    queue_id
+    |> Item.new("email:send", %{legacy: true}, Keyword.put(opts, :id, id))
+    |> Map.from_struct()
+    |> Map.delete(:custom_id?)
+    |> Map.put(:__struct__, Item)
+    |> :erlang.term_to_binary()
+    |> :erlang.binary_to_term()
+  end
+
+  defp count_entries(store, keyspace) do
+    prefix = Keyspace.prefix(keyspace)
+
+    Agent.get(store, fn state ->
+      Enum.count(state, fn
+        {{entry_prefix, _key}, _value} -> entry_prefix == prefix
+        _ -> false
+      end)
+    end)
   end
 end

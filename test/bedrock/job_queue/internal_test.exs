@@ -2,13 +2,24 @@ defmodule Bedrock.JobQueue.InternalTest do
   use ExUnit.Case, async: false
 
   import Mox
+  import Bedrock.JobQueue.Test.StoreHelpers
 
   alias Bedrock.JobQueue.Internal
   alias Bedrock.JobQueue.Item
+  alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
 
   setup :set_mox_global
   setup :verify_on_exit!
+
+  setup do
+    stub(MockRepo, :get, fn %Keyspace{} = keyspace, "state" ->
+      assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
+      "current"
+    end)
+
+    :ok
+  end
 
   # Test module that simulates a JobQueue module
   defmodule TestJobQueue do
@@ -149,6 +160,72 @@ defmodule Bedrock.JobQueue.InternalTest do
       result = Internal.enqueue(TestJobQueue, "tenant_1", "test:topic", %{}, priority: 0, now: now)
 
       assert {:ok, %Item{priority: 0}} = result
+    end
+
+    test "returns the original item when retrying a custom ID" do
+      root = Keyspace.new("job_queue/test/")
+      :persistent_term.put({Internal, TestJobQueue}, root)
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      stub(MockRepo, :transact, fn callback -> callback.() end)
+
+      assert {:ok, %Item{} = original} =
+               Internal.enqueue(TestJobQueue, "tenant_1", "test:topic", %{version: 1},
+                 id: "request-42",
+                 now: 1_000
+               )
+
+      assert {:ok, ^original} =
+               Internal.enqueue(TestJobQueue, "tenant_1", "test:topic", %{version: 2},
+                 id: "request-42",
+                 now: 2_000
+               )
+
+      assert %{pending_count: 1, processing_count: 0} = Store.stats(MockRepo, root, "tenant_1")
+      :persistent_term.erase({Internal, TestJobQueue})
+    end
+
+    test "uses a tracked point read for a custom identity inside the enqueue transaction" do
+      now = 1_000
+      test_pid = self()
+
+      expect(MockRepo, :transact, fn callback ->
+        send(test_pid, :transaction_started)
+        callback.()
+      end)
+
+      expect(MockRepo, :get, fn %Keyspace{} = keyspace, "state" ->
+        assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
+        "current"
+      end)
+
+      expect(MockRepo, :get, fn %Keyspace{} = keyspace, "request-42" ->
+        assert Keyspace.prefix(keyspace) =~ "identities/"
+        send(test_pid, :identity_point_read)
+        nil
+      end)
+
+      expect(MockRepo, :put, fn %Keyspace{} = keyspace, "request-42", _value ->
+        assert Keyspace.prefix(keyspace) =~ "identities/"
+        :ok
+      end)
+
+      expect(MockRepo, :put, fn %Keyspace{} = keyspace, _item_key, _value ->
+        assert Keyspace.prefix(keyspace) =~ "items/"
+        :ok
+      end)
+
+      expect(MockRepo, :max, fn _key, _value -> :ok end)
+      expect(MockRepo, :add, fn _key, _value -> :ok end)
+
+      assert {:ok, %Item{id: "request-42"}} =
+               Internal.enqueue(TestJobQueue, "tenant_1", "test:topic", %{},
+                 id: "request-42",
+                 now: now
+               )
+
+      assert_received :transaction_started
+      assert_received :identity_point_read
     end
   end
 

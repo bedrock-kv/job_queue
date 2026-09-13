@@ -31,6 +31,19 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     def timeout, do: 1000
   end
 
+  defmodule BlockingJob do
+    def perform(_args, _meta) do
+      Process.register(self(), :manager_lifecycle_handler)
+      send(:manager_lifecycle_test_process, {:handler_started, self()})
+
+      receive do
+        :finish -> :ok
+      end
+    end
+
+    def timeout, do: 1_000
+  end
+
   defmodule ActionHook do
     @moduledoc false
     def apply(repo, root, lease, action, handler_result, queue_result, test_pid) do
@@ -113,6 +126,35 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     use Bedrock.Repo, cluster: UnusedCluster
   end
 
+  defmodule PreflightFailureRepo do
+    @state :manager_preflight_failure_repo
+
+    def transact(callback) do
+      case Agent.get(@state, & &1.phase) do
+        :dequeue ->
+          Agent.update(@state, &Map.put(&1, :phase, :preflight))
+          callback.()
+
+        :preflight ->
+          preflight_result = Agent.get(@state, & &1.preflight_result)
+          Agent.update(@state, &Map.put(&1, :phase, :after_preflight))
+          preflight_result.()
+
+        :after_preflight ->
+          Agent.update(@state, &Map.put(&1, :action_called?, true))
+          callback.()
+      end
+    end
+
+    def get(keyspace, key), do: MockRepo.get(keyspace, key)
+    def get_range(key_range, opts), do: MockRepo.get_range(key_range, opts)
+    def put(keyspace, key, value), do: MockRepo.put(keyspace, key, value)
+    def clear(keyspace, key), do: MockRepo.clear(keyspace, key)
+    def max(key, value), do: MockRepo.max(key, value)
+    def add(key, value), do: MockRepo.add(key, value)
+    def rollback(reason), do: MockRepo.rollback(reason)
+  end
+
   defmodule RecordingTransaction do
     @moduledoc false
     use GenServer
@@ -177,7 +219,8 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
     workers = %{
       "test:success" => SuccessJob,
-      "test:crash" => CrashingJob
+      "test:crash" => CrashingJob,
+      "test:blocking" => BlockingJob
     }
 
     %{
@@ -232,6 +275,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
         end)
 
       assert log =~ "Job task crashed"
+      assert Process.alive?(manager)
     end
 
     test "ignores unknown task reference", ctx do
@@ -258,6 +302,31 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   end
 
   describe "queue processing" do
+    test "terminates an in-flight handler when the manager stops", ctx do
+      Process.register(self(), :manager_lifecycle_test_process)
+
+      on_exit(fn ->
+        if handler = Process.whereis(:manager_lifecycle_handler) do
+          Process.exit(handler, :kill)
+        end
+      end)
+
+      _item = enqueue_item(ctx, "test:blocking")
+      manager = start_manager(ctx)
+      manager_ref = Process.monitor(manager)
+      Process.unlink(manager)
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive {:handler_started, handler_pid}
+      handler_ref = Process.monitor(handler_pid)
+
+      :ok = GenServer.stop(manager, :shutdown)
+
+      assert_receive {:DOWN, ^manager_ref, :process, ^manager, :shutdown}
+      assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, _reason}
+    end
+
     test "handles no available workers", ctx do
       # Fill up worker slots
       _item = enqueue_item(ctx, "test:success")
@@ -268,6 +337,14 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       # Sync to ensure message processed
       _ = :sys.get_state(manager)
       assert Process.alive?(manager)
+    end
+
+    test "does not requeue a job when worker lease preflight is unavailable", ctx do
+      assert_preflight_does_not_requeue(ctx, fn -> {:error, :transaction_failed} end)
+    end
+
+    test "does not requeue a job when worker lease preflight raises", ctx do
+      assert_preflight_does_not_requeue(ctx, fn -> raise "preflight unavailable" end)
     end
 
     test "runs action hook inside successful queue action", ctx do
@@ -311,7 +388,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       transaction_calls = :counters.new(1, [])
       test_pid = self()
 
-      expect(MockRepo, :transact, 4, fn callback ->
+      expect(MockRepo, :transact, 6, fn callback ->
         :counters.add(transaction_calls, 1, 1)
 
         case :counters.get(transaction_calls, 1) do
@@ -319,6 +396,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
             callback.()
 
           2 ->
+            callback.()
+
+          3 ->
             result = callback.()
             send(test_pid, :action_transaction_ready)
 
@@ -439,8 +519,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
   defp lease_transaction_values(action) do
     root = Keyspace.new("job_queue/test/")
-    item = Item.new("tenant_1", "test:success", %{}, id: "item-id", vesting_time: 1_000)
-    lease = Lease.new(item, @holder_id, now: 2_000)
+    now = System.system_time(:millisecond)
+    item = Item.new("tenant_1", "test:success", %{}, id: "item-id", vesting_time: now)
+    lease = Lease.new(item, @holder_id, now: now)
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
     values = %{
@@ -466,6 +547,39 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
   defp handler_result_for(:complete), do: :ok
   defp handler_result_for(:requeue), do: {:error, :failed}
+
+  defp assert_preflight_does_not_requeue(ctx, preflight_result) do
+    item = enqueue_item(ctx, "test:success")
+
+    {:ok, _state} =
+      Agent.start_link(
+        fn -> %{phase: :dequeue, preflight_result: preflight_result, action_called?: false} end,
+        name: :manager_preflight_failure_repo
+      )
+
+    on_exit(fn ->
+      if Process.whereis(:manager_preflight_failure_repo) do
+        try do
+          Agent.stop(:manager_preflight_failure_repo)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    manager = start_manager(ctx, repo: PreflightFailureRepo)
+    send(manager, {:queue_ready, item.queue_id})
+
+    assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+    refute Agent.get(:manager_preflight_failure_repo, & &1.action_called?)
+
+    keyspaces = Store.queue_keyspaces(ctx.root, item.queue_id)
+    assert lease_value = MockRepo.get(keyspaces.leases, item.id)
+    lease = :erlang.binary_to_term(lease_value)
+    lease_id = lease.id
+    assert leased_item_value = MockRepo.get(keyspaces.items, lease.item_key)
+    assert %Item{error_count: 0, lease_id: ^lease_id} = :erlang.binary_to_term(leased_item_value)
+  end
 
   defp assert_action_rolled_back(transaction) do
     assert_receive :nested_transaction

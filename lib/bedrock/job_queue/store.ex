@@ -86,6 +86,11 @@ defmodule Bedrock.JobQueue.Store do
   must first obtain a queue lease before it can dequeue items. Only one
   consumer can hold a queue lease at a time.
 
+  Options:
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying current time after the lease
+    read (default: `System.system_time/1`)
+
   Returns:
   - `{:ok, QueueLease.t()}` - Lease obtained successfully
   - `{:error, :queue_leased}` - Queue already leased by another consumer
@@ -101,17 +106,19 @@ defmodule Bedrock.JobQueue.Store do
           {:ok, QueueLease.t()} | {:error, :queue_leased}
   def obtain_queue_lease(repo, root, queue_id, holder, duration_ms, opts \\ []) do
     ks = queue_lease_keyspace(root)
-    now = Keyword.get(opts, :now, System.system_time(:millisecond))
+    clock = clock(opts)
 
     case repo.get(ks, queue_id) do
       nil ->
         # No existing lease - create new one
+        now = clock.()
         lease = QueueLease.new(queue_id, holder, duration_ms: duration_ms, now: now)
         repo.put(ks, queue_id, encode(lease))
         {:ok, lease}
 
       value ->
         existing = decode(value)
+        now = clock.()
 
         if existing.expires_at <= now do
           # Existing lease expired - replace it
@@ -370,13 +377,18 @@ defmodule Bedrock.JobQueue.Store do
   2. Creates lease record
   3. Updates item's vesting_time to lease expiry (makes it invisible)
   4. Updates pointer index with new min vesting_time
+
+  Options:
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying current time after the item
+    read (default: `System.system_time/1`)
   """
   @spec obtain_lease(repo(), root_keyspace(), Item.t(), binary(), pos_integer(), keyword()) ::
           {:ok, Lease.t()} | {:error, :already_leased | :not_found}
   def obtain_lease(repo, root, %Item{} = item, holder, duration_ms, opts \\ []) do
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
-    now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    clock = clock(opts)
 
     # Read current item state
     item_key = Item.key(item)
@@ -387,6 +399,7 @@ defmodule Bedrock.JobQueue.Store do
 
       value ->
         current_item = decode(value)
+        now = clock.()
 
         if Item.leased?(current_item, now: now) do
           {:error, :already_leased}
@@ -430,13 +443,20 @@ defmodule Bedrock.JobQueue.Store do
   to prevent the item from becoming visible to other consumers.
 
   1. Validates lease exists and matches
-  2. Updates item's vesting_time to new expiry
-  3. Updates lease record with new expiry
-  4. Updates pointer index
+  2. Validates the stored lease has not expired
+  3. Updates item's vesting_time to new expiry
+  4. Updates lease record with new expiry
+  5. Updates pointer index
+
+  ## Options
+
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying the current time in ms; sampled
+    after each lease read (default: `System.system_time/1`)
 
   ## Error Cases
 
-  - `{:error, :lease_expired}` - Lease already expired (checked before DB access)
+  - `{:error, :lease_expired}` - Lease expiry has passed
   - `{:error, :lease_not_found}` - No lease record exists for this item
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
   - `{:error, :item_not_found}` - Item no longer exists in queue
@@ -445,16 +465,16 @@ defmodule Bedrock.JobQueue.Store do
           {:ok, Lease.t()}
           | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
   def extend_lease(repo, root, %Lease{} = lease, extension_ms, opts \\ []) do
-    now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    clock = clock(opts)
 
-    if lease.expires_at <= now do
+    if lease.expires_at <= clock.() do
       {:error, :lease_expired}
     else
       keyspaces = queue_keyspaces(root, lease.queue_id)
 
-      case verify_lease(repo, keyspaces, lease) do
-        {:ok, stored_lease} ->
-          do_extend_lease(repo, root, keyspaces, stored_lease, now + extension_ms, now)
+      case verify_active_lease(repo, keyspaces, lease, clock) do
+        {:ok, stored_lease, _now} ->
+          do_extend_lease(repo, root, keyspaces, stored_lease, extension_ms, clock)
 
         error ->
           error
@@ -462,7 +482,26 @@ defmodule Bedrock.JobQueue.Store do
     end
   end
 
-  defp do_extend_lease(repo, root, keyspaces, stored_lease, new_expires_at, now) do
+  @doc """
+  Checks that a lease still belongs to this worker and has not expired.
+
+  This check is intended immediately before invoking a job handler. It does
+  not modify queue state. Call it inside a repository transaction so the read
+  participates in the same conflict handling as other queue operations.
+  """
+  @spec lease_owned?(repo(), root_keyspace(), Lease.t(), keyword()) ::
+          :ok | {:error, :lease_not_found | :lease_mismatch | :lease_expired}
+  def lease_owned?(repo, root, %Lease{} = lease, opts \\ []) do
+    clock = clock(opts)
+    keyspaces = queue_keyspaces(root, lease.queue_id)
+
+    case verify_active_lease(repo, keyspaces, lease, clock) do
+      {:ok, _stored_lease, _now} -> :ok
+      error -> error
+    end
+  end
+
+  defp do_extend_lease(repo, root, keyspaces, stored_lease, extension_ms, clock) do
     old_item_key = stored_lease.item_key
 
     case repo.get(keyspaces.items, old_item_key) do
@@ -470,22 +509,25 @@ defmodule Bedrock.JobQueue.Store do
         {:error, :item_not_found}
 
       item_value ->
-        item = decode(item_value)
-        updated_item = %{item | vesting_time: new_expires_at, lease_expires_at: new_expires_at}
+        with {:ok, now} <- active_now(stored_lease, clock) do
+          new_expires_at = now + extension_ms
+          item = decode(item_value)
+          updated_item = %{item | vesting_time: new_expires_at, lease_expires_at: new_expires_at}
 
-        # Delete old item key, write with new vesting_time
-        repo.clear(keyspaces.items, old_item_key)
-        new_item_key = Item.key(updated_item)
-        repo.put(keyspaces.items, new_item_key, encode(updated_item))
+          # Delete old item key, write with new vesting_time
+          repo.clear(keyspaces.items, old_item_key)
+          new_item_key = Item.key(updated_item)
+          repo.put(keyspaces.items, new_item_key, encode(updated_item))
 
-        # Update lease record
-        updated_lease = %{stored_lease | expires_at: new_expires_at, item_key: new_item_key}
-        repo.put(keyspaces.leases, stored_lease.item_id, encode(updated_lease))
+          # Update lease record
+          updated_lease = %{stored_lease | expires_at: new_expires_at, item_key: new_item_key}
+          repo.put(keyspaces.leases, stored_lease.item_id, encode(updated_lease))
 
-        # Update pointer index
-        update_pointer(repo, pointer_keyspace(root), new_expires_at, stored_lease.queue_id, now)
+          # Update pointer index
+          update_pointer(repo, pointer_keyspace(root), new_expires_at, stored_lease.queue_id, now)
 
-        {:ok, updated_lease}
+          {:ok, updated_lease}
+        end
     end
   end
 
@@ -493,17 +535,26 @@ defmodule Bedrock.JobQueue.Store do
   Completes a leased job, removing it from the queue.
 
   1. Validates lease exists and matches
-  2. Deletes item from queue using stored item_key (O(1) lookup)
-  3. Deletes lease record
-  4. Decrements processing_count
-  """
-  @spec complete(repo(), root_keyspace(), Lease.t()) ::
-          :ok | {:error, :lease_not_found | :lease_mismatch}
-  def complete(repo, root, %Lease{} = lease) do
-    keyspaces = queue_keyspaces(root, lease.queue_id)
+  2. Validates the stored lease has not expired
+  3. Deletes item from queue using stored item_key (O(1) lookup)
+  4. Deletes lease record
+  5. Decrements processing_count
 
-    case verify_lease(repo, keyspaces, lease) do
-      {:ok, stored_lease} ->
+  ## Options
+
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying the current time in ms; sampled
+    after the lease read and immediately before queue mutations (default:
+    `System.system_time/1`)
+  """
+  @spec complete(repo(), root_keyspace(), Lease.t(), keyword()) ::
+          :ok | {:error, :lease_not_found | :lease_mismatch | :lease_expired}
+  def complete(repo, root, %Lease{} = lease, opts \\ []) do
+    keyspaces = queue_keyspaces(root, lease.queue_id)
+    clock = clock(opts)
+
+    with {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
+         {:ok, _now} <- active_now(stored_lease, clock) do
         item_key = stored_lease.item_key
         repo.clear(keyspaces.items, item_key)
         repo.clear(keyspaces.leases, lease.item_id)
@@ -511,9 +562,6 @@ defmodule Bedrock.JobQueue.Store do
         update_stats(repo, keyspaces, 0, -1)
 
         :ok
-
-      error ->
-        error
     end
   end
 
@@ -530,32 +578,30 @@ defmodule Bedrock.JobQueue.Store do
   - `:backoff_fn` - Function `(attempt) -> delay_ms` for retry delay
   - `:base_delay` - Fixed base delay in ms (used by snooze, overrides backoff_fn)
   - `:max_delay` - Maximum delay in ms (default: 60_000)
-  - `:now` - Current time in ms (default: `System.system_time(:millisecond)`)
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying the current time in ms; sampled
+    after required reads and immediately before queue mutations (default:
+    `System.system_time/1`)
 
   ## Error Cases
 
   - `{:error, :lease_not_found}` - No lease record exists for this item
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
+  - `{:error, :lease_expired}` - Lease expiry has passed
   - `{:error, :item_not_found}` - Item no longer exists in queue
   """
   @spec requeue(repo(), root_keyspace(), Lease.t(), keyword()) ::
           {:ok, :requeued | :dead_lettered}
-          | {:error, :lease_not_found | :lease_mismatch | :item_not_found}
+          | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
   def requeue(repo, root, %Lease{} = lease, opts) do
     keyspaces = queue_keyspaces(root, lease.queue_id)
     pointers = pointer_keyspace(root)
-    now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    clock = clock(opts)
 
-    with {:ok, item_key} <- resolve_item_key(repo, keyspaces, lease),
+    with {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
+         item_key = stored_lease.item_key,
          {:ok, item} <- fetch_item(repo, keyspaces, item_key) do
-      do_requeue(repo, keyspaces, pointers, lease, item, item_key, opts, now)
-    end
-  end
-
-  defp resolve_item_key(repo, keyspaces, %Lease{} = lease) do
-    case verify_lease(repo, keyspaces, lease) do
-      {:ok, stored_lease} -> {:ok, stored_lease.item_key}
-      error -> error
+      do_requeue(repo, keyspaces, pointers, {lease, stored_lease}, item, item_key, opts, clock)
     end
   end
 
@@ -566,40 +612,50 @@ defmodule Bedrock.JobQueue.Store do
     end
   end
 
-  defp do_requeue(repo, keyspaces, pointers, lease, item, item_key, opts, now) do
+  defp do_requeue(repo, keyspaces, pointers, {lease, stored_lease}, item, item_key, opts, clock) do
+    plan = requeue_plan(item, opts)
+
+    with {:ok, now} <- active_now(stored_lease, clock) do
+      write_requeue(repo, keyspaces, pointers, lease, item, item_key, plan, now)
+    end
+  end
+
+  defp requeue_plan(item, opts) do
     new_error_count = item.error_count + 1
 
     if new_error_count >= item.max_retries do
-      # Move to dead letter
-      move_to_dead_letter(repo, keyspaces, item_key, item, now)
-      repo.clear(keyspaces.leases, lease.item_id)
-      {:ok, :dead_lettered}
+      {:dead_letter, new_error_count}
     else
-      # Calculate backoff delay
-      delay = calculate_backoff_delay(opts, new_error_count)
-      new_vesting_time = now + delay
-
-      # Update item
-      updated_item = %{
-        item
-        | error_count: new_error_count,
-          vesting_time: new_vesting_time,
-          lease_id: nil,
-          lease_expires_at: nil
-      }
-
-      # Delete old key, write new
-      repo.clear(keyspaces.items, item_key)
-      new_item_key = Item.key(updated_item)
-      repo.put(keyspaces.items, new_item_key, encode(updated_item))
-
-      # Update pointer, clear lease, update stats
-      update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
-      repo.clear(keyspaces.leases, lease.item_id)
-      update_stats(repo, keyspaces, 1, -1)
-
-      {:ok, :requeued}
+      {:requeue, new_error_count, calculate_backoff_delay(opts, new_error_count)}
     end
+  end
+
+  defp write_requeue(repo, keyspaces, _pointers, lease, item, item_key, {:dead_letter, _error_count}, now) do
+    move_to_dead_letter(repo, keyspaces, item_key, item, now)
+    repo.clear(keyspaces.leases, lease.item_id)
+    {:ok, :dead_lettered}
+  end
+
+  defp write_requeue(repo, keyspaces, pointers, lease, item, item_key, {:requeue, error_count, delay}, now) do
+    new_vesting_time = now + delay
+
+    updated_item = %{
+      item
+      | error_count: error_count,
+        vesting_time: new_vesting_time,
+        lease_id: nil,
+        lease_expires_at: nil
+    }
+
+    repo.clear(keyspaces.items, item_key)
+    new_item_key = Item.key(updated_item)
+    repo.put(keyspaces.items, new_item_key, encode(updated_item))
+
+    update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
+    repo.clear(keyspaces.leases, lease.item_id)
+    update_stats(repo, keyspaces, 1, -1)
+
+    {:ok, :requeued}
   end
 
   # Calculate backoff delay based on options.
@@ -818,6 +874,32 @@ defmodule Bedrock.JobQueue.Store do
         if stored.id == lease.id, do: {:ok, stored}, else: {:error, :lease_mismatch}
     end
   end
+
+  # Finalization must observe the same active-ownership condition as execution:
+  # an ID match alone is insufficient once another consumer may claim the item.
+  # Sample time only after reading the stored lease so a blocked read cannot
+  # authorize work past the stored expiration deadline.
+  defp verify_active_lease(repo, keyspaces, %Lease{} = lease, clock) do
+    with {:ok, stored_lease} <- verify_lease(repo, keyspaces, lease),
+         {:ok, now} <- active_now(stored_lease, clock) do
+      {:ok, stored_lease, now}
+    end
+  end
+
+  defp active_now(%Lease{} = lease, clock) do
+    now = clock.()
+    if lease.expires_at > now, do: {:ok, now}, else: {:error, :lease_expired}
+  end
+
+  defp clock(opts) do
+    case Keyword.fetch(opts, :clock) do
+      {:ok, clock} when is_function(clock, 0) -> clock
+      :error -> fixed_clock(Keyword.get(opts, :now))
+    end
+  end
+
+  defp fixed_clock(nil), do: fn -> System.system_time(:millisecond) end
+  defp fixed_clock(now), do: fn -> now end
 
   # Updates the pointer index with a new vesting time.
   # Per QuiCK paper: stores last_active_time (when items were last seen) for smarter GC.

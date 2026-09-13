@@ -638,7 +638,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, current_item)
       MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
 
-      assert :ok = Store.complete(MockRepo, root(), stale_lease)
+      assert :ok =
+               Store.complete(MockRepo, root(), stale_lease, now: extended_expires_at - 1)
       assert MockRepo.get(keyspaces.items, current_item_key) == nil
       assert MockRepo.get(keyspaces.leases, stale_lease.item_id) == nil
     end

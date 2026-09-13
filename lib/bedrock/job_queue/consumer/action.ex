@@ -36,15 +36,28 @@ defmodule Bedrock.JobQueue.Consumer.Action do
     end
   end
 
-  defp run_queue_action(repo, root, lease, :complete, _opts), do: Store.complete(repo, root, lease)
+  defp run_queue_action(repo, root, lease, :complete, opts),
+    do: Store.complete(repo, root, lease, queue_time_opts(opts))
 
   defp run_queue_action(repo, root, lease, :requeue, opts) do
-    Store.requeue(repo, root, lease, backoff_fn: Keyword.fetch!(opts, :backoff_fn))
+    Store.requeue(
+      repo,
+      root,
+      lease,
+      Keyword.merge(queue_time_opts(opts), backoff_fn: Keyword.fetch!(opts, :backoff_fn))
+    )
   end
 
-  defp run_queue_action(repo, root, lease, {:snooze, delay_ms}, _opts) do
-    Store.requeue(repo, root, lease, base_delay: delay_ms, max_delay: delay_ms)
+  defp run_queue_action(repo, root, lease, {:snooze, delay_ms}, opts) do
+    Store.requeue(
+      repo,
+      root,
+      lease,
+      Keyword.merge(queue_time_opts(opts), base_delay: delay_ms, max_delay: delay_ms)
+    )
   end
+
+  defp queue_time_opts(opts), do: Keyword.take(opts, [:clock, :now])
 
   defp queue_action_succeeded?(:ok), do: true
   defp queue_action_succeeded?({:ok, _status}), do: true

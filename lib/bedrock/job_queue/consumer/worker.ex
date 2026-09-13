@@ -72,7 +72,7 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   end
 
   defp execute_with_verified_lease(item, workers, %{repo: repo, root: root, lease: lease} = context) do
-    case transaction_result(repo, fn -> Store.lease_owned?(repo, root, lease) end) do
+    case transaction_result(repo, fn -> Store.lease_owned?(repo, root, lease, context.lease_check_opts) end) do
       :ok -> execute_with_lease_guard(item, workers, context)
       {:error, reason} when reason in [:lease_not_found, :lease_mismatch, :lease_expired] ->
         {:cancelled, {:lease_lost, reason}}
@@ -182,6 +182,7 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
          root: root,
          lease: lease,
          lease_duration: Keyword.get(opts, :lease_duration, 30_000),
+         lease_check_opts: Keyword.get(opts, :lease_check_opts, []),
          lease_extender_opts: Keyword.get(opts, :lease_extender_opts, [])
        }}
     else

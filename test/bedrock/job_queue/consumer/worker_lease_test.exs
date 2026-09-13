@@ -89,6 +89,40 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
     end
   end
 
+  defmodule BlockingPreflightRepo do
+    def transact(callback), do: callback.()
+
+    def get(_keyspace, _item_id) do
+      %{encoded_lease: encoded_lease, test_pid: test_pid} =
+        Agent.get(:worker_lease_blocking_preflight_repo, & &1)
+
+      send(test_pid, {:preflight_read_blocked, self()})
+
+      receive do
+        :finish_preflight_read -> encoded_lease
+      end
+    end
+  end
+
+  defmodule StalledRenewalRepo do
+    def transact(callback) do
+      case Agent.get(:worker_lease_stalled_renewal_repo, & &1.phase) do
+        :preflight ->
+          Agent.update(:worker_lease_stalled_renewal_repo, &Map.put(&1, :phase, :renewing))
+          callback.()
+
+        :renewing ->
+          %{test_pid: test_pid} = Agent.get(:worker_lease_stalled_renewal_repo, & &1)
+          send(test_pid, {:renewal_transaction_stalled, self()})
+          receive do end
+      end
+    end
+
+    def get(_keyspace, _item_id) do
+      Agent.get(:worker_lease_stalled_renewal_repo, & &1.encoded_lease)
+    end
+  end
+
   test "kills the running handler when renewal proves the lease was lost" do
     Process.register(self(), :worker_lease_test_process)
 
@@ -149,6 +183,51 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
                lease: lease
              )
 
+    refute_received :handler_ran
+  end
+
+  test "does not run the handler when the lease expires during a blocked ownership read" do
+    Process.register(self(), :worker_lease_test_process)
+
+    now = System.system_time(:millisecond)
+    {:ok, clock} = Agent.start_link(fn -> now end)
+    item = Item.new("tenant_1", "test:never_run", %{}, now: now)
+    lease = Lease.new(item, "holder", now: now, duration_ms: 30_000)
+    encoded_lease = :erlang.term_to_binary(lease)
+    test_pid = self()
+
+    {:ok, _repo_state} =
+      Agent.start_link(
+        fn -> %{encoded_lease: encoded_lease, test_pid: test_pid} end,
+        name: :worker_lease_blocking_preflight_repo
+      )
+
+    on_exit(fn ->
+      if Process.whereis(:worker_lease_blocking_preflight_repo) do
+        try do
+          Agent.stop(:worker_lease_blocking_preflight_repo)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    task =
+      Task.async(fn ->
+        Worker.execute(item, %{"test:never_run" => NeverRunJob},
+          repo: BlockingPreflightRepo,
+          root: Keyspace.new("job_queue/test/"),
+          lease: lease,
+          lease_check_opts: [clock: fn -> Agent.get(clock, & &1) end]
+        )
+      end)
+
+    assert_receive {:preflight_read_blocked, reader_pid}
+    Agent.update(clock, fn _ -> lease.expires_at end)
+    send(reader_pid, :finish_preflight_read)
+
+    assert_receive {task_ref, {:cancelled, {:lease_lost, :lease_expired}}}
+    assert task_ref == task.ref
     refute_received :handler_ran
   end
 
@@ -278,19 +357,66 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
 
     assert_receive {:perform_started, handler_pid}
     handler_ref = Process.monitor(handler_pid)
-    assert_receive {:raising_renewal_attempt, extender_pid}
+    assert_receive {:raising_renewal_attempt, extender_pid}, 500
 
     send(extender_pid, :raise_transiently)
-    assert_receive {:renewal_retried, ^extender_pid}
+    assert_receive {:renewal_retried, retry_pid}, 500
     assert Process.alive?(task.pid)
     assert Process.alive?(handler_pid)
     refute_received {:DOWN, ^handler_ref, :process, ^handler_pid, _reason}
 
     Agent.update(clock, fn _ -> lease.expires_at end)
-    send(extender_pid, :fail_at_expiry)
+    send(retry_pid, :fail_at_expiry)
 
     assert_receive {task_ref, {:cancelled, {:lease_lost, :lease_expired}}}
     assert task_ref == task.ref
     assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, :killed}
+  end
+
+  test "cancels the handler at expiry when renewal transaction stalls" do
+    Process.register(self(), :worker_lease_test_process)
+
+    now = System.system_time(:millisecond)
+    item = Item.new("tenant_1", "test:blocking", %{}, now: now)
+    lease = Lease.new(item, "holder", now: now, duration_ms: 100)
+    encoded_lease = :erlang.term_to_binary(lease)
+    test_pid = self()
+
+    {:ok, _repo_state} =
+      Agent.start_link(
+        fn -> %{phase: :preflight, encoded_lease: encoded_lease, test_pid: test_pid} end,
+        name: :worker_lease_stalled_renewal_repo
+      )
+
+    on_exit(fn ->
+      if Process.whereis(:worker_lease_stalled_renewal_repo) do
+        try do
+          Agent.stop(:worker_lease_stalled_renewal_repo)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    task =
+      Task.async(fn ->
+        Worker.execute(item, %{"test:blocking" => BlockingJob},
+          repo: StalledRenewalRepo,
+          root: Keyspace.new("job_queue/test/"),
+          lease: lease,
+          lease_duration: 100,
+          lease_extender_opts: [interval: 0]
+        )
+      end)
+
+    assert_receive {:perform_started, handler_pid}
+    handler_ref = Process.monitor(handler_pid)
+    assert_receive {:renewal_transaction_stalled, renewal_pid}, 500
+    renewal_ref = Process.monitor(renewal_pid)
+
+    assert_receive {task_ref, {:cancelled, {:lease_lost, :lease_expired}}}, 1_000
+    assert task_ref == task.ref
+    assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, :killed}
+    assert_receive {:DOWN, ^renewal_ref, :process, ^renewal_pid, :killed}
   end
 end

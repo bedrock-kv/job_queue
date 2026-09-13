@@ -48,9 +48,11 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
     extension = Keyword.get(opts, :extension, lease_duration)
     notify = Keyword.get(opts, :notify, self())
     clock = Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end)
+    owner = self()
 
     spawn_link(fn ->
-      loop(repo, root, lease, interval, extension, notify, clock)
+      Process.flag(:trap_exit, true)
+      loop(repo, root, lease, interval, extension, notify, clock, owner)
     end)
   end
 
@@ -67,7 +69,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   end
 
   # Main loop - waits for interval, extends lease, repeats
-  defp loop(repo, root, lease, interval, extension, notify, clock) do
+  defp loop(repo, root, lease, interval, extension, notify, clock, owner) do
     case remaining_ms(lease, clock) do
       0 ->
         report_loss(lease, notify, :lease_expired)
@@ -76,31 +78,120 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
         receive do
           :stop ->
             :ok
+
+          {:EXIT, ^owner, _reason} ->
+            :ok
+
+          {:EXIT, _pid, :normal} ->
+            loop(repo, root, lease, interval, extension, notify, clock, owner)
+
+          {:EXIT, _pid, _reason} ->
+            loop(repo, root, lease, interval, extension, notify, clock, owner)
         after
           min(interval, remaining_ms) ->
-            case extend_lease(repo, root, lease, extension, clock) do
-              {:ok, updated_lease} ->
-                loop(repo, root, updated_lease, interval, extension, notify, clock)
-
-              {:retry, reason} ->
-                Logger.warning(
-                  "Failed to extend lease for item #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}; will retry while the lease remains valid"
-                )
-
-                loop(repo, root, lease, interval, extension, notify, clock)
-
-              {:lost, reason} ->
-                report_loss(lease, notify, reason)
-            end
+            renew_or_expire(repo, root, lease, interval, extension, notify, clock, owner)
         end
     end
+  end
+
+  defp renew_or_expire(repo, root, lease, interval, extension, notify, clock, owner) do
+    case remaining_ms(lease, clock) do
+      0 -> report_loss(lease, notify, :lease_expired)
+
+      _ ->
+        handle_renewal(
+          await_renewal(repo, root, lease, extension, clock, owner),
+          {repo, root, lease, interval, extension, notify, clock, owner}
+        )
+    end
+  end
+
+  defp handle_renewal({:ok, updated_lease}, {repo, root, _lease, interval, extension, notify, clock, owner}),
+    do: loop(repo, root, updated_lease, interval, extension, notify, clock, owner)
+
+  defp handle_renewal({:retry, reason}, {repo, root, lease, interval, extension, notify, clock, owner}) do
+    Logger.warning(
+      "Failed to extend lease for item #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}; will retry while the lease remains valid"
+    )
+
+    loop(repo, root, lease, interval, extension, notify, clock, owner)
+  end
+
+  defp handle_renewal({:lost, reason}, {_repo, _root, lease, _interval, _extension, notify, _clock, _owner}),
+    do: report_loss(lease, notify, reason)
+
+  defp handle_renewal(:stopped, {_repo, _root, _lease, _interval, _extension, _notify, _clock, _owner}), do: :ok
+
+  # A renewal must not hide the lease deadline. Run it in a linked, monitored
+  # process so expiry (or stop) can kill a stalled transaction without leaving
+  # work behind. The link preserves the Worker -> Extender -> renewal lifetime.
+  defp await_renewal(repo, root, lease, extension, clock, owner) do
+    result_ref = make_ref()
+    parent = self()
+
+    pid =
+      spawn_link(fn ->
+        send(parent, {:renewal_result, result_ref, extend_lease(repo, root, lease, extension, clock)})
+      end)
+
+    monitor = Process.monitor(pid)
+
+    wait_for_renewal(pid, monitor, result_ref, lease, clock, owner)
+  end
+
+  defp wait_for_renewal(pid, monitor, result_ref, lease, clock, owner) do
+    remaining_ms = remaining_ms(lease, clock)
+
+    receive do
+      :stop ->
+        stop_renewal(pid, monitor)
+        :stopped
+
+      {:EXIT, ^owner, _reason} ->
+        stop_renewal(pid, monitor)
+        :stopped
+
+      {:renewal_result, ^result_ref, result} ->
+        Process.unlink(pid)
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:EXIT, ^pid, :normal} ->
+        wait_for_renewal(pid, monitor, result_ref, lease, clock, owner)
+
+      {:EXIT, ^pid, reason} ->
+        Process.demonitor(monitor, [:flush])
+        {:retry, {:renewal_task_exit, reason}}
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        Process.unlink(pid)
+        {:retry, {:renewal_task_exit, reason}}
+    after
+      remaining_ms ->
+        stop_renewal(pid, monitor)
+        {:lost, :lease_expired}
+    end
+  end
+
+  defp stop_renewal(pid, monitor) do
+    Process.unlink(pid)
+
+    if Process.alive?(pid) do
+      Process.exit(pid, :kill)
+      receive do
+        {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+      end
+    end
+
+    Process.demonitor(monitor, [:flush])
+    :ok
   end
 
   # Extends the lease. Missing/mismatched storage and lease expiry prove the
   # worker no longer has an exclusive right to execute; transaction failures and
   # exceptions do not and are retried until the expiry deadline.
   defp extend_lease(repo, root, lease, extension, clock) do
-    result = transaction_result(repo, fn -> Store.extend_lease(repo, root, lease, extension, now: clock.()) end)
+    result = transaction_result(repo, fn -> Store.extend_lease(repo, root, lease, extension, clock: clock) end)
 
     case result do
       {:ok, %Lease{} = updated_lease} ->

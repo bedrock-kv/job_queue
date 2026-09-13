@@ -5,6 +5,7 @@ defmodule Bedrock.JobQueue.Item do
   ## Fields
 
   - `id` - Unique job identifier (UUID binary)
+  - `custom_id?` - Whether the ID was supplied by the caller
   - `topic` - Job type/topic (Phoenix PubSub-style, e.g., "user:created")
   - `priority` - Integer priority (lower = higher priority)
   - `vesting_time` - When the job becomes visible (milliseconds since epoch)
@@ -20,6 +21,7 @@ defmodule Bedrock.JobQueue.Item do
 
   @type t :: %__MODULE__{
           id: binary(),
+          custom_id?: boolean(),
           topic: String.t(),
           priority: non_neg_integer(),
           vesting_time: non_neg_integer(),
@@ -41,7 +43,8 @@ defmodule Bedrock.JobQueue.Item do
     :error_count,
     :max_retries,
     :payload,
-    :queue_id
+    :queue_id,
+    custom_id?: false
   ]
 
   @default_priority 100
@@ -52,7 +55,8 @@ defmodule Bedrock.JobQueue.Item do
 
   ## Options
 
-  - `:id` - Custom job ID (default: random 16-byte binary)
+  - `:id` - Custom job ID (default: random 16-byte binary). A supplied ID is
+    retained as enqueue intent so direct `Store.enqueue/4` calls are idempotent.
   - `:priority` - Integer priority, lower = higher priority (default: 100)
   - `:vesting_time` - When the job becomes visible in ms since epoch (default: now)
   - `:max_retries` - Maximum retry attempts before dead-lettering (default: 3)
@@ -70,6 +74,7 @@ defmodule Bedrock.JobQueue.Item do
 
     %__MODULE__{
       id: Keyword.get(opts, :id, generate_id()),
+      custom_id?: Keyword.has_key?(opts, :id),
       topic: topic,
       priority: Keyword.get(opts, :priority, @default_priority),
       vesting_time: Keyword.get(opts, :vesting_time, now),

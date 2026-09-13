@@ -93,6 +93,13 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     expected_key = Item.key(item)
 
     repo
+    |> expect(:get, fn %Keyspace{} = ks, key ->
+      assert String.contains?(Keyspace.prefix(ks), "identity_metadata/"),
+             "Expected identity metadata keyspace, got: #{Keyspace.prefix(ks)}"
+
+      assert key == "state"
+      "current"
+    end)
     |> expect(:put, fn %Keyspace{} = ks, key, value ->
       assert String.contains?(Keyspace.prefix(ks), "items/"),
              "Expected items keyspace, got: #{Keyspace.prefix(ks)}"
@@ -296,7 +303,11 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
     stub(repo, :get, fn %Keyspace{} = ks, key ->
       storage_key = {Keyspace.prefix(ks), key}
-      Agent.get(store_agent, &Map.get(&1, storage_key))
+      packed_key = Keyspace.pack(ks, key)
+
+      Agent.get(store_agent, fn state ->
+        Map.get(state, storage_key) || Map.get(state, {:atomic_counter, packed_key})
+      end)
     end)
 
     stub(repo, :clear, fn %Keyspace{} = ks, key ->
@@ -306,7 +317,11 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     end)
 
     stub(repo, :max, fn _key, _value -> :ok end)
-    stub(repo, :add, fn _key, _value -> :ok end)
+
+    stub(repo, :add, fn key, <<delta::64-signed-little>> ->
+      increment_atomic_counter(store_agent, key, delta)
+      :ok
+    end)
 
     # Support Keyspace-based get_range and tuple-based raw key range
     stub(repo, :get_range, fn
@@ -356,6 +371,33 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
   defp extract_key_value({{prefix, key}, v}) when is_binary(key), do: {prefix <> key, v}
   defp extract_key_value({k, v}), do: {k, v}
+
+  defp increment_atomic_counter(store_agent, key, delta) do
+    Agent.update(store_agent, &put_atomic_counter(&1, key, delta))
+  end
+
+  defp put_atomic_counter(state, key, delta) do
+    updated_value = atomic_counter_value(state, key) + delta
+    Map.put(state, {:atomic_counter, key}, <<updated_value::64-signed-little>>)
+  end
+
+  defp atomic_counter_value(state, key) do
+    case Map.get(state, {:atomic_counter, key}) do
+      nil -> 0
+      <<value::64-signed-little>> -> value
+    end
+  end
+
+  @doc """
+  Seeds an atomic counter in the stateful store.
+  """
+  def store_counter(store_agent, keyspace, key, value) do
+    packed_key = Keyspace.pack(keyspace, key)
+
+    Agent.update(store_agent, fn state ->
+      Map.put(state, {:atomic_counter, packed_key}, <<value::64-signed-little>>)
+    end)
+  end
 
   @doc """
   Stores an item in the mock store.

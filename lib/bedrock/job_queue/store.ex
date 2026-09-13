@@ -10,6 +10,8 @@ defmodule Bedrock.JobQueue.Store do
       job_queue/
         queues/{queue_id}/
           items/                         # {priority, vesting_time, id} -> Item
+          identities/{item_id}           # -> canonical custom-ID Item
+          identity_metadata/state         # -> current | legacy
           leases/{item_id}               # -> Lease
           dead_letter/{timestamp}/{id}   # -> Item (failed jobs after max retries)
           stats/pending                  # atomic counter
@@ -41,10 +43,12 @@ defmodule Bedrock.JobQueue.Store do
   @doc """
   Creates keyspaces for a queue.
 
-  Returns a map with keyspaces for items, leases, and stats.
+  Returns a map with keyspaces for item identities, items, leases, and stats.
   """
   @spec queue_keyspaces(root_keyspace(), String.t()) :: %{
           dead_letter: Keyspace.t(),
+          identity_metadata: Keyspace.t(),
+          identities: Keyspace.t(),
           items: Keyspace.t(),
           leases: Keyspace.t(),
           stats: Keyspace.t()
@@ -54,6 +58,8 @@ defmodule Bedrock.JobQueue.Store do
 
     %{
       dead_letter: Keyspace.partition(queue_ks, "dead_letter/"),
+      identity_metadata: Keyspace.partition(queue_ks, "identity_metadata/"),
+      identities: Keyspace.partition(queue_ks, "identities/"),
       items: Keyspace.partition(queue_ks, "items/", key_encoding: TupleEncoding),
       leases: Keyspace.partition(queue_ks, "leases/"),
       stats: Keyspace.partition(queue_ks, "stats/")
@@ -149,26 +155,135 @@ defmodule Bedrock.JobQueue.Store do
   @doc """
   Enqueues a job item atomically.
 
+  A supplied item ID is a queue-scoped idempotency key. The first enqueue
+  persists the canonical item in a durable identity index; later calls with
+  that ID resolve to the canonical item without changing queue state. The
+  identity record remains after completion, so retries cannot recreate completed
+  work. `enqueue/4` returns `:ok`; use `enqueue_with_item/4` when the caller
+  needs the canonical item.
+
+  Generated IDs bypass the identity index because they are already unique.
+
+  Queues created before the identity index are detected lazily. Active legacy
+  items are indexed transactionally on retry. A legacy queue with no matching
+  active item rejects a custom ID with `:legacy_custom_id_unknown`, rather than
+  risk recreating completed work whose ID was not historically recorded.
+
   Within a transaction:
   1. Writes item to queue zone with key {priority, vesting_time, id}
   2. Updates pointer index with atomic min for vesting_time
   3. Increments pending_count via atomic add
   """
-  @spec enqueue(repo(), root_keyspace(), Item.t(), keyword()) :: :ok
+  @spec enqueue(repo(), root_keyspace(), Item.t(), keyword()) ::
+          :ok
+          | {:error, :legacy_custom_id_unknown | :legacy_duplicate_custom_id}
   def enqueue(repo, root, %Item{} = item, opts \\ []) do
+    case enqueue_with_item(repo, root, item, opts) do
+      {:ok, _item} -> :ok
+      error -> error
+    end
+  end
+
+  @doc """
+  Enqueues a job and returns the canonical item for idempotent custom IDs.
+
+  This companion to `enqueue/4` is for callers that need the item created by
+  the first enqueue rather than the retry input. `enqueue/4` preserves its
+  established `:ok` return value.
+  """
+  @spec enqueue_with_item(repo(), root_keyspace(), Item.t(), keyword()) ::
+          {:ok, Item.t()}
+          | {:error, :legacy_custom_id_unknown | :legacy_duplicate_custom_id}
+  def enqueue_with_item(repo, root, %Item{} = item, opts \\ []) do
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    identity_state = identity_state(repo, keyspaces)
 
-    # Write item with tuple key
+    if custom_id?(item, opts) do
+      enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state)
+    else
+      write_new_item(repo, keyspaces, pointers, item, now)
+    end
+  end
+
+  defp custom_id?(item, opts) do
+    Keyword.get(opts, :custom_id?, Map.get(item, :custom_id?, false))
+  end
+
+  defp enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state) do
+    case repo.get(keyspaces.identities, item.id) do
+      nil ->
+        enqueue_unindexed_custom_id(repo, keyspaces, pointers, item, now, identity_state)
+
+      value ->
+        {:ok, decode(value)}
+    end
+  end
+
+  defp enqueue_unindexed_custom_id(repo, keyspaces, pointers, item, now, :current) do
+    repo.put(keyspaces.identities, item.id, encode(item))
+    write_new_item(repo, keyspaces, pointers, item, now)
+  end
+
+  defp enqueue_unindexed_custom_id(repo, keyspaces, _pointers, item, _now, :legacy) do
+    case legacy_items_with_id(repo, keyspaces, item.id) do
+      [legacy_item] ->
+        repo.put(keyspaces.identities, item.id, encode(legacy_item))
+        {:ok, legacy_item}
+
+      [] ->
+        {:error, :legacy_custom_id_unknown}
+
+      _duplicate_items ->
+        {:error, :legacy_duplicate_custom_id}
+    end
+  end
+
+  defp identity_state(repo, keyspaces) do
+    case repo.get(keyspaces.identity_metadata, "state") do
+      "current" -> :current
+      "legacy" -> :legacy
+      nil -> initialize_identity_state(repo, keyspaces)
+    end
+  end
+
+  defp initialize_identity_state(repo, keyspaces) do
+    state = if legacy_queue?(repo, keyspaces), do: :legacy, else: :current
+    repo.put(keyspaces.identity_metadata, "state", Atom.to_string(state))
+    state
+  end
+
+  defp legacy_queue?(repo, keyspaces) do
+    keyspace_has_entries?(repo, keyspaces.items) or
+      keyspace_has_entries?(repo, keyspaces.dead_letter) or
+      repo.get(keyspaces.stats, "pending") != nil or
+      repo.get(keyspaces.stats, "processing") != nil
+  end
+
+  defp legacy_items_with_id(repo, keyspaces, item_id) do
+    keyspaces.items
+    |> item_keyspace_range(repo, [])
+    |> Stream.map(fn {_key, value} -> decode(value) end)
+    |> Enum.filter(&(&1.id == item_id))
+  end
+
+  defp keyspace_has_entries?(repo, keyspace) do
+    keyspace
+    |> Keyspace.prefix()
+    |> Bedrock.KeyRange.from_prefix()
+    |> repo.get_range(limit: 1)
+    |> Enum.any?()
+  end
+
+  defp write_new_item(repo, keyspaces, pointers, item, now) do
     item_key = Item.key(item)
     repo.put(keyspaces.items, item_key, encode(item))
 
-    # Update pointer index and stats
     update_pointer(repo, pointers, item.vesting_time, item.queue_id, now)
     update_stats(repo, keyspaces, 1, 0)
 
-    :ok
+    {:ok, item}
   end
 
   @doc """

@@ -25,7 +25,10 @@ defmodule Bedrock.JobQueue.Internal do
   - `:in` - Delay in milliseconds before processing
   - `:priority` - Integer priority (lower = higher priority, default: 100)
   - `:max_retries` - Maximum retry attempts (default: 3)
-  - `:id` - Custom job ID (default: auto-generated UUID)
+  - `:id` - Custom job ID used as a queue-scoped idempotency key. The first
+    enqueue wins; subsequent calls return that original job, including after completion.
+    For queues created before custom-ID tracking, retries migrate an active
+    item; an unknown ID returns `{:error, :legacy_custom_id_unknown}`.
 
   ## Examples
 
@@ -49,8 +52,7 @@ defmodule Bedrock.JobQueue.Internal do
     item = Item.new(queue_id, topic, payload, opts)
 
     config.repo.transact(fn ->
-      Store.enqueue(config.repo, root, item, now: now)
-      {:ok, item}
+      Store.enqueue_with_item(config.repo, root, item, now: now)
     end)
   end
 

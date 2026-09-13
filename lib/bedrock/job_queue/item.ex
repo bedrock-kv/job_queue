@@ -60,6 +60,24 @@ defmodule Bedrock.JobQueue.Item do
   def min_priority, do: @min_priority
 
   @doc false
+  @spec max_vesting_time() :: non_neg_integer()
+  def max_vesting_time, do: @max_vesting_time
+
+  @doc false
+  @spec add_vesting_time(term(), term()) ::
+          {:ok, non_neg_integer()} | {:error, :vesting_time_out_of_range}
+  def add_vesting_time(time, delay)
+      when is_integer(time) and is_integer(delay) and time >= 0 and delay >= 0 do
+    if time <= @max_vesting_time and delay <= @max_vesting_time - time do
+      {:ok, time + delay}
+    else
+      {:error, :vesting_time_out_of_range}
+    end
+  end
+
+  def add_vesting_time(_time, _delay), do: {:error, :vesting_time_out_of_range}
+
+  @doc false
   @spec max_priority() :: integer()
   def max_priority, do: @max_priority
 

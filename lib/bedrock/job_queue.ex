@@ -144,6 +144,11 @@ defmodule Bedrock.JobQueue do
         item; an unknown ID returns `{:error, :legacy_custom_id_unknown}` to avoid
         recreating historical work.
 
+      Job vesting timestamps use the unsigned 64-bit millisecond domain
+      `0..18_446_744_073_709_551_615`. If `:at` or `:in` falls outside that
+      domain, enqueue returns `{:error, :vesting_time_out_of_range}` before it
+      starts a transaction.
+
       A nonempty queue created before the priority index returns
       `{:error, :priority_index_migration_required}` until it has been migrated
       with `migrate_queue/2` after old writers have been fenced. The first

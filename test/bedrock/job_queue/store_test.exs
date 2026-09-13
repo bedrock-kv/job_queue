@@ -122,6 +122,7 @@ defmodule Bedrock.JobQueue.StoreTest do
     end
 
     def operations(store), do: Agent.get(store, &Enum.reverse(&1.operations))
+    def entries(store), do: Agent.get(store, & &1.data)
     def clear_operations(store), do: Agent.update(store, &%{&1 | operations: []})
 
     defp fetch(key, store) do
@@ -277,6 +278,23 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert pointers.key_encoding == TupleEncoding
       assert String.contains?(Keyspace.prefix(pointers), "pointers/")
+    end
+
+    test "scans pointers at the maximum timestamp through the pointer prefix end" do
+      maximum = (1 <<< 64) - 1
+      pointers = Store.pointer_keyspace(root())
+      start_key = Keyspace.pack(pointers, {0, <<>>})
+      {_, prefix_end} = Bedrock.KeyRange.from_prefix(Keyspace.prefix(pointers))
+      pointer_key = Keyspace.pack(pointers, {maximum, "maximum-time"})
+
+      expect(MockRepo, :get_range, fn {received_start, received_end}, opts ->
+        assert received_start == start_key
+        assert received_end == prefix_end
+        assert opts[:limit] == 10
+        [{pointer_key, <<maximum::64-little>>}]
+      end)
+
+      assert ["maximum-time"] = Store.scan_visible_queues(MockRepo, root(), now: maximum, limit: 10)
     end
   end
 
@@ -1070,6 +1088,48 @@ defmodule Bedrock.JobQueue.StoreTest do
 
         assert second_id == second.id
       end)
+    end
+
+    test "rejects overflowing lease timestamps before mutating queue state" do
+      maximum = (1 <<< 64) - 1
+
+      overflow_obtain_item = Item.new("overflow-obtain", "item", %{}, vesting_time: maximum)
+      {:ok, obtain_store} = TxVisibilityRepo.start_link([])
+
+      TxVisibilityRepo.with_store(obtain_store, fn ->
+        assert :ok =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.enqueue(TxVisibilityRepo, root(), overflow_obtain_item, now: maximum)
+                 end)
+
+        snapshot = TxVisibilityRepo.entries(obtain_store)
+
+        assert {:error, :vesting_time_out_of_range} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), overflow_obtain_item, "worker", 1, now: maximum)
+                 end)
+
+        assert TxVisibilityRepo.entries(obtain_store) == snapshot
+      end)
+
+      for operation <- [:extend, :requeue] do
+        {lease, store} = maximum_lease(operation)
+
+        TxVisibilityRepo.with_store(store, fn ->
+          snapshot = TxVisibilityRepo.entries(store)
+
+          result =
+            TxVisibilityRepo.transact(fn ->
+              case operation do
+                :extend -> Store.extend_lease(TxVisibilityRepo, root(), lease, 2, now: maximum - 1)
+                :requeue -> Store.requeue(TxVisibilityRepo, root(), lease, base_delay: 2, now: maximum - 1)
+              end
+            end)
+
+          assert {:error, :vesting_time_out_of_range} = result
+          assert TxVisibilityRepo.entries(store) == snapshot
+        end)
+      end
     end
 
     test "fences every direct operation for unknown v2 markers and nonempty markerless legacy queues" do
@@ -1979,6 +2039,29 @@ defmodule Bedrock.JobQueue.StoreTest do
     end)
 
     {first, second, lease, store}
+  end
+
+  defp maximum_lease(operation) do
+    maximum = (1 <<< 64) - 1
+    now = maximum - 1
+    queue_id = "overflow-#{operation}"
+    item = Item.new(queue_id, "item", %{}, vesting_time: now)
+    {:ok, store} = TxVisibilityRepo.start_link([])
+
+    lease =
+      TxVisibilityRepo.with_store(store, fn ->
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), item, now: now) end)
+
+        assert {:ok, lease} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), item, "worker", 1, now: now)
+                 end)
+
+        assert lease.expires_at == maximum
+        lease
+      end)
+
+    {lease, store}
   end
 
   defp legacy_item(queue_id, id, opts) do

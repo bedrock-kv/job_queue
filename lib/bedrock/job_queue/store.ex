@@ -68,6 +68,7 @@ defmodule Bedrock.JobQueue.Store do
   @type repo :: module()
   @type root_keyspace :: Keyspace.t()
   @type priority_index_status :: :writer_fence_required | :migrating | :ready | :empty
+  @type timestamp_error :: :vesting_time_out_of_range
 
   @doc """
   Creates keyspaces for a queue.
@@ -202,7 +203,8 @@ defmodule Bedrock.JobQueue.Store do
           pos_integer(),
           keyword()
         ) ::
-          {:ok, QueueLease.t()} | {:error, :queue_leased | :priority_index_migration_required}
+          {:ok, QueueLease.t()}
+          | {:error, :queue_leased | :priority_index_migration_required | timestamp_error()}
   def obtain_queue_lease(repo, root, queue_id, holder, duration_ms, opts \\ []) do
     ks = queue_lease_keyspace(root)
     clock = clock(opts)
@@ -212,9 +214,12 @@ defmodule Bedrock.JobQueue.Store do
         nil ->
           # No existing lease - create new one
           now = clock.()
-          lease = QueueLease.new(queue_id, holder, duration_ms: duration_ms, now: now)
-          repo.put(ks, queue_id, encode(lease))
-          {:ok, lease}
+
+          with {:ok, _expires_at} <- future_vesting_time(now, duration_ms) do
+            lease = QueueLease.new(queue_id, holder, duration_ms: duration_ms, now: now)
+            repo.put(ks, queue_id, encode(lease))
+            {:ok, lease}
+          end
 
         value ->
           existing = decode(value)
@@ -222,9 +227,11 @@ defmodule Bedrock.JobQueue.Store do
 
           if existing.expires_at <= now do
             # Existing lease expired - replace it
-            lease = QueueLease.new(queue_id, holder, duration_ms: duration_ms, now: now)
-            repo.put(ks, queue_id, encode(lease))
-            {:ok, lease}
+            with {:ok, _expires_at} <- future_vesting_time(now, duration_ms) do
+              lease = QueueLease.new(queue_id, holder, duration_ms: duration_ms, now: now)
+              repo.put(ks, queue_id, encode(lease))
+              {:ok, lease}
+            end
           else
             # Lease still active
             {:error, :queue_leased}
@@ -287,6 +294,10 @@ defmodule Bedrock.JobQueue.Store do
   old writers and migrate it explicitly before enqueuing. An unsupported or
   malformed v2 migration marker is held too, even if the raw queue is empty.
 
+  Item vesting times and pointer activity timestamps use the unsigned 64-bit
+  millisecond domain. An out-of-range `:now` returns
+  `{:error, :vesting_time_out_of_range}` before queue state is written.
+
   Within a transaction:
   1. Writes item to queue zone with key {priority, vesting_time, id}
   2. Updates pointer index with atomic min for vesting_time
@@ -299,6 +310,7 @@ defmodule Bedrock.JobQueue.Store do
               :legacy_custom_id_unknown
               | :legacy_duplicate_custom_id
               | :priority_index_migration_required
+              | timestamp_error()
             }
   def enqueue(repo, root, %Item{} = item, opts \\ []) do
     case enqueue_with_item(repo, root, item, opts) do
@@ -322,6 +334,7 @@ defmodule Bedrock.JobQueue.Store do
               :legacy_custom_id_unknown
               | :legacy_duplicate_custom_id
               | :priority_index_migration_required
+              | timestamp_error()
             }
   def enqueue_with_item(repo, root, %Item{} = item, opts \\ []) do
     Item.validate_priority!(item.priority)
@@ -330,7 +343,8 @@ defmodule Bedrock.JobQueue.Store do
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
 
-    with {:ok, priority_index_mode} <- initialize_empty_priority_index(repo, keyspaces) do
+    with :ok <- validate_timestamp(now),
+         {:ok, priority_index_mode} <- initialize_empty_priority_index(repo, keyspaces) do
       identity_state = identity_state(repo, keyspaces)
 
       if custom_id?(item, opts) do
@@ -558,7 +572,8 @@ defmodule Bedrock.JobQueue.Store do
     read (default: `System.system_time/1`)
   """
   @spec obtain_lease(repo(), root_keyspace(), Item.t(), binary(), pos_integer(), keyword()) ::
-          {:ok, Lease.t()} | {:error, :already_leased | :not_found | :priority_index_migration_required}
+          {:ok, Lease.t()}
+          | {:error, :already_leased | :not_found | :priority_index_migration_required | timestamp_error()}
   def obtain_lease(repo, root, %Item{} = item, holder, duration_ms, opts \\ []) do
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
@@ -579,15 +594,16 @@ defmodule Bedrock.JobQueue.Store do
           if Item.leased?(current_item, now: now) do
             {:error, :already_leased}
           else
-            do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now)
+            with {:ok, lease_expires_at} <- future_vesting_time(now, duration_ms) do
+              do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now, lease_expires_at)
+            end
           end
       end
     end
   end
 
-  defp do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now) do
+  defp do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now, lease_expires_at) do
     lease = Lease.new(current_item, holder, duration_ms: duration_ms, now: now)
-    lease_expires_at = now + duration_ms
     pending_item? = current_item.lease_id == nil
 
     updated_item = %{
@@ -637,6 +653,8 @@ defmodule Bedrock.JobQueue.Store do
   - `{:error, :lease_not_found}` - No lease record exists for this item
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
   - `{:error, :item_not_found}` - Item no longer exists in queue
+  - `{:error, :vesting_time_out_of_range}` - Extending would exceed the
+    unsigned 64-bit millisecond timestamp domain
   """
   @spec extend_lease(repo(), root_keyspace(), Lease.t(), pos_integer(), keyword()) ::
           {:ok, Lease.t()}
@@ -647,6 +665,7 @@ defmodule Bedrock.JobQueue.Store do
               | :lease_expired
               | :item_not_found
               | :priority_index_migration_required
+              | timestamp_error()
             }
   def extend_lease(repo, root, %Lease{} = lease, extension_ms, opts \\ []) do
     clock = clock(opts)
@@ -694,8 +713,8 @@ defmodule Bedrock.JobQueue.Store do
         {:error, :item_not_found}
 
       item_value ->
-        with {:ok, now} <- active_now(stored_lease, clock) do
-          new_expires_at = now + extension_ms
+        with {:ok, now} <- active_now(stored_lease, clock),
+             {:ok, new_expires_at} <- future_vesting_time(now, extension_ms) do
           item = decode(item_value)
           updated_item = %{item | vesting_time: new_expires_at, lease_expires_at: new_expires_at}
 
@@ -777,11 +796,18 @@ defmodule Bedrock.JobQueue.Store do
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
   - `{:error, :lease_expired}` - Lease expiry has passed
   - `{:error, :item_not_found}` - Item no longer exists in queue
+  - `{:error, :vesting_time_out_of_range}` - Requeue backoff would exceed the
+    unsigned 64-bit millisecond timestamp domain
   """
   @spec requeue(repo(), root_keyspace(), Lease.t(), keyword()) ::
           {:ok, :requeued | :dead_lettered}
           | {:error,
-             :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found | :priority_index_migration_required}
+             :lease_not_found
+             | :lease_mismatch
+             | :lease_expired
+             | :item_not_found
+             | :priority_index_migration_required
+             | timestamp_error()}
   def requeue(repo, root, %Lease{} = lease, opts) do
     keyspaces = queue_keyspaces(root, lease.queue_id)
     pointers = pointer_keyspace(root)
@@ -827,26 +853,26 @@ defmodule Bedrock.JobQueue.Store do
   end
 
   defp write_requeue(repo, keyspaces, pointers, lease, item, item_key, {:requeue, error_count, delay}, now) do
-    new_vesting_time = now + delay
+    with {:ok, new_vesting_time} <- future_vesting_time(now, delay) do
+      updated_item = %{
+        item
+        | error_count: error_count,
+          vesting_time: new_vesting_time,
+          lease_id: nil,
+          lease_expires_at: nil
+      }
 
-    updated_item = %{
-      item
-      | error_count: error_count,
-        vesting_time: new_vesting_time,
-        lease_id: nil,
-        lease_expires_at: nil
-    }
+      repo.clear(keyspaces.items, item_key)
+      new_item_key = Item.key(updated_item)
+      repo.put(keyspaces.items, new_item_key, encode(updated_item))
+      replace_item_in_priority_index(repo, keyspaces, item, updated_item)
 
-    repo.clear(keyspaces.items, item_key)
-    new_item_key = Item.key(updated_item)
-    repo.put(keyspaces.items, new_item_key, encode(updated_item))
-    replace_item_in_priority_index(repo, keyspaces, item, updated_item)
+      update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
+      repo.clear(keyspaces.leases, lease.item_id)
+      update_stats(repo, keyspaces, 1, -1)
 
-    update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
-    repo.clear(keyspaces.leases, lease.item_id)
-    update_stats(repo, keyspaces, 1, -1)
-
-    {:ok, :requeued}
+      {:ok, :requeued}
+    end
   end
 
   # Calculate backoff delay based on options.
@@ -920,12 +946,14 @@ defmodule Bedrock.JobQueue.Store do
   pointers in the past to prevent the scanner from repeatedly finding them.
   """
   @spec update_queue_pointer(repo(), root_keyspace(), String.t(), non_neg_integer(), keyword()) ::
-          :ok | {:error, :priority_index_migration_required}
+          :ok | {:error, :priority_index_migration_required | timestamp_error()}
   def update_queue_pointer(repo, root, queue_id, vesting_time, opts \\ []) do
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
 
-    with :ok <- require_queue_operation(repo, queue_keyspaces(root, queue_id)) do
+    with :ok <- validate_timestamp(vesting_time),
+         :ok <- validate_timestamp(now),
+         :ok <- require_queue_operation(repo, queue_keyspaces(root, queue_id)) do
       # If new vesting_time is in the future, clean up any stale pointers in the past
       # This prevents the scanner from repeatedly finding stale pointers that point
       # to queues where all visible items have been processed
@@ -941,10 +969,10 @@ defmodule Bedrock.JobQueue.Store do
   # Cleans up pointers for a queue_id that are in the past (vesting_time <= now).
   # This is called when updating to a future vesting_time to remove stale pointers.
   defp cleanup_past_pointers(repo, pointers, queue_id, now) do
-    {start_key, end_key} = pointer_visible_range(now)
+    {start_key, end_key} = pointer_visible_range(pointers, now)
     prefix = Keyspace.prefix(pointers)
 
-    {prefix <> start_key, prefix <> end_key}
+    {start_key, end_key}
     |> repo.get_range(limit: 100)
     |> Enum.each(fn {key, _value} ->
       suffix = binary_part(key, byte_size(prefix), byte_size(key) - byte_size(prefix))
@@ -968,11 +996,11 @@ defmodule Bedrock.JobQueue.Store do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
     limit = Keyword.get(opts, :limit, 100)
 
-    # Range from 0 to now+1 (exclusive)
-    {start_key, end_key} = pointer_visible_range(now)
+    # Range from 0 through now (inclusive).
+    {start_key, end_key} = pointer_visible_range(pointers, now)
     prefix = Keyspace.prefix(pointers)
 
-    {prefix <> start_key, prefix <> end_key}
+    {start_key, end_key}
     |> repo.get_range(limit: limit)
     |> Enum.map(fn {key, _value} ->
       suffix = binary_part(key, byte_size(prefix), byte_size(key) - byte_size(prefix))
@@ -1005,11 +1033,11 @@ defmodule Bedrock.JobQueue.Store do
 
     # Scan pointers that are past their vesting_time + grace period
     cutoff = now - grace_period
-    {start_key, end_key} = pointer_visible_range(cutoff)
+    {start_key, end_key} = pointer_visible_range(pointers, cutoff)
     prefix = Keyspace.prefix(pointers)
 
     stale_pointers =
-      {prefix <> start_key, prefix <> end_key}
+      {start_key, end_key}
       |> repo.get_range(limit: limit)
       |> Enum.map(fn {key, value} ->
         suffix = binary_part(key, byte_size(prefix), byte_size(key) - byte_size(prefix))
@@ -1084,6 +1112,18 @@ defmodule Bedrock.JobQueue.Store do
 
   defp fixed_clock(nil), do: fn -> System.system_time(:millisecond) end
   defp fixed_clock(now), do: fn -> now end
+
+  # All item and pointer timestamps share the tuple encoder's unsigned 64-bit
+  # domain. Check an addition before producing a new item key so a lease or
+  # retry cannot leave partial writes behind when it would overflow.
+  defp future_vesting_time(now, delay), do: Item.add_vesting_time(now, delay)
+
+  defp validate_timestamp(timestamp) do
+    case Item.add_vesting_time(timestamp, 0) do
+      {:ok, _timestamp} -> :ok
+      {:error, :vesting_time_out_of_range} = error -> error
+    end
+  end
 
   # Updates the pointer index with a new vesting time.
   # Per QuiCK paper: stores last_active_time (when items were last seen) for smarter GC.
@@ -1650,11 +1690,29 @@ defmodule Bedrock.JobQueue.Store do
 
   # Pointer key helpers (replacing PointerKey module)
 
-  defp pointer_visible_range(now) do
-    start_key = TupleEncoding.pack({0, <<>>})
-    end_key = TupleEncoding.pack({now + 1, <<>>})
-    {start_key, end_key}
+  defp pointer_visible_range(pointers, now) when is_integer(now) do
+    prefix = Keyspace.prefix(pointers)
+    start_key = prefix <> TupleEncoding.pack({0, <<>>})
+
+    cond do
+      now < 0 ->
+        {start_key, start_key}
+
+      now >= Item.max_vesting_time() ->
+        {start_key, prefix_end(prefix)}
+
+      true ->
+        {start_key, prefix <> TupleEncoding.pack({now + 1, <<>>})}
+    end
   end
+
+  defp pointer_visible_range(pointers, _now) do
+    prefix = Keyspace.prefix(pointers)
+    start_key = prefix <> TupleEncoding.pack({0, <<>>})
+    {start_key, start_key}
+  end
+
+  defp prefix_end(prefix), do: prefix |> Bedrock.KeyRange.from_prefix() |> elem(1)
 
   defp unpack_pointer_key(suffix) do
     TupleEncoding.unpack(suffix)

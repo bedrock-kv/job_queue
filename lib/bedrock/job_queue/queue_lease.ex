@@ -21,6 +21,7 @@ defmodule Bedrock.JobQueue.QueueLease do
   """
 
   alias Bedrock.JobQueue.Expirable
+  alias Bedrock.JobQueue.Item
 
   @type t :: %__MODULE__{
           id: binary(),
@@ -48,13 +49,14 @@ defmodule Bedrock.JobQueue.QueueLease do
   def new(queue_id, holder, opts) do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
     duration = Keyword.get(opts, :duration_ms, @default_duration_ms)
+    expires_at = expiration_time!(now, duration)
 
     %__MODULE__{
       id: derive_id(queue_id, holder, now),
       queue_id: queue_id,
       holder: holder,
       obtained_at: now,
-      expires_at: now + duration
+      expires_at: expires_at
     }
   end
 
@@ -69,6 +71,16 @@ defmodule Bedrock.JobQueue.QueueLease do
     :sha256
     |> :crypto.hash([queue_id, to_string(holder), <<now::64>>])
     |> binary_part(0, 16)
+  end
+
+  defp expiration_time!(now, duration) do
+    case Item.add_vesting_time(now, duration) do
+      {:ok, expires_at} -> expires_at
+
+      {:error, :vesting_time_out_of_range} ->
+        raise ArgumentError,
+              "queue lease expiration must be an unsigned 64-bit millisecond timestamp, got now: #{inspect(now)}, duration_ms: #{inspect(duration)}"
+    end
   end
 
   @doc """

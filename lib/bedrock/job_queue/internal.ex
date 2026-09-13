@@ -33,6 +33,11 @@ defmodule Bedrock.JobQueue.Internal do
     For queues created before custom-ID tracking, retries migrate an active
     item; an unknown ID returns `{:error, :legacy_custom_id_unknown}`.
 
+  Job vesting times use the unsigned 64-bit millisecond domain
+  `0..18_446_744_073_709_551_615`. An `:in` delay (or an `:at` time) outside
+  that domain returns `{:error, :vesting_time_out_of_range}` before starting a
+  transaction.
+
   ## Examples
 
       # Immediate processing
@@ -51,12 +56,14 @@ defmodule Bedrock.JobQueue.Internal do
     config = job_queue_module.__config__()
     root = root_keyspace(job_queue_module)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
-    opts = process_scheduling_opts(opts, now)
-    item = Item.new(queue_id, topic, payload, opts)
 
-    config.repo.transact(fn ->
-      Store.enqueue_with_item(config.repo, root, item, now: now)
-    end)
+    with {:ok, opts} <- process_scheduling_opts(opts, now) do
+      item = Item.new(queue_id, topic, payload, opts)
+
+      config.repo.transact(fn ->
+        Store.enqueue_with_item(config.repo, root, item, now: now)
+      end)
+    end
   end
 
   @doc """
@@ -86,17 +93,23 @@ defmodule Bedrock.JobQueue.Internal do
   end
 
   defp process_scheduling_opts(opts, now) do
-    cond do
-      scheduled_at = Keyword.get(opts, :at) ->
-        vesting_time = DateTime.to_unix(scheduled_at, :millisecond)
-        opts |> Keyword.delete(:at) |> Keyword.put(:vesting_time, vesting_time)
+    with {:ok, _} <- Item.add_vesting_time(now, 0) do
+      cond do
+        scheduled_at = Keyword.get(opts, :at) ->
+          vesting_time = DateTime.to_unix(scheduled_at, :millisecond)
 
-      delay_ms = Keyword.get(opts, :in) ->
-        vesting_time = now + delay_ms
-        opts |> Keyword.delete(:in) |> Keyword.put(:vesting_time, vesting_time)
+          with {:ok, _} <- Item.add_vesting_time(vesting_time, 0) do
+            {:ok, opts |> Keyword.delete(:at) |> Keyword.put(:vesting_time, vesting_time)}
+          end
 
-      true ->
-        opts
+        delay_ms = Keyword.get(opts, :in) ->
+          with {:ok, vesting_time} <- Item.add_vesting_time(now, delay_ms) do
+            {:ok, opts |> Keyword.delete(:in) |> Keyword.put(:vesting_time, vesting_time)}
+          end
+
+        true ->
+          {:ok, opts}
+      end
     end
   end
 

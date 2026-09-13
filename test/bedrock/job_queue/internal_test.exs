@@ -1,6 +1,7 @@
 defmodule Bedrock.JobQueue.InternalTest do
   use ExUnit.Case, async: false
 
+  import Bitwise
   import Bedrock.JobQueue.Test.StoreHelpers
   import Mox
 
@@ -164,6 +165,13 @@ defmodule Bedrock.JobQueue.InternalTest do
 
       assert {:ok, %Item{}} = result
       assert_receive {:transact_result, {:ok, %Item{vesting_time: ^expected_vesting}}}
+    end
+
+    test "rejects an :in delay that exceeds the timestamp domain before starting a transaction" do
+      maximum = (1 <<< 64) - 1
+
+      assert {:error, :vesting_time_out_of_range} =
+               Internal.enqueue(TestJobQueue, "tenant_1", "test:topic", %{}, in: 1, now: maximum)
     end
 
     test "enqueues item with custom priority" do

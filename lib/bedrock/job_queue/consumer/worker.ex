@@ -91,32 +91,37 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp execute_job(%Item{} = item, workers, lease) do
+  defp execute_job(%Item{} = item, workers, lease, start_guard \\ fn -> :ok end) do
     case Map.get(workers, item.topic) do
       nil ->
         Logger.warning("No worker configured for topic: #{item.topic}")
         {:discard, :no_handler}
 
       job_module ->
-        execute_with_timeout(job_module, item, lease)
+        execute_with_timeout(job_module, item, lease, start_guard)
     end
   end
 
   defp execute_with_lease_guard(item, workers, context) do
     if lease_still_active?(context.lease, context.lease_check_opts) do
-      extender =
-        LeaseExtender.start(
-          context.repo,
-          context.root,
-          context.lease,
-          context.lease_duration,
-          Keyword.put(context.lease_extender_opts, :notify, self())
-        )
+      case LeaseExtender.start_ready(
+             context.repo,
+             context.root,
+             context.lease,
+             context.lease_duration,
+             Keyword.put(context.lease_extender_opts, :notify, self())
+           ) do
+        {:ok, extender} ->
+          try do
+            execute_job(item, workers, context.lease, fn ->
+              handler_start_guard(context.lease, context.lease_check_opts)
+            end)
+          after
+            stop_extender(extender)
+          end
 
-      try do
-        execute_job(item, workers, context.lease)
-      after
-        stop_extender(extender)
+        {:error, reason} ->
+          {:cancelled, {:lease_lost, reason}}
       end
     else
       {:cancelled, {:lease_lost, :lease_expired}}
@@ -135,7 +140,18 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
     end
   end
 
-  defp execute_with_timeout(job_module, item, lease) do
+  # This runs in the handler Task itself, directly before `perform/2`. It is
+  # deliberately separate from the parent-side check above: BEAM can schedule
+  # the newly spawned Task after that earlier check, including at lease expiry.
+  defp handler_start_guard(lease, opts) do
+    if lease_still_active?(lease, opts) do
+      :ok
+    else
+      {:cancelled, {:lease_lost, :lease_expired}}
+    end
+  end
+
+  defp execute_with_timeout(job_module, item, lease, start_guard) do
     timeout = get_timeout(job_module)
     payload = Payload.decode(item.payload)
 
@@ -148,7 +164,10 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
 
     task =
       Task.async(fn ->
-        job_module.perform(payload, meta)
+        case start_guard.() do
+          :ok -> job_module.perform(payload, meta)
+          {:cancelled, _reason} = cancelled -> cancelled
+        end
       end)
 
     await_job(task, timeout, lease)

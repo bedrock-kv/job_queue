@@ -30,6 +30,19 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
     end
   end
 
+  defmodule StartupBarrierJob do
+    def perform(_args, _meta) do
+      send(:worker_lease_test_process, {:handler_waiting, self()})
+
+      receive do
+        :perform ->
+          now = Agent.get(:worker_lease_startup_clock, & &1)
+          send(:worker_lease_test_process, {:handler_effect_at, now})
+          :ok
+      end
+    end
+  end
+
   defmodule RetryRepo do
     def transact(callback) do
       case Agent.get(:worker_lease_retry_repo, & &1.phase) do
@@ -275,6 +288,111 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
              )
 
     refute_received :handler_ran
+  end
+
+  test "does not release a handler across the watchdog startup handoff" do
+    Process.register(self(), :worker_lease_test_process)
+
+    now = System.system_time(:millisecond)
+    {:ok, clock} = Agent.start_link(fn -> now end, name: :worker_lease_startup_clock)
+    {:ok, start_guard_state} = Agent.start_link(fn -> :preflight end)
+    {:ok, watchdog_state} = Agent.start_link(fn -> :starting end)
+    item = Item.new("tenant_1", "test:startup_barrier", %{}, now: now)
+    lease = Lease.new(item, "holder", now: now, duration_ms: 10_000)
+    encoded_lease = :erlang.term_to_binary(lease)
+    test_pid = self()
+
+    on_exit(fn ->
+      if Process.whereis(:worker_lease_startup_clock) do
+        Agent.stop(:worker_lease_startup_clock)
+      end
+    end)
+
+    expect(MockRepo, :transact, fn callback -> callback.() end)
+    expect(MockRepo, :get, fn _keyspace, _item_id -> encoded_lease end)
+
+    lease_check_clock = fn ->
+      phase =
+        Agent.get_and_update(start_guard_state, fn
+          :preflight -> {:preflight, :parent}
+          :parent -> {:parent, :handler}
+          :handler -> {:handler, :handler}
+        end)
+
+      case phase do
+        :preflight -> Agent.get(clock, & &1)
+        :parent -> Agent.get(clock, & &1)
+
+        :handler ->
+          send(test_pid, {:handler_start_check, self()})
+
+          receive do
+            :release_handler_start -> Agent.get(clock, & &1)
+          end
+      end
+    end
+
+    watchdog_clock = fn ->
+      phase =
+        Agent.get_and_update(watchdog_state, fn
+          :starting -> {:starting, :running}
+          :running -> {:running, :running}
+        end)
+
+      case phase do
+        :starting ->
+          send(test_pid, {:watchdog_starting, self()})
+
+          receive do
+            :release_watchdog -> Agent.get(clock, & &1)
+          end
+
+        :running ->
+          Agent.get(clock, & &1)
+      end
+    end
+
+    task =
+      Task.async(fn ->
+        Worker.execute(item, %{"test:startup_barrier" => StartupBarrierJob},
+          repo: MockRepo,
+          root: Keyspace.new("job_queue/test/"),
+          lease: lease,
+          lease_duration: 10_000,
+          lease_check_opts: [clock: lease_check_clock],
+          lease_extender_opts: [interval: 100_000, clock: watchdog_clock]
+        )
+      end)
+
+    assert_receive {:watchdog_starting, watchdog_pid}
+    send(watchdog_pid, :release_watchdog)
+
+    boundary =
+      receive do
+        {:handler_start_check, pid} -> {:start_check, pid}
+        {:handler_waiting, pid} -> {:handler, pid}
+      after
+        100 -> flunk("worker did not reach a handler-start boundary")
+      end
+
+    Agent.update(clock, fn _ -> lease.expires_at end)
+
+    case boundary do
+      {:start_check, pid} -> send(pid, :release_handler_start)
+      {:handler, pid} -> send(pid, :perform)
+    end
+
+    # The previous handoff started `perform/2` while watchdog startup was held,
+    # allowing its later effect to observe the expiry time below.
+    receive do
+      {:handler_effect_at, observed_at} ->
+        assert observed_at < lease.expires_at
+    after
+      50 -> :ok
+    end
+
+    assert_receive {task_ref, {:cancelled, {:lease_lost, :lease_expired}}}
+    assert task_ref == task.ref
   end
 
   test "defers without running the handler when preflight is unavailable" do

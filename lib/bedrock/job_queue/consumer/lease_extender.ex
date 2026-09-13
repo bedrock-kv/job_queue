@@ -44,16 +44,52 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   """
   @spec start(module(), term(), Lease.t(), pos_integer(), keyword()) :: pid()
   def start(repo, root, lease, lease_duration, opts \\ []) do
+    start_extender(repo, root, lease, lease_duration, opts, nil)
+  end
+
+  @doc false
+  @spec start_ready(module(), term(), Lease.t(), pos_integer(), keyword()) ::
+          {:ok, pid()} | {:error, :lease_expired}
+  def start_ready(repo, root, lease, lease_duration, opts \\ []) do
+    ready_ref = make_ref()
+    pid = start_extender(repo, root, lease, lease_duration, opts, {self(), ready_ref})
+
+    receive do
+      {:lease_extender_ready, ^ready_ref, ^pid, :ok} -> {:ok, pid}
+      {:lease_extender_ready, ^ready_ref, ^pid, {:error, reason}} -> {:error, reason}
+    end
+  end
+
+  defp start_extender(repo, root, lease, lease_duration, opts, starter) do
     interval = Keyword.get(opts, :interval, div(lease_duration, 3))
     extension = Keyword.get(opts, :extension, lease_duration)
     notify = Keyword.get(opts, :notify, self())
     clock = Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end)
     owner = self()
 
+    # Worker must not release a handler until its watchdog has actually
+    # observed a live lease. Merely spawning it leaves a scheduler gap where a
+    # lease can expire before the watchdog gets its first turn.
     spawn_link(fn ->
       Process.flag(:trap_exit, true)
-      loop(repo, root, lease, interval, extension, notify, clock, owner)
+
+      case remaining_ms(lease, clock) do
+        0 ->
+          reply_ready(starter, {:error, :lease_expired})
+          report_loss(lease, notify, :lease_expired)
+
+        _ ->
+          reply_ready(starter, :ok)
+          loop(repo, root, lease, interval, extension, notify, clock, owner)
+      end
     end)
+  end
+
+  defp reply_ready(nil, _result), do: :ok
+
+  defp reply_ready({starter, ready_ref}, result) do
+    send(starter, {:lease_extender_ready, ready_ref, self(), result})
+    :ok
   end
 
   @doc """

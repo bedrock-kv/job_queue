@@ -203,6 +203,7 @@ defmodule Bedrock.JobQueue.StoreTest do
                identities: identities,
                items: items,
                leases: leases,
+               legacy_priority_index: legacy_priority_index,
                priority_index: priority_index,
                stats: stats
              } = keyspaces
@@ -212,6 +213,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert identities.key_encoding == nil
       assert items.key_encoding == TupleEncoding
       assert leases.key_encoding == nil
+      assert legacy_priority_index.key_encoding == TupleEncoding
       assert priority_index.key_encoding == TupleEncoding
       assert stats.key_encoding == nil
 
@@ -221,6 +223,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert String.contains?(Keyspace.prefix(identities), "identities/")
       assert String.contains?(Keyspace.prefix(items), "items/")
       assert String.contains?(Keyspace.prefix(leases), "leases/")
+      assert String.contains?(Keyspace.prefix(legacy_priority_index), "priority_index/")
+      assert String.contains?(Keyspace.prefix(priority_index), "priority_index/v2/")
       assert String.contains?(Keyspace.prefix(priority_index), "priority_index/")
       assert String.contains?(Keyspace.prefix(stats), "stats/")
       refute String.starts_with?(Keyspace.prefix(dead_letter), Keyspace.prefix(items))
@@ -631,16 +635,15 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert item_id == item.id
     end
 
-    test "bootstraps an empty queue without reading stale tree nodes after its clear" do
+    test "bootstraps an empty queue in v2 without reading or clearing the inert v1 tree" do
       now = 100
       queue_id = "transactional-empty-bootstrap"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
       item = Item.new(queue_id, "first", %{}, priority: 0, vesting_time: now)
 
-      # A marker-less stale negative subtree is precisely the state an empty
-      # upgraded queue may inherit. Tx.clear_range/2 does not mask this value
-      # from a later point read in the pinned TransactionBuilder.
-      stale_negative_root = Keyspace.pack(keyspaces.priority_index, {0, 0, 0})
+      # A marker-less stale v1 subtree is precisely the state an empty upgraded
+      # queue may inherit. v2 must never read or clear this legacy keyspace.
+      stale_negative_root = Keyspace.pack(keyspaces.legacy_priority_index, {0, 0, 0})
       {:ok, store} = TxVisibilityRepo.start_link([{stale_negative_root, <<0::64-little>>}])
 
       TxVisibilityRepo.with_store(store, fn ->
@@ -655,6 +658,8 @@ defmodule Bedrock.JobQueue.StoreTest do
                  {:get, key} -> key == stale_negative_root
                  _operation -> false
                end)
+
+        refute Enum.any?(operations, &match?({:clear_range, _, _}, &1))
 
         assert now ==
                  TxVisibilityRepo.transact(fn ->
@@ -683,7 +688,7 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       # A root written before the lifecycle marker is untrusted too: an older
       # release could have built only a partial tree.
-      MockRepo.put(keyspaces.priority_index, {"root"}, <<now::64-little>>)
+      MockRepo.put(keyspaces.legacy_priority_index, {"root"}, <<now::64-little>>)
 
       assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
 
@@ -742,7 +747,6 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
       assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
 
@@ -775,8 +779,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
       store_item(store, keyspaces.items, ready)
 
-      # The first administrative call only prepares the clear. From this point
-      # the declared offline fence holds both old and current writers.
+      # The first administrative call builds one v2 chunk. From this point the
+      # declared offline fence holds both old and current writers.
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
@@ -809,28 +813,39 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
-    test "prepares the clear in its own Bedrock transaction before indexing stale legacy trees" do
+    test "builds a fresh v2 tree safely across repeated Store calls in one transaction" do
       now = 10_000
-      queue_id = "transactional-clear-preparation"
+      queue_id = "transactional-v2-migration"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
 
-      future = Item.new(queue_id, "future", %{}, priority: 0, vesting_time: now + 10_000)
+      futures =
+        for priority <- 0..15 do
+          Item.new(queue_id, "future", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 10_000
+          )
+        end
+
       ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
-      stale_node_keys = for level <- 0..64, do: Keyspace.pack(keyspaces.priority_index, {1, level, 0})
-      stale_tree_keys = [Keyspace.pack(keyspaces.priority_index, {"root"}) | stale_node_keys]
+      stale_node_keys = for level <- 0..64, do: Keyspace.pack(keyspaces.legacy_priority_index, {1, level, 0})
+      stale_tree_keys = [Keyspace.pack(keyspaces.legacy_priority_index, {"root"}) | stale_node_keys]
 
       entries =
-        [
-          {Keyspace.pack(keyspaces.items, Item.key(future)), :erlang.term_to_binary(future)},
-          {Keyspace.pack(keyspaces.items, Item.key(ready)), :erlang.term_to_binary(ready)}
-        ] ++ Enum.map(stale_tree_keys, &{&1, <<0::64-little>>})
+        Enum.map(futures ++ [ready], fn item ->
+          {Keyspace.pack(keyspaces.items, Item.key(item)), :erlang.term_to_binary(item)}
+        end) ++ Enum.map(stale_tree_keys, &{&1, <<0::64-little>>})
 
       {:ok, store} = TxVisibilityRepo.start_link(entries)
 
       TxVisibilityRepo.with_store(store, fn ->
-        # Retrying the preparation transaction leaves the durable tree untouched.
+        # Two chunks can be built inside one caller-owned transaction without
+        # exposing a terminal result. Aborting it leaves no v2 marker or tree.
         assert :more =
                  TxVisibilityRepo.abort(fn ->
+                   assert :more =
+                            Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+
                    Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
                  end)
 
@@ -839,26 +854,24 @@ defmodule Bedrock.JobQueue.StoreTest do
                    Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
                  end)
 
-        TxVisibilityRepo.clear_operations(store)
+        operations = TxVisibilityRepo.operations(store)
+        refute Enum.any?(operations, &match?({:clear_range, _, _}, &1))
 
-        # Tx.clear_range/4 does not hide the old point values from Tx.get/4.
-        # Preparation therefore performs no raw-item scan or min-tree point read.
+        refute Enum.any?(operations, fn
+                 {operation, key} when operation in [:get, :put, :clear] -> key in stale_tree_keys
+                 _operation -> false
+               end)
+
+        # Separate physical transactions resume from a marker-linked v2 tree
+        # and eventually publish one exact, complete index.
         assert :more =
                  TxVisibilityRepo.transact(fn ->
                    Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
                  end)
 
-        operations = TxVisibilityRepo.operations(store)
-        refute Enum.any?(operations, &match?({:get_range, _, _, _}, &1))
-
-        refute Enum.any?(operations, fn
-                 {:get, key} -> key in stale_tree_keys
-                 _operation -> false
-               end)
-
-        assert :migrating =
+        assert :more =
                  TxVisibilityRepo.transact(fn ->
-                   Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
                  end)
 
         assert :ready =
@@ -890,7 +903,6 @@ defmodule Bedrock.JobQueue.StoreTest do
       # An unrelated row cannot affect a raw range bounded by the item prefix.
       MockRepo.put(keyspaces.identities, "unrelated", "value")
 
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :empty = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       current = Item.new(queue_id, "current", %{}, priority: 100, vesting_time: 10_000)
       assert :empty = Store.priority_index_status(MockRepo, root(), queue_id)
@@ -922,13 +934,12 @@ defmodule Bedrock.JobQueue.StoreTest do
 
         # A prior rolling-upgrade marker cannot establish this migration's
         # offline static-queue precondition, so it never becomes a dispatch source.
-        MockRepo.put(keyspaces.priority_index, {"migration"}, :erlang.term_to_binary(marker))
+        MockRepo.put(keyspaces.legacy_priority_index, {"migration"}, :erlang.term_to_binary(marker))
 
         assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
         assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
         assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
 
-        assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
         assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
         assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
         assert item_id == item.id
@@ -974,7 +985,7 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       # The administrator advances one chunk per transaction; the final short
       # raw range proves static coverage and completes immediately.
-      for _ <- 1..(nonempty_chunks - 1) do
+      for _ <- 1..(nonempty_chunks - 2) do
         assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       end
 
@@ -1013,11 +1024,6 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
       refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-
-      preparation_operations = drain_store_operations()
-      refute Enum.any?(preparation_operations, &match?({:get_range, {_, _}, _}, &1))
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
@@ -1067,7 +1073,6 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = List.last(items)
       Enum.each(items, &store_item(store, keyspaces.items, &1))
 
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       # A real transaction retry rolls back both the tree writes and marker
@@ -1131,7 +1136,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       ready = Item.new(queue_id, "ready", %{}, priority: 129, vesting_time: now)
       store_item(store, keyspaces.items, ready)
 
-      for _ <- 1..17 do
+      for _ <- 1..16 do
         assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       end
 

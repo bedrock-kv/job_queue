@@ -42,49 +42,6 @@ defmodule Bedrock.JobQueue.InternalTest do
     use Bedrock.JobQueue, otp_app: :bedrock_job_queue, repo: MockRepo
   end
 
-  # The generated Repo module takes the real nested-transaction path whenever
-  # TransactionContext contains a builder. The transaction below is deliberately
-  # minimal because migrate_queue/2 must reject before it reaches Store or makes
-  # a write in that nested physical transaction.
-  defmodule NestedMigrationCluster do
-    @moduledoc false
-    def link!, do: raise("the test always supplies an active transaction")
-  end
-
-  defmodule NestedMigrationRepo do
-    @moduledoc false
-    use Bedrock.Repo, cluster: NestedMigrationCluster
-  end
-
-  defmodule NestedMigrationQueue do
-    @moduledoc false
-    def __config__, do: %{repo: NestedMigrationRepo}
-  end
-
-  defmodule NestedMigrationTransaction do
-    @moduledoc false
-    use GenServer
-
-    def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid)
-    def writes(transaction), do: GenServer.call(transaction, :writes)
-
-    @impl true
-    def init(test_pid), do: {:ok, %{test_pid: test_pid, writes: []}}
-
-    @impl true
-    def handle_call(:nested_transaction, _from, state) do
-      send(state.test_pid, :nested_transaction)
-      {:reply, :ok, state}
-    end
-
-    def handle_call(:commit, _from, state) do
-      send(state.test_pid, {:nested_commit, state.writes})
-      {:reply, :ok, state}
-    end
-
-    def handle_call(:writes, _from, state), do: {:reply, state.writes, state}
-  end
-
   describe "enqueue/5" do
     test "enqueues item with immediate processing" do
       test_pid = self()
@@ -322,14 +279,13 @@ defmodule Bedrock.JobQueue.InternalTest do
   end
 
   describe "migrate_queue/2" do
-    test "runs each bounded offline migration phase in its own transaction" do
+    test "runs an empty offline migration in one bounded transaction" do
       :persistent_term.erase({Internal, TestJobQueue})
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
-      expect(MockRepo, :transact, 2, fn callback -> callback.() end)
+      expect(MockRepo, :transact, fn callback -> callback.() end)
 
-      assert :more = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
       assert :empty = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
     end
 
@@ -341,20 +297,17 @@ defmodule Bedrock.JobQueue.InternalTest do
       assert {:error, :writer_fence_required} = TestJobQueue.migrate_queue("tenant_1")
     end
 
-    test "rejects migration inside a real nested Repo transaction before Store can mutate" do
-      {:ok, transaction} = NestedMigrationTransaction.start_link(self())
-      TransactionContext.put_builder(NestedMigrationRepo, transaction)
+    test "does not reject an active transaction context" do
+      :persistent_term.erase({Internal, TestJobQueue})
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      TransactionContext.put_builder(MockRepo, self())
 
-      on_exit(fn -> TransactionContext.clear(NestedMigrationRepo) end)
+      on_exit(fn -> TransactionContext.clear(MockRepo) end)
 
-      assert {:error, :top_level_transaction_required} =
-               NestedMigrationRepo.transact(fn ->
-                 Internal.migrate_queue(NestedMigrationQueue, "legacy", writer_fence: :offline)
-               end)
+      expect(MockRepo, :transact, fn callback -> callback.() end)
 
-      assert_receive :nested_transaction
-      assert_receive {:nested_commit, []}
-      assert NestedMigrationTransaction.writes(transaction) == []
+      assert :empty = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
     end
   end
 

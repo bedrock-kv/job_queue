@@ -10,10 +10,11 @@ defmodule Bedrock.JobQueue.Store do
       job_queue/
         queues/{queue_id}/
           items/                         # {priority, vesting_time, id} -> Item
-          priority_index/{sign, level, node} # -> earliest vesting time in priority range
-          priority_index/{"root"}            # -> earliest vesting time in queue
-          priority_index/{"initialized"}     # -> complete index marker
-          priority_index/{"migration"}       # -> fenced, resumable raw-item cursor
+          priority_index/                    # legacy v1 tree (inert after upgrade)
+          priority_index/v2/{sign, level, node} # -> earliest vesting time in priority range
+          priority_index/v2/{"root"}            # -> earliest vesting time in queue
+          priority_index/v2/{"initialized"}     # -> complete v2 index marker
+          priority_index/v2/{"migration"}       # -> fenced, resumable raw-item cursor
           identities/{item_id}           # -> canonical custom-ID Item
           identity_metadata/state         # -> current | legacy
           leases/{item_id}               # -> Lease
@@ -64,13 +65,15 @@ defmodule Bedrock.JobQueue.Store do
   @doc """
   Creates keyspaces for a queue.
 
-  Returns a map with keyspaces for item identities, items, leases, and stats.
+  Returns a map with keyspaces for item identities, items, leases, stats, and
+  the current v2 plus inert legacy priority indexes.
   """
   @spec queue_keyspaces(root_keyspace(), String.t()) :: %{
           dead_letter: Keyspace.t(),
           identity_metadata: Keyspace.t(),
           identities: Keyspace.t(),
           items: Keyspace.t(),
+          legacy_priority_index: Keyspace.t(),
           leases: Keyspace.t(),
           priority_index: Keyspace.t(),
           stats: Keyspace.t()
@@ -83,8 +86,9 @@ defmodule Bedrock.JobQueue.Store do
       identity_metadata: Keyspace.partition(queue_ks, "identity_metadata/"),
       identities: Keyspace.partition(queue_ks, "identities/"),
       items: Keyspace.partition(queue_ks, "items/", key_encoding: TupleEncoding),
+      legacy_priority_index: Keyspace.partition(queue_ks, "priority_index/", key_encoding: TupleEncoding),
       leases: Keyspace.partition(queue_ks, "leases/"),
-      priority_index: Keyspace.partition(queue_ks, "priority_index/", key_encoding: TupleEncoding),
+      priority_index: Keyspace.partition(queue_ks, "priority_index/v2/", key_encoding: TupleEncoding),
       stats: Keyspace.partition(queue_ks, "stats/")
     }
   end
@@ -104,8 +108,8 @@ defmodule Bedrock.JobQueue.Store do
   @doc """
   Returns the scheduling-index state for a queue.
 
-  `:writer_fence_required` means the queue contains pre-index work or an
-  untrusted prior migration marker. It is deliberately held
+  `:writer_fence_required` means the queue contains pre-v2 work or an
+  untrusted v2 marker. It is deliberately held
   until an administrator calls `migrate_priority_index/4` after fencing all
   old writers. A marker written by new code cannot fence an older writer that
   does not read it.
@@ -128,10 +132,11 @@ defmodule Bedrock.JobQueue.Store do
   The queue must remain static for every call, until this function returns
   `:ready` or `:empty`. While the status is `:migrating`, normal queue
   operations are held with `{:error, :priority_index_migration_required}` and
-  the Manager does not dispatch it. The first call only clears the stale index
-  and persists an offline-prepared marker. Each later call reads and indexes at
-  most #{@migration_chunk_size} raw item rows. A short final range proves the
-  static queue has been covered, so that same call completes the migration.
+  the Manager does not dispatch it. Each call reads and indexes at most
+  #{@migration_chunk_size} raw item rows into a fresh v2 keyspace; v1 is never
+  read or cleared. A marker-linked partial v2 tree is never a dispatch source.
+  A short final range proves the static queue has been covered, so that same
+  call atomically activates the complete v2 index.
   """
   @spec migrate_priority_index(repo(), root_keyspace(), String.t(), keyword()) ::
           :more | :ready | :empty | {:error, :writer_fence_required}
@@ -143,15 +148,15 @@ defmodule Bedrock.JobQueue.Store do
   defp migrate_priority_index_state(repo, keyspaces, migration_state, opts) do
     case priority_index_state(keyspaces, repo, migration_state) do
       :writer_fence_required ->
-        if Keyword.get(opts, :writer_fence) == :offline do
-          prepare_priority_index_migration(repo, keyspaces)
+        if Keyword.get(opts, :writer_fence) == :offline and is_nil(migration_state) do
+          advance_priority_migration(repo, keyspaces, nil)
         else
           {:error, :writer_fence_required}
         end
 
       :migrating ->
         if Keyword.get(opts, :writer_fence) == :offline do
-          advance_offline_priority_migration(repo, keyspaces, migration_state(repo, keyspaces.priority_index))
+          advance_offline_priority_migration(repo, keyspaces, migration_state)
         else
           {:error, :writer_fence_required}
         end
@@ -1161,10 +1166,10 @@ defmodule Bedrock.JobQueue.Store do
 
   defp priority_index_present?(repo, keyspaces), do: not is_nil(priority_index_minimum(repo, keyspaces))
 
-  # A root is exact only after the initialized marker has been written. No
-  # marker (including an old root without one) is untrusted legacy state: a
-  # pre-index writer cannot see or obey a new marker, so only an explicitly
-  # writer-fenced administrator may transition it to :migrating.
+  # A v2 root is exact only after its initialized marker has been written. The
+  # unversioned v1 tree is intentionally not consulted: an older writer cannot
+  # observe a new marker, so raw legacy work remains held until an explicitly
+  # writer-fenced administrator builds and activates v2.
   defp priority_index_state(keyspaces, repo) do
     priority_index_state(keyspaces, repo, migration_state(repo, keyspaces.priority_index))
   end
@@ -1173,26 +1178,16 @@ defmodule Bedrock.JobQueue.Store do
     index = keyspaces.priority_index
 
     case migration_state do
-      :offline_prepared ->
-        :migrating
-
       {:offline_building, _cursor} ->
         :migrating
 
-      # Older cursor/frontier/capture formats relied on a rolling-upgrade
-      # writer guarantee that cannot be established by an in-band marker. Hold
-      # them until an operator starts a new offline migration.
-      {:building, _cursor} ->
-        :writer_fence_required
-
-      :capturing_frontier ->
-        :writer_fence_required
-
-      {:building, _cursor, _frontier} ->
-        :writer_fence_required
-
       nil ->
         initialized_priority_index_state(repo, keyspaces, index)
+
+      # An unknown v2 marker is not assumed to identify a coherent partial
+      # tree. It remains held rather than reusing potentially stale values.
+      _unknown_marker ->
+        :writer_fence_required
     end
   end
 
@@ -1205,10 +1200,8 @@ defmodule Bedrock.JobQueue.Store do
   end
 
   # Initializing a truly empty queue is safe and ergonomic: the bounded empty
-  # range read and marker write are in the caller's transaction. A nonempty
+  # range read and v2 marker write are in the caller's transaction. A nonempty
   # marker-less queue is held instead of guessing that no old writer exists.
-  # An offline migration is held even when an individual chunk is empty until
-  # that chunk writes the initialized marker.
   defp initialize_empty_priority_index(repo, keyspaces) do
     migration_state = migration_state(repo, keyspaces.priority_index)
     initialize_empty_priority_index_state(repo, keyspaces, migration_state)
@@ -1216,33 +1209,20 @@ defmodule Bedrock.JobQueue.Store do
 
   defp initialize_empty_priority_index_state(repo, keyspaces, migration_state) do
     case priority_index_state(keyspaces, repo, migration_state) do
-      :writer_fence_required -> initialize_empty_legacy_priority_index(repo, keyspaces)
+      :writer_fence_required -> initialize_empty_v2_priority_index(repo, keyspaces)
       :migrating -> {:error, :priority_index_migration_required}
       _current -> {:ok, :current}
     end
   end
 
-  defp initialize_empty_legacy_priority_index(repo, keyspaces) do
+  defp initialize_empty_v2_priority_index(repo, keyspaces) do
     if keyspace_has_entries?(repo, keyspaces.items) do
       {:error, :priority_index_migration_required}
     else
-      repo.clear_range(keyspaces.priority_index)
       put_priority_index_initialized(repo, keyspaces.priority_index)
       {:ok, :bootstrap}
     end
   end
-
-  # Bedrock's range clears deliberately do not make old point values disappear
-  # from later Tx.get calls in the same transaction. Commit this preparation
-  # phase before reading or merging any min-tree node.
-  defp prepare_priority_index_migration(repo, keyspaces) do
-    repo.clear_range(keyspaces.priority_index)
-    repo.put(keyspaces.priority_index, @priority_index_migration_key, encode(:offline_prepared))
-    :more
-  end
-
-  defp advance_offline_priority_migration(repo, keyspaces, :offline_prepared),
-    do: advance_priority_migration(repo, keyspaces, nil)
 
   defp advance_offline_priority_migration(repo, keyspaces, {:offline_building, cursor}),
     do: advance_priority_migration(repo, keyspaces, cursor)
@@ -1321,7 +1301,6 @@ defmodule Bedrock.JobQueue.Store do
 
   defp require_not_migrating(repo, keyspaces) do
     case migration_state(repo, keyspaces.priority_index) do
-      :offline_prepared -> {:error, :priority_index_migration_required}
       {:offline_building, _cursor} -> {:error, :priority_index_migration_required}
       _not_current_migration -> :ok
     end
@@ -1331,10 +1310,10 @@ defmodule Bedrock.JobQueue.Store do
     do: refresh_priority_index(repo, keyspaces, priority)
 
   # The empty-range read immediately before this function conflict-tracks the
-  # raw item namespace. Its clear_range may leave stale point values visible to
-  # this transaction, so the first current-format item builds its entire
-  # non-empty min-tree path with writes only. Sparse absent nodes are the exact
-  # representation of every other priority range.
+  # raw item namespace. The fresh v2 namespace has no legacy tree to clear or
+  # read, so the first current-format item builds its entire non-empty min-tree
+  # path with writes only. Sparse absent nodes exactly represent every other
+  # priority range.
   defp initialize_priority_index_for_first_item(repo, index, item) do
     {sign, leaf} = priority_location(item.priority)
 

@@ -18,8 +18,11 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
       end
   """
 
+  alias Bedrock.JobQueue.Consumer.LeaseExtender
   alias Bedrock.JobQueue.Item
+  alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.Payload
+  alias Bedrock.JobQueue.Store
 
   require Logger
 
@@ -47,19 +50,55 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   implements `timeout/0`, that value is used instead. On timeout, the job
   is killed and `{:error, :timeout}` is returned.
   """
-  @spec execute(Item.t(), map()) :: term()
-  def execute(%Item{} = item, workers) when is_map(workers) do
+  @spec execute(Item.t(), map(), keyword()) :: term()
+  def execute(%Item{} = item, workers, opts \\ []) when is_map(workers) do
+    case lease_context(opts) do
+      :none ->
+        execute_job(item, workers, nil)
+
+      {:ok, context} ->
+        execute_with_verified_lease(item, workers, context)
+    end
+  end
+
+  defp execute_with_verified_lease(item, workers, %{repo: repo, root: root, lease: lease} = context) do
+    case repo.transact(fn -> Store.lease_owned?(repo, root, lease) end) do
+      :ok -> execute_with_lease_guard(item, workers, context)
+      {:error, reason} when reason in [:lease_not_found, :lease_mismatch, :lease_expired] ->
+        {:cancelled, {:lease_lost, reason}}
+      {:error, reason} -> {:error, {:lease_check_failed, reason}}
+    end
+  end
+
+  defp execute_job(%Item{} = item, workers, lease) do
     case Map.get(workers, item.topic) do
       nil ->
         Logger.warning("No worker configured for topic: #{item.topic}")
         {:discard, :no_handler}
 
       job_module ->
-        execute_with_timeout(job_module, item)
+        execute_with_timeout(job_module, item, lease)
     end
   end
 
-  defp execute_with_timeout(job_module, item) do
+  defp execute_with_lease_guard(item, workers, context) do
+    extender =
+      LeaseExtender.start(
+        context.repo,
+        context.root,
+        context.lease,
+        context.lease_duration,
+        Keyword.put(context.lease_extender_opts, :notify, self())
+      )
+
+    try do
+      execute_job(item, workers, context.lease)
+    after
+      stop_extender(extender)
+    end
+  end
+
+  defp execute_with_timeout(job_module, item, lease) do
     timeout = get_timeout(job_module)
     payload = Payload.decode(item.payload)
 
@@ -75,20 +114,67 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
         job_module.perform(payload, meta)
       end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} ->
-        result
-
-      nil ->
-        {:error, :timeout}
-
-      {:exit, reason} ->
-        {:error, {:exit, reason}}
-    end
+    await_job(task, timeout, lease)
   rescue
     e ->
       Logger.error("Job execution failed: #{Exception.message(e)}")
       {:error, {:exception, e}}
+  end
+
+  defp await_job(task, timeout, nil) do
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> {:error, :timeout}
+      {:exit, reason} -> {:error, {:exit, reason}}
+    end
+  end
+
+  defp await_job(task, timeout, %Lease{id: lease_id}) do
+    receive do
+      {:lease_lost, ^lease_id, reason} ->
+        Task.shutdown(task, :brutal_kill)
+        {:cancelled, {:lease_lost, reason}}
+
+      {ref, result} when ref == task.ref ->
+        Process.demonitor(ref, [:flush])
+        result
+
+      {:DOWN, ref, :process, _pid, reason} when ref == task.ref ->
+        {:error, {:exit, reason}}
+    after
+      timeout ->
+        case Task.shutdown(task, :brutal_kill) do
+          {:ok, result} -> result
+          nil -> {:error, :timeout}
+          {:exit, reason} -> {:error, {:exit, reason}}
+        end
+    end
+  end
+
+  defp lease_context(opts) do
+    with {:ok, repo} <- Keyword.fetch(opts, :repo),
+         {:ok, root} <- Keyword.fetch(opts, :root),
+         {:ok, %Lease{} = lease} <- Keyword.fetch(opts, :lease) do
+      {:ok,
+       %{
+         repo: repo,
+         root: root,
+         lease: lease,
+         lease_duration: Keyword.get(opts, :lease_duration, 30_000),
+         lease_extender_opts: Keyword.get(opts, :lease_extender_opts, [])
+       }}
+    else
+      :error -> :none
+    end
+  end
+
+  defp stop_extender(extender) do
+    LeaseExtender.stop(extender)
+    Process.unlink(extender)
+
+    if Process.alive?(extender) do
+      Process.exit(extender, :shutdown)
+    end
   end
 
   defp get_timeout(job_module) do

@@ -12,10 +12,9 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   - The process loops, extending the lease at regular intervals
   - Stopped via `stop/1` when the job completes (sends `:stop` message)
   - Uses `spawn_link` so the extender dies if the parent job process crashes
-  - Extension failures are logged but don't stop the loop - the job may still
-    complete in time before the lease expires
-  - If the lease cannot be extended (e.g., already expired), logging occurs
-    but execution continues
+  - Transient extension failures are logged and retried
+  - A missing, mismatched, or removed lease is reported to the owner and stops
+    the extender. The owner must cancel the running job handler.
 
   ## Timing
 
@@ -35,6 +34,8 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   Options:
   - `:interval` - How often to extend the lease in ms (default: lease_duration / 3)
   - `:extension` - How much to extend by in ms (default: lease_duration)
+  - `:notify` - Process to receive `{:lease_lost, lease_id, reason}` when
+    ownership is conclusively lost (default: the calling process)
 
   Returns the pid of the extender process.
   """
@@ -42,9 +43,10 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   def start(repo, root, lease, lease_duration, opts \\ []) do
     interval = Keyword.get(opts, :interval, div(lease_duration, 3))
     extension = Keyword.get(opts, :extension, lease_duration)
+    notify = Keyword.get(opts, :notify, self())
 
     spawn_link(fn ->
-      loop(repo, root, lease, interval, extension)
+      loop(repo, root, lease, interval, extension, notify)
     end)
   end
 
@@ -61,18 +63,35 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   end
 
   # Main loop - waits for interval, extends lease, repeats
-  defp loop(repo, root, lease, interval, extension) do
+  defp loop(repo, root, lease, interval, extension, notify) do
     receive do
       :stop ->
         :ok
     after
       interval ->
-        lease = extend_lease(repo, root, lease, extension)
-        loop(repo, root, lease, interval, extension)
+        case extend_lease(repo, root, lease, extension) do
+          {:ok, updated_lease} ->
+            loop(repo, root, updated_lease, interval, extension, notify)
+
+          {:retry, reason} ->
+            Logger.warning(
+              "Failed to extend lease for item #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}; will retry"
+            )
+
+            loop(repo, root, lease, interval, extension, notify)
+
+          {:lost, reason} ->
+            Logger.warning(
+              "Failed to extend lease for item #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}; lease is lost"
+            )
+
+            send(notify, {:lease_lost, lease.id, reason})
+        end
     end
   end
 
-  # Extends the lease, returns updated lease or original on failure
+  # Extends the lease. Missing/mismatched storage proves the worker no longer
+  # owns the lease; transaction failures do not and are retried.
   defp extend_lease(repo, root, lease, extension) do
     result =
       repo.transact(fn ->
@@ -82,14 +101,13 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
     case result do
       {:ok, %Lease{} = updated_lease} ->
         Logger.debug("Extended lease for item #{Base.encode16(lease.item_id, case: :lower)}")
-        updated_lease
+        {:ok, updated_lease}
+
+      {:error, reason} when reason in [:lease_not_found, :lease_mismatch, :item_not_found] ->
+        {:lost, reason}
 
       {:error, reason} ->
-        Logger.warning(
-          "Failed to extend lease for item #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}"
-        )
-
-        lease
+        {:retry, reason}
     end
   end
 end

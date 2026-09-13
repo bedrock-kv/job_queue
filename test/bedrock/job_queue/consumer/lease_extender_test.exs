@@ -211,5 +211,29 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       assert log =~ "Failed to extend lease"
       assert log =~ ":transaction_failed"
     end
+
+    test "does not report lease loss for a transient renewal failure", ctx do
+      test_pid = self()
+
+      expect(MockRepo, :transact, fn _callback ->
+        send(test_pid, :renewal_attempted)
+
+        receive do
+          :finish_transient_failure -> {:error, :transaction_failed}
+        end
+      end)
+
+      pid = LeaseExtender.start(MockRepo, ctx.root, ctx.lease, 30_000, interval: 0)
+      ref = Process.monitor(pid)
+
+      assert_receive :renewal_attempted
+      refute_received {:lease_lost, _lease_id, _reason}
+
+      LeaseExtender.stop(pid)
+      send(pid, :finish_transient_failure)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      refute_received {:lease_lost, _lease_id, _reason}
+    end
   end
 end

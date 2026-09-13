@@ -311,7 +311,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       transaction_calls = :counters.new(1, [])
       test_pid = self()
 
-      expect(MockRepo, :transact, 4, fn callback ->
+      expect(MockRepo, :transact, 6, fn callback ->
         :counters.add(transaction_calls, 1, 1)
 
         case :counters.get(transaction_calls, 1) do
@@ -319,6 +319,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
             callback.()
 
           2 ->
+            callback.()
+
+          3 ->
             result = callback.()
             send(test_pid, :action_transaction_ready)
 

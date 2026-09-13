@@ -436,29 +436,45 @@ defmodule Bedrock.JobQueue.Store do
 
   ## Error Cases
 
-  - `{:error, :lease_expired}` - Lease already expired (checked before DB access)
   - `{:error, :lease_not_found}` - No lease record exists for this item
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
   - `{:error, :item_not_found}` - Item no longer exists in queue
+
+  An expired lease may still be extended if it has not been replaced. This is
+  safe because the stored lease ID is verified transactionally before the
+  extension is written.
   """
   @spec extend_lease(repo(), root_keyspace(), Lease.t(), pos_integer(), keyword()) ::
           {:ok, Lease.t()}
-          | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
+          | {:error, :lease_not_found | :lease_mismatch | :item_not_found}
   def extend_lease(repo, root, %Lease{} = lease, extension_ms, opts \\ []) do
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    keyspaces = queue_keyspaces(root, lease.queue_id)
 
-    if lease.expires_at <= now do
-      {:error, :lease_expired}
-    else
-      keyspaces = queue_keyspaces(root, lease.queue_id)
+    case verify_lease(repo, keyspaces, lease) do
+      {:ok, stored_lease} ->
+        do_extend_lease(repo, root, keyspaces, stored_lease, now + extension_ms, now)
 
-      case verify_lease(repo, keyspaces, lease) do
-        {:ok, stored_lease} ->
-          do_extend_lease(repo, root, keyspaces, stored_lease, now + extension_ms, now)
+      error ->
+        error
+    end
+  end
 
-        error ->
-          error
-      end
+  @doc """
+  Checks that a lease still belongs to this worker and has not expired.
+
+  This check is intended immediately before invoking a job handler. It does
+  not modify queue state. Call it inside a repository transaction so the read
+  participates in the same conflict handling as other queue operations.
+  """
+  @spec lease_owned?(repo(), root_keyspace(), Lease.t(), keyword()) ::
+          :ok | {:error, :lease_not_found | :lease_mismatch | :lease_expired}
+  def lease_owned?(repo, root, %Lease{} = lease, opts \\ []) do
+    now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    keyspaces = queue_keyspaces(root, lease.queue_id)
+
+    with {:ok, stored_lease} <- verify_lease(repo, keyspaces, lease) do
+      if stored_lease.expires_at > now, do: :ok, else: {:error, :lease_expired}
     end
   end
 

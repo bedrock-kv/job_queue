@@ -17,9 +17,9 @@ defmodule Bedrock.JobQueue.Item do
   - `queue_id` - The queue/tenant this job belongs to
   """
 
-  alias Bedrock.JobQueue.Payload
-
   import Bitwise
+
+  alias Bedrock.JobQueue.Payload
 
   @type t :: %__MODULE__{
           id: binary(),
@@ -53,6 +53,7 @@ defmodule Bedrock.JobQueue.Item do
   @default_max_retries 3
   @max_priority (1 <<< 64) - 1
   @min_priority -@max_priority
+  @max_vesting_time (1 <<< 64) - 1
 
   @doc false
   @spec min_priority() :: integer()
@@ -65,12 +66,21 @@ defmodule Bedrock.JobQueue.Item do
   @doc false
   @spec validate_priority!(term()) :: integer()
   def validate_priority!(priority)
-      when is_integer(priority) and priority >= @min_priority and priority <= @max_priority,
-      do: priority
+      when is_integer(priority) and priority >= @min_priority and priority <= @max_priority, do: priority
 
   def validate_priority!(priority) do
     raise ArgumentError,
           "priority must be an integer between #{@min_priority} and #{@max_priority}, got: #{inspect(priority)}"
+  end
+
+  @doc false
+  @spec validate_vesting_time!(term()) :: non_neg_integer()
+  def validate_vesting_time!(vesting_time)
+      when is_integer(vesting_time) and vesting_time >= 0 and vesting_time <= @max_vesting_time, do: vesting_time
+
+  def validate_vesting_time!(vesting_time) do
+    raise ArgumentError,
+          "vesting_time must be an integer between 0 and #{@max_vesting_time}, got: #{inspect(vesting_time)}"
   end
 
   @doc """
@@ -81,7 +91,8 @@ defmodule Bedrock.JobQueue.Item do
   - `:id` - Custom job ID (default: random 16-byte binary). A supplied ID is
     retained as enqueue intent so direct `Store.enqueue/4` calls are idempotent.
   - `:priority` - Integer priority, lower = higher priority (default: 100)
-  - `:vesting_time` - When the job becomes visible in ms since epoch (default: now)
+  - `:vesting_time` - When the job becomes visible in ms since epoch (default: now).
+    Values must fit the queue's unsigned 64-bit timestamp domain.
   - `:max_retries` - Maximum retry attempts before dead-lettering (default: 3)
   - `:now` - Current time in ms, used for vesting_time default (default: System.system_time(:millisecond))
 
@@ -96,13 +107,14 @@ defmodule Bedrock.JobQueue.Item do
   def new(queue_id, topic, payload, opts \\ []) do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
     priority = opts |> Keyword.get(:priority, @default_priority) |> validate_priority!()
+    vesting_time = opts |> Keyword.get(:vesting_time, now) |> validate_vesting_time!()
 
     %__MODULE__{
       id: Keyword.get(opts, :id, generate_id()),
       custom_id?: Keyword.has_key?(opts, :id),
       topic: topic,
       priority: priority,
-      vesting_time: Keyword.get(opts, :vesting_time, now),
+      vesting_time: vesting_time,
       lease_id: nil,
       lease_expires_at: nil,
       error_count: 0,
@@ -125,8 +137,7 @@ defmodule Bedrock.JobQueue.Item do
 
   def visible?(%__MODULE__{vesting_time: vt, lease_id: nil}, now), do: now >= vt
 
-  def visible?(%__MODULE__{vesting_time: vt, lease_expires_at: exp}, now)
-      when not is_nil(exp) do
+  def visible?(%__MODULE__{vesting_time: vt, lease_expires_at: exp}, now) when not is_nil(exp) do
     now >= vt and now >= exp
   end
 

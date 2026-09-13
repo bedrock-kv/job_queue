@@ -58,7 +58,7 @@ defmodule Bedrock.JobQueue.InternalTest do
       end)
 
       # 2. Store.enqueue calls repo.put for item (keyspace, key, value)
-      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {priority, vesting_time, id} = key
           assert priority == 100
@@ -110,7 +110,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {_priority, vesting_time, _id} = key
           assert vesting_time == expected_vesting
@@ -145,7 +145,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {_priority, vesting_time, _id} = key
           assert vesting_time == expected_vesting
@@ -178,7 +178,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {priority, _vesting_time, _id} = key
           assert priority == 0
@@ -251,7 +251,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         end
       end)
 
-      expect(MockRepo, :put, 69, fn %Keyspace{} = keyspace, key, _value ->
+      expect(MockRepo, :put, 135, fn %Keyspace{} = keyspace, key, _value ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do
@@ -312,9 +312,22 @@ defmodule Bedrock.JobQueue.InternalTest do
   end
 
   defp assert_priority_index_bootstrap_key(key) do
-    assert key == {"initialized"} or key == {"root"} or
-             match?({sign, level, node} when sign in [0, 1] and level in 0..64 and is_integer(node), key)
+    assert priority_index_bootstrap_key?(key)
   end
+
+  defp priority_index_bootstrap_key?({"initialized"}), do: true
+  defp priority_index_bootstrap_key?({"root"}), do: true
+
+  defp priority_index_bootstrap_key?({sign, level, node}) when sign in [0, 1] and level in 0..64 and is_integer(node),
+    do: true
+
+  defp priority_index_bootstrap_key?({"member", sign, priority_leaf, vesting_time, item_id})
+       when sign in [0, 1] and is_integer(priority_leaf) and is_integer(vesting_time) and is_binary(item_id), do: true
+
+  defp priority_index_bootstrap_key?({"vesting", sign, priority_leaf, level, node})
+       when sign in [0, 1] and is_integer(priority_leaf) and level in 0..64 and is_integer(node), do: true
+
+  defp priority_index_bootstrap_key?(_key), do: false
 
   describe "stats/3" do
     test "returns queue statistics on success" do

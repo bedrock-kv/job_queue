@@ -12,6 +12,10 @@ defmodule Bedrock.JobQueue.Store do
           items/                         # {priority, vesting_time, id} -> Item
           priority_index/                    # legacy v1 tree (inert after upgrade)
           priority_index/v2/{sign, level, node} # -> earliest vesting time in priority range
+          priority_index/v2/{"vesting", sign, priority, level, node}
+                                           # -> earliest nonempty time in a priority
+          priority_index/v2/{"member", sign, priority, vesting_time, id}
+                                           # -> one row per indexed item
           priority_index/v2/{"root"}            # -> earliest vesting time in queue
           priority_index/v2/{"initialized"}     # -> complete v2 index marker
           priority_index/v2/{"migration"}       # -> fenced, resumable raw-item cursor
@@ -32,9 +36,11 @@ defmodule Bedrock.JobQueue.Store do
   - Then by vesting_time (earlier = visible first)
   - Then by id for uniqueness
 
-  The per-queue priority index is two fixed-height min-trees, one for each
-  side of the integer domain. It preserves priority-first dequeueing while
-  keeping visibility checks and minimum-time reads bounded.
+  The per-queue priority index has two fixed-height min-trees, one for each
+  side of the integer domain, plus a fixed-height vesting-time multiset tree
+  for every active priority. It preserves priority-first dequeueing while
+  keeping visibility checks and minimum-time reads bounded even after a
+  transaction moves or removes the first raw item row.
 
   Pointer keys use `{vesting_time, queue_id}` for efficient scanning of
   queues with visible items.
@@ -52,6 +58,7 @@ defmodule Bedrock.JobQueue.Store do
   # fixed-height subtrees retain that complete ordering without narrowing the
   # priorities accepted by existing item keys.
   @priority_bits 64
+  @vesting_bits 64
   @max_priority (1 <<< @priority_bits) - 1
   @min_priority -@max_priority
   @migration_chunk_size 8
@@ -318,6 +325,7 @@ defmodule Bedrock.JobQueue.Store do
             }
   def enqueue_with_item(repo, root, %Item{} = item, opts \\ []) do
     Item.validate_priority!(item.priority)
+    Item.validate_vesting_time!(item.vesting_time)
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
@@ -408,7 +416,7 @@ defmodule Bedrock.JobQueue.Store do
 
     case priority_index_mode do
       :bootstrap -> initialize_priority_index_for_first_item(repo, keyspaces.priority_index, item)
-      :current -> refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
+      :current -> add_item_to_priority_index(repo, keyspaces, item)
     end
 
     update_pointer(repo, pointers, item.vesting_time, item.queue_id, now)
@@ -594,7 +602,7 @@ defmodule Bedrock.JobQueue.Store do
     new_item_key = Item.key(updated_item)
     repo.put(keyspaces.items, new_item_key, encode(updated_item))
     repo.put(keyspaces.leases, lease.item_id, encode(lease))
-    refresh_priority_index_after_mutation(repo, keyspaces, current_item.priority)
+    replace_item_in_priority_index(repo, keyspaces, current_item, updated_item)
 
     update_pointer(repo, pointers, lease_expires_at, current_item.queue_id, now)
 
@@ -695,7 +703,7 @@ defmodule Bedrock.JobQueue.Store do
           repo.clear(keyspaces.items, old_item_key)
           new_item_key = Item.key(updated_item)
           repo.put(keyspaces.items, new_item_key, encode(updated_item))
-          refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
+          replace_item_in_priority_index(repo, keyspaces, item, updated_item)
 
           # Update lease record
           updated_lease = %{stored_lease | expires_at: new_expires_at, item_key: new_item_key}
@@ -737,7 +745,7 @@ defmodule Bedrock.JobQueue.Store do
       item_key = stored_lease.item_key
       repo.clear(keyspaces.items, item_key)
       repo.clear(keyspaces.leases, lease.item_id)
-      refresh_priority_index_after_mutation(repo, keyspaces, elem(stored_lease.item_key, 0))
+      remove_item_from_priority_index(repo, keyspaces, elem(stored_lease.item_key, 0), item_key)
 
       update_stats(repo, keyspaces, 0, -1)
 
@@ -832,7 +840,7 @@ defmodule Bedrock.JobQueue.Store do
     repo.clear(keyspaces.items, item_key)
     new_item_key = Item.key(updated_item)
     repo.put(keyspaces.items, new_item_key, encode(updated_item))
-    refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
+    replace_item_in_priority_index(repo, keyspaces, item, updated_item)
 
     update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
     repo.clear(keyspaces.leases, lease.item_id)
@@ -1156,7 +1164,7 @@ defmodule Bedrock.JobQueue.Store do
 
     # Delete from main queue and update stats
     repo.clear(keyspaces.items, item_key)
-    refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
+    remove_item_from_priority_index(repo, keyspaces, item.priority, item_key)
     update_stats(repo, keyspaces, 0, -1)
   end
 
@@ -1323,16 +1331,22 @@ defmodule Bedrock.JobQueue.Store do
     end
   end
 
-  defp refresh_priority_index_after_mutation(repo, keyspaces, priority),
-    do: refresh_priority_index(repo, keyspaces, priority)
-
   # The empty-range read immediately before this function conflict-tracks the
   # raw item namespace. The fresh v2 namespace has no legacy tree to clear or
-  # read, so the first current-format item builds its entire non-empty min-tree
-  # path with writes only. Sparse absent nodes exactly represent every other
-  # priority range.
+  # read, so the first current-format item builds both fixed-height trees with
+  # writes only. Sparse absent nodes exactly represent every other priority and
+  # timestamp range.
   defp initialize_priority_index_for_first_item(repo, index, item) do
     {sign, leaf} = priority_location(item.priority)
+    vesting_time = vesting_time!(item.vesting_time)
+
+    repo.put(index, priority_member_key(sign, leaf, vesting_time, item.id), "indexed")
+    put_priority_vesting_count(repo, index, sign, leaf, vesting_time, 1)
+
+    for level <- (@vesting_bits - 1)..0//-1 do
+      node = vesting_time >>> (@vesting_bits - level)
+      put_priority_vesting_node(repo, index, sign, leaf, level, node, vesting_time)
+    end
 
     for level <- @priority_bits..0//-1 do
       node = leaf >>> (@priority_bits - level)
@@ -1342,35 +1356,8 @@ defmodule Bedrock.JobQueue.Store do
     put_priority_node(repo, index, {"root"}, item.vesting_time)
   end
 
-  defp refresh_priority_index(repo, keyspaces, priority) do
-    minimum = priority_minimum(repo, keyspaces.items, priority)
-    {sign, leaf} = priority_location(priority)
-    index = keyspaces.priority_index
-
-    put_priority_node(repo, index, {sign, @priority_bits, leaf}, minimum)
-    refresh_priority_ancestors(repo, index, sign, @priority_bits - 1, div(leaf, 2))
-    refresh_priority_root(repo, index)
-  end
-
   defp merge_priority_index(repo, keyspaces, item) do
-    {sign, leaf} = priority_location(item.priority)
-    index = keyspaces.priority_index
-    key = {sign, @priority_bits, leaf}
-
-    case priority_node(repo, index, key) do
-      nil ->
-        put_priority_node(repo, index, key, item.vesting_time)
-        refresh_priority_ancestors(repo, index, sign, @priority_bits - 1, div(leaf, 2))
-        refresh_priority_root(repo, index)
-
-      current_minimum when item.vesting_time < current_minimum ->
-        put_priority_node(repo, index, key, item.vesting_time)
-        refresh_priority_ancestors(repo, index, sign, @priority_bits - 1, div(leaf, 2))
-        refresh_priority_root(repo, index)
-
-      _current_minimum ->
-        :ok
-    end
+    add_item_to_priority_index(repo, keyspaces, item)
   end
 
   defp priority_location(priority)
@@ -1383,16 +1370,166 @@ defmodule Bedrock.JobQueue.Store do
           "priority must be an integer between #{@min_priority} and #{@max_priority}, got: #{inspect(priority)}"
   end
 
-  defp priority_minimum(repo, item_keyspace, priority) do
-    item_keyspace
-    |> priority_item_range(priority, repo, limit: 1)
-    |> Stream.map(fn {_key, value} -> decode(value) end)
-    |> Enum.at(0)
-    |> case do
-      nil -> nil
-      item -> item.vesting_time
+  # Each active raw item contributes one membership row and one count at its
+  # {priority, vesting_time} leaf. The fixed-height vesting tree gives that
+  # priority's exact earliest timestamp without rereading the raw item range.
+  # This makes a transaction correct even when its first raw range row was
+  # locally cleared and the underlying range stream reports an empty page with
+  # more storage rows behind it.
+  defp add_item_to_priority_index(repo, keyspaces, item) do
+    index = keyspaces.priority_index
+    {sign, priority_leaf} = priority_location(item.priority)
+    vesting_time = vesting_time!(item.vesting_time)
+    member_key = priority_member_key(sign, priority_leaf, vesting_time, item.id)
+
+    if is_nil(repo.get(index, member_key)) do
+      repo.put(index, member_key, "indexed")
+      adjust_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, 1)
+      refresh_priority_vesting_path(repo, index, sign, priority_leaf, vesting_time)
+      refresh_global_priority_from_vesting(repo, index, sign, priority_leaf)
     end
   end
+
+  defp replace_item_in_priority_index(repo, keyspaces, old_item, new_item) do
+    index = keyspaces.priority_index
+
+    changed_locations =
+      Enum.reject(
+        [remove_priority_index_member(repo, index, old_item), add_priority_index_member(repo, index, new_item)],
+        &is_nil/1
+      )
+
+    refresh_changed_priority_locations(repo, index, changed_locations)
+  end
+
+  defp remove_item_from_priority_index(repo, keyspaces, priority, item_key) do
+    {_priority, vesting_time, item_id} = item_key
+    index = keyspaces.priority_index
+    item = %{priority: priority, vesting_time: vesting_time, id: item_id}
+
+    case remove_priority_index_member(repo, index, item) do
+      nil -> :ok
+      location -> refresh_changed_priority_locations(repo, index, [location])
+    end
+  end
+
+  defp add_priority_index_member(repo, index, item) do
+    {sign, priority_leaf} = priority_location(item.priority)
+    vesting_time = vesting_time!(item.vesting_time)
+    member_key = priority_member_key(sign, priority_leaf, vesting_time, item.id)
+
+    if is_nil(repo.get(index, member_key)) do
+      repo.put(index, member_key, "indexed")
+      adjust_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, 1)
+      {sign, priority_leaf, vesting_time}
+    end
+  end
+
+  defp remove_priority_index_member(repo, index, item) do
+    {sign, priority_leaf} = priority_location(item.priority)
+    vesting_time = vesting_time!(item.vesting_time)
+    member_key = priority_member_key(sign, priority_leaf, vesting_time, item.id)
+
+    if repo.get(index, member_key) do
+      repo.clear(index, member_key)
+      adjust_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, -1)
+      {sign, priority_leaf, vesting_time}
+    end
+  end
+
+  defp refresh_changed_priority_locations(repo, index, changed_locations) do
+    changed_locations
+    |> Enum.uniq()
+    |> Enum.each(fn {sign, priority_leaf, vesting_time} ->
+      refresh_priority_vesting_path(repo, index, sign, priority_leaf, vesting_time)
+    end)
+
+    changed_locations
+    |> Enum.map(fn {sign, priority_leaf, _vesting_time} -> {sign, priority_leaf} end)
+    |> Enum.uniq()
+    |> Enum.each(fn {sign, priority_leaf} ->
+      refresh_global_priority_from_vesting(repo, index, sign, priority_leaf)
+    end)
+  end
+
+  defp adjust_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, delta) do
+    current_count = priority_vesting_count(repo, index, sign, priority_leaf, vesting_time)
+    updated_count = current_count + delta
+
+    if updated_count < 0 do
+      raise ArgumentError,
+            "priority index member count cannot become negative for priority leaf #{priority_leaf} at #{vesting_time}"
+    end
+
+    put_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, updated_count)
+  end
+
+  defp refresh_priority_vesting_path(repo, index, sign, priority_leaf, vesting_time) do
+    refresh_priority_vesting_ancestors(
+      repo,
+      index,
+      sign,
+      priority_leaf,
+      @vesting_bits - 1,
+      div(vesting_time, 2)
+    )
+  end
+
+  defp refresh_priority_vesting_ancestors(repo, index, sign, priority_leaf, level, node) do
+    left = priority_vesting_minimum(repo, index, sign, priority_leaf, level + 1, node * 2)
+    right = priority_vesting_minimum(repo, index, sign, priority_leaf, level + 1, node * 2 + 1)
+
+    put_priority_vesting_node(repo, index, sign, priority_leaf, level, node, minimum(left, right))
+
+    if level > 0 do
+      refresh_priority_vesting_ancestors(repo, index, sign, priority_leaf, level - 1, div(node, 2))
+    end
+  end
+
+  defp refresh_global_priority_from_vesting(repo, index, sign, priority_leaf) do
+    minimum = priority_vesting_minimum(repo, index, sign, priority_leaf, 0, 0)
+
+    put_priority_node(repo, index, {sign, @priority_bits, priority_leaf}, minimum)
+    refresh_priority_ancestors(repo, index, sign, @priority_bits - 1, div(priority_leaf, 2))
+    refresh_priority_root(repo, index)
+  end
+
+  defp priority_member_key(sign, priority_leaf, vesting_time, item_id),
+    do: {"member", sign, priority_leaf, vesting_time, item_id}
+
+  defp priority_vesting_key(sign, priority_leaf, level, node), do: {"vesting", sign, priority_leaf, level, node}
+
+  defp priority_vesting_count(repo, index, sign, priority_leaf, vesting_time) do
+    case repo.get(index, priority_vesting_key(sign, priority_leaf, @vesting_bits, vesting_time)) do
+      nil -> 0
+      value -> decode_timestamp(value)
+    end
+  end
+
+  defp put_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, 0),
+    do: repo.clear(index, priority_vesting_key(sign, priority_leaf, @vesting_bits, vesting_time))
+
+  defp put_priority_vesting_count(repo, index, sign, priority_leaf, vesting_time, count),
+    do: repo.put(index, priority_vesting_key(sign, priority_leaf, @vesting_bits, vesting_time), encode_timestamp(count))
+
+  defp priority_vesting_minimum(repo, index, sign, priority_leaf, @vesting_bits, vesting_time) do
+    if priority_vesting_count(repo, index, sign, priority_leaf, vesting_time) == 0, do: nil, else: vesting_time
+  end
+
+  defp priority_vesting_minimum(repo, index, sign, priority_leaf, level, node) do
+    case repo.get(index, priority_vesting_key(sign, priority_leaf, level, node)) do
+      nil -> nil
+      value -> decode_timestamp(value)
+    end
+  end
+
+  defp put_priority_vesting_node(repo, index, sign, priority_leaf, level, node, nil),
+    do: repo.clear(index, priority_vesting_key(sign, priority_leaf, level, node))
+
+  defp put_priority_vesting_node(repo, index, sign, priority_leaf, level, node, vesting_time),
+    do: repo.put(index, priority_vesting_key(sign, priority_leaf, level, node), encode_timestamp(vesting_time))
+
+  defp vesting_time!(vesting_time), do: Item.validate_vesting_time!(vesting_time)
 
   defp priority_item_range(item_keyspace, priority, repo, opts) do
     start_key = Keyspace.pack(item_keyspace, {priority, 0, <<>>})

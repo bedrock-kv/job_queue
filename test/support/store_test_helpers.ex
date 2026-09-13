@@ -124,7 +124,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
           flunk("Unexpected get keyspace: #{prefix}")
       end
     end)
-    |> expect(:put, 68, fn %Keyspace{} = ks, key, value ->
+    |> expect(:put, 134, fn %Keyspace{} = ks, key, value ->
       prefix = Keyspace.prefix(ks)
 
       if String.contains?(prefix, "items/") do
@@ -139,8 +139,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
       else
         assert String.contains?(prefix, "priority_index/"), "Unexpected put keyspace: #{prefix}"
 
-        assert key == {"initialized"} or key == {"root"} or
-                 match?({sign, level, node} when sign in [0, 1] and level in 0..64 and is_integer(node), key)
+        assert priority_index_key?(key)
       end
 
       :ok
@@ -157,6 +156,19 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
       :ok
     end)
   end
+
+  defp priority_index_key?({"initialized"}), do: true
+  defp priority_index_key?({"root"}), do: true
+
+  defp priority_index_key?({sign, level, node}) when sign in [0, 1] and level in 0..64 and is_integer(node), do: true
+
+  defp priority_index_key?({"member", sign, priority_leaf, vesting_time, item_id})
+       when sign in [0, 1] and is_integer(priority_leaf) and is_integer(vesting_time) and is_binary(item_id), do: true
+
+  defp priority_index_key?({"vesting", sign, priority_leaf, level, node})
+       when sign in [0, 1] and is_integer(priority_leaf) and level in 0..64 and is_integer(node), do: true
+
+  defp priority_index_key?(_key), do: false
 
   # ============================================================================
   # Peek Operations

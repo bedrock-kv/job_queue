@@ -110,17 +110,15 @@ defmodule Bedrock.JobQueue.StoreTest do
       {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
       record({:get_range, start_key, end_key, opts})
 
-      entries =
+      storage_entries =
         Agent.get(store(), fn %{data: data} ->
           data
           |> Enum.filter(fn {key, _value} -> key >= start_key and key < end_key end)
           |> Enum.sort()
         end)
 
-      case Keyword.get(opts, :limit) do
-        nil -> entries
-        limit -> Enum.take(entries, limit)
-      end
+      {storage_page, has_more} = storage_page(storage_entries, Keyword.get(opts, :limit))
+      merge_storage_page(transaction!(), storage_entries, storage_page, has_more, start_key, end_key)
     end
 
     def operations(store), do: Agent.get(store, &Enum.reverse(&1.operations))
@@ -155,6 +153,48 @@ defmodule Bedrock.JobQueue.StoreTest do
       |> Map.new()
     end
 
+    # This mirrors the pinned transaction builder's range merge rule closely
+    # enough to exercise Store against the important edge: a storage page can
+    # become empty after local clears while `has_more` remains true. In that
+    # case the real stream stops rather than reaching the next storage page.
+    defp storage_page(entries, nil), do: {entries, false}
+
+    defp storage_page(entries, limit) do
+      {Enum.take(entries, limit), length(entries) > limit}
+    end
+
+    defp merge_storage_page(transaction, storage_entries, storage_page, has_more, start_key, end_key) do
+      merge_end =
+        if has_more do
+          storage_page
+          |> List.last()
+          |> elem(0)
+          |> Bedrock.Key.key_after()
+        else
+          end_key
+        end
+
+      storage_entries
+      |> Enum.filter(fn {key, _value} -> key < merge_end end)
+      |> Enum.map(fn {key, stored_value} -> {key, Tx.repeatable_read(transaction, key) || stored_value} end)
+      |> merge_pending_writes(transaction, start_key, merge_end)
+      |> Enum.reject(fn {_key, value} -> value == :clear end)
+      |> Enum.sort()
+    end
+
+    defp merge_pending_writes(entries, transaction, start_key, end_key) do
+      transaction.writes
+      |> :gb_trees.to_list()
+      |> Enum.reduce(Map.new(entries), fn {key, value}, merged ->
+        if key >= start_key and key < end_key do
+          Map.put(merged, key, value)
+        else
+          merged
+        end
+      end)
+      |> Map.to_list()
+    end
+
     defp record(operation), do: Agent.update(store(), &%{&1 | operations: [operation | &1.operations]})
 
     defp store do
@@ -171,7 +211,7 @@ defmodule Bedrock.JobQueue.StoreTest do
   setup :verify_on_exit!
 
   @migration_chunk_size 8
-  @migration_tree_point_operations_per_item 197
+  @migration_tree_point_operations_per_item 400
 
   # Stub transact to execute callbacks immediately
   setup do
@@ -890,6 +930,145 @@ defmodule Bedrock.JobQueue.StoreTest do
                  end)
 
         assert ready_id == ready.id
+      end)
+    end
+
+    test "keeps a same-priority successor indexed when a lease clears the first merged range page" do
+      now = 10_000
+      queue_id = "merged-range-successor"
+      first = Item.new(queue_id, "first", %{}, id: "a", priority: 0, vesting_time: now)
+      second = Item.new(queue_id, "second", %{}, id: "b", priority: 0, vesting_time: now + 1)
+      {:ok, store} = TxVisibilityRepo.start_link([])
+
+      TxVisibilityRepo.with_store(store, fn ->
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), first, now: now) end)
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), second, now: now) end)
+        TxVisibilityRepo.clear_operations(store)
+
+        assert {:ok, _lease} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), first, "worker", 10_000, now: now)
+                 end)
+
+        refute Enum.any?(TxVisibilityRepo.operations(store), &match?({:get_range, _, _, _}, &1))
+
+        TxVisibilityRepo.clear_operations(store)
+
+        assert now + 1 ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: second_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now + 1)
+                 end)
+
+        assert second_id == second.id
+      end)
+    end
+
+    test "uses no raw range refresh after every mutation that removes a same-priority minimum" do
+      now = 10_000
+
+      for operation <- [:extend, :complete, :requeue, :dead_letter] do
+        queue_id = "merged-range-#{operation}"
+        {first, second, lease, store} = ready_leased_pair(queue_id, now, operation)
+
+        TxVisibilityRepo.with_store(store, fn ->
+          TxVisibilityRepo.clear_operations(store)
+
+          result =
+            TxVisibilityRepo.transact(fn ->
+              case operation do
+                :extend -> Store.extend_lease(TxVisibilityRepo, root(), lease, 15_000, now: now)
+                :complete -> Store.complete(TxVisibilityRepo, root(), lease, now: now)
+                :requeue -> Store.requeue(TxVisibilityRepo, root(), lease, base_delay: 15_000, now: now)
+                :dead_letter -> Store.requeue(TxVisibilityRepo, root(), lease, now: now)
+              end
+            end)
+
+          case operation do
+            :extend -> assert {:ok, _extended} = result
+            :complete -> assert :ok = result
+            :requeue -> assert {:ok, :requeued} = result
+            :dead_letter -> assert {:ok, :dead_lettered} = result
+          end
+
+          refute Enum.any?(TxVisibilityRepo.operations(store), &match?({:get_range, _, _, _}, &1))
+
+          TxVisibilityRepo.clear_operations(store)
+
+          assert second.vesting_time ==
+                   TxVisibilityRepo.transact(fn ->
+                     Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                   end)
+
+          assert [%Item{id: second_id}] =
+                   TxVisibilityRepo.transact(fn ->
+                     Store.peek(TxVisibilityRepo, root(), queue_id, now: second.vesting_time)
+                   end)
+
+          assert second_id == second.id
+          refute first.id == second_id
+        end)
+      end
+    end
+
+    test "keeps a requeued item when its timestamp moves earlier than its former lease expiry" do
+      now = 10_000
+      queue_id = "requeue-earlier-than-lease"
+      {first, _second, lease, store} = ready_leased_pair(queue_id, now, :requeue)
+
+      TxVisibilityRepo.with_store(store, fn ->
+        TxVisibilityRepo.clear_operations(store)
+
+        assert {:ok, :requeued} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.requeue(TxVisibilityRepo, root(), lease, base_delay: 500, now: now)
+                 end)
+
+        assert now + 500 ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: first_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now + 500)
+                 end)
+
+        assert first_id == first.id
+      end)
+    end
+
+    test "counts same-vesting item IDs independently" do
+      now = 10_000
+      queue_id = "same-vesting-members"
+      first = Item.new(queue_id, "first", %{}, id: "a", priority: 0, vesting_time: now)
+      second = Item.new(queue_id, "second", %{}, id: "b", priority: 0, vesting_time: now)
+      {:ok, store} = TxVisibilityRepo.start_link([])
+
+      TxVisibilityRepo.with_store(store, fn ->
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), first, now: now) end)
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), second, now: now) end)
+
+        assert {:ok, _lease} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), first, "worker", 10_000, now: now)
+                 end)
+
+        assert now ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: second_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                 end)
+
+        assert second_id == second.id
       end)
     end
 
@@ -1723,6 +1902,33 @@ defmodule Bedrock.JobQueue.StoreTest do
     end
   end
 
+  describe "vesting time domain" do
+    test "accepts the full unsigned 64-bit timestamp range, including zero" do
+      queue_id = "timestamp-domain"
+      maximum = (1 <<< 64) - 1
+
+      assert %Item{vesting_time: 0} = Item.new(queue_id, "zero", %{}, vesting_time: 0)
+      assert %Item{vesting_time: ^maximum} = Item.new(queue_id, "maximum", %{}, vesting_time: maximum)
+    end
+
+    test "rejects invalid timestamps before item or Store writes" do
+      for invalid_vesting_time <- [-1, 1 <<< 64] do
+        assert_raise ArgumentError, ~r/vesting_time must be an integer between/, fn ->
+          Item.new("invalid-timestamp", "topic", %{}, vesting_time: invalid_vesting_time)
+        end
+
+        invalid_item = %{
+          Item.new("invalid-timestamp", "topic", %{}, vesting_time: 0)
+          | vesting_time: invalid_vesting_time
+        }
+
+        assert_raise ArgumentError, ~r/vesting_time must be an integer between/, fn ->
+          Store.enqueue(MockRepo, root(), invalid_item)
+        end
+      end
+    end
+  end
+
   defp item_count(store, queue_id) do
     count_entries(store, root() |> Store.queue_keyspaces(queue_id) |> Map.fetch!(:items))
   end
@@ -1733,6 +1939,46 @@ defmodule Bedrock.JobQueue.StoreTest do
 
   defp identity_count(store, queue_id) do
     count_entries(store, root() |> Store.queue_keyspaces(queue_id) |> Map.fetch!(:identities))
+  end
+
+  defp ready_leased_pair(queue_id, now, operation) do
+    keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+    original =
+      Item.new(queue_id, "first", %{},
+        id: "first",
+        priority: 0,
+        vesting_time: now,
+        max_retries: if(operation == :dead_letter, do: 1, else: 3)
+      )
+
+    lease = Lease.new(original, "worker", duration_ms: 1_000, now: now)
+
+    first = %{
+      original
+      | lease_id: lease.id,
+        lease_expires_at: lease.expires_at,
+        vesting_time: lease.expires_at
+    }
+
+    second = Item.new(queue_id, "second", %{}, id: "second", priority: 0, vesting_time: now + 10_000)
+
+    entries = [
+      {Keyspace.pack(keyspaces.items, Item.key(first)), :erlang.term_to_binary(first)},
+      {Keyspace.pack(keyspaces.items, Item.key(second)), :erlang.term_to_binary(second)},
+      {Keyspace.pack(keyspaces.leases, lease.item_id), :erlang.term_to_binary(lease)}
+    ]
+
+    {:ok, store} = TxVisibilityRepo.start_link(entries)
+
+    TxVisibilityRepo.with_store(store, fn ->
+      assert :ready =
+               TxVisibilityRepo.transact(fn ->
+                 Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+               end)
+    end)
+
+    {first, second, lease, store}
   end
 
   defp legacy_item(queue_id, id, opts) do

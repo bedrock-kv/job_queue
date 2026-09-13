@@ -60,9 +60,9 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      # 2. Verify the current index, lease, and item. The tree refresh has a
-      # fixed number of point reads for its 64-level path.
-      expect(MockRepo, :get, 135, fn ks, key ->
+      # 2. Verify the current index, lease, item, and the two fixed-height
+      # paths (priority plus per-priority vesting-time multiset).
+      stub(MockRepo, :get, fn ks, key ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases) ->
             assert key == ctx.item.id
@@ -73,7 +73,21 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             :erlang.term_to_binary(ctx.leased_item)
 
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
-            if key == {"initialized"}, do: "ready"
+            case key do
+              {"initialized"} ->
+                "ready"
+
+              {"member", _sign, _priority_leaf, vesting_time, _item_id}
+              when vesting_time == ctx.leased_item.vesting_time ->
+                "indexed"
+
+              {"vesting", _sign, _priority_leaf, 64, vesting_time}
+              when vesting_time == ctx.leased_item.vesting_time ->
+                <<1::64-little>>
+
+              _other ->
+                nil
+            end
 
           true ->
             flunk("Unexpected get: #{inspect({ks, key})}")
@@ -81,7 +95,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       end)
 
       # 4. Clear the old item key and the fixed-height index path.
-      expect(MockRepo, :clear, 67, fn ks, key ->
+      stub(MockRepo, :clear, fn ks, key ->
         if Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) do
           assert key == ctx.lease.item_key
         else
@@ -92,8 +106,8 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         :ok
       end)
 
-      # 5. Write the item and lease.
-      expect(MockRepo, :put, 2, fn ks, key, value ->
+      # 5. Write the item, lease, and the new multiset/tree path.
+      stub(MockRepo, :put, fn ks, key, value ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
             {priority, vesting_time, id} = key
@@ -108,6 +122,10 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             assert updated_lease.id == ctx.lease.id
             assert updated_lease.expires_at > ctx.lease.expires_at
 
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
+            assert is_tuple(key)
+            assert is_binary(value)
+
           true ->
             flunk("Unexpected put: #{inspect({ks, key})}")
         end
@@ -121,8 +139,6 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         assert String.contains?(key, "pointers/")
         :ok
       end)
-
-      expect(MockRepo, :get_range, fn _range, _opts -> [] end)
 
       # Start with short interval
       pid = LeaseExtender.start(MockRepo, ctx.root, ctx.lease, 30_000, interval: 10)
@@ -142,10 +158,24 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      expect(MockRepo, :get, 135, fn ks, key ->
+      stub(MockRepo, :get, fn ks, key ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
-            if key == {"initialized"}, do: "ready"
+            case key do
+              {"initialized"} ->
+                "ready"
+
+              {"member", _sign, _priority_leaf, vesting_time, _item_id}
+              when vesting_time == ctx.leased_item.vesting_time ->
+                "indexed"
+
+              {"vesting", _sign, _priority_leaf, 64, vesting_time}
+              when vesting_time == ctx.leased_item.vesting_time ->
+                <<1::64-little>>
+
+              _other ->
+                nil
+            end
 
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
             :erlang.term_to_binary(ctx.leased_item)
@@ -155,10 +185,9 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         end
       end)
 
-      expect(MockRepo, :clear, 67, fn _, _ -> :ok end)
-      expect(MockRepo, :put, 2, fn _, _, _ -> :ok end)
+      stub(MockRepo, :clear, fn _, _ -> :ok end)
+      stub(MockRepo, :put, fn _, _, _ -> :ok end)
       expect(MockRepo, :max, fn _, _ -> :ok end)
-      expect(MockRepo, :get_range, fn _range, _opts -> [] end)
 
       log =
         capture_log(fn ->

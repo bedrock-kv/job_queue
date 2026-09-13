@@ -6,12 +6,14 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
   alias Bedrock.JobQueue.Consumer.Worker
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Lease
+  alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
 
   setup :set_mox_global
   setup :verify_on_exit!
 
   defmodule BlockingJob do
+    @moduledoc false
     def perform(_args, _meta) do
       send(:worker_lease_test_process, {:perform_started, self()})
 
@@ -24,6 +26,7 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
   end
 
   defmodule NeverRunJob do
+    @moduledoc false
     def perform(_args, _meta) do
       send(:worker_lease_test_process, :handler_ran)
       :ok
@@ -31,6 +34,7 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
   end
 
   defmodule StartupBarrierJob do
+    @moduledoc false
     def perform(_args, _meta) do
       send(:worker_lease_test_process, {:handler_waiting, self()})
 
@@ -127,7 +131,9 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
         :renewing ->
           %{test_pid: test_pid} = Agent.get(:worker_lease_stalled_renewal_repo, & &1)
           send(test_pid, {:renewal_transaction_stalled, self()})
-          receive do end
+
+          receive do
+          end
       end
     end
 
@@ -156,9 +162,10 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
     root = Keyspace.new("job_queue/test/")
     encoded_lease = :erlang.term_to_binary(lease)
     test_pid = self()
+    keyspaces = Store.queue_keyspaces(root, item.queue_id)
+    {:ok, lease_reads} = Agent.start_link(fn -> 0 end)
 
     expect(MockRepo, :transact, fn callback -> callback.() end)
-    expect(MockRepo, :get, fn _keyspace, _item_id -> encoded_lease end)
 
     expect(MockRepo, :transact, fn callback ->
       send(test_pid, {:renewal_attempt, self()})
@@ -168,7 +175,27 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
       end
     end)
 
-    expect(MockRepo, :get, fn _keyspace, _item_id -> nil end)
+    expect(MockRepo, :get, 5, fn keyspace, key ->
+      cond do
+        keyspace == keyspaces.priority_index and key == {"migration"} ->
+          nil
+
+        keyspace == keyspaces.priority_index and key == {"initialized"} ->
+          "ready"
+
+        keyspace == keyspaces.priority_index and key == {"root"} ->
+          nil
+
+        keyspace == keyspaces.leases and key == item.id ->
+          Agent.get_and_update(lease_reads, fn
+            0 -> {encoded_lease, 1}
+            1 -> {nil, 2}
+          end)
+
+        true ->
+          flunk("unexpected queue read: #{inspect({keyspace, key})}")
+      end
+    end)
 
     task =
       Task.async(fn ->
@@ -320,8 +347,11 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
         end)
 
       case phase do
-        :preflight -> Agent.get(clock, & &1)
-        :parent -> Agent.get(clock, & &1)
+        :preflight ->
+          Agent.get(clock, & &1)
+
+        :parent ->
+          Agent.get(clock, & &1)
 
         :handler ->
           send(test_pid, {:handler_start_check, self()})

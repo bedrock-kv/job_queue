@@ -5,8 +5,11 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   import ExUnit.CaptureLog
   import Mox
 
+  alias Bedrock.Internal.Repo.TransactionContext
+  alias Bedrock.JobQueue.Consumer.Action
   alias Bedrock.JobQueue.Consumer.Manager
   alias Bedrock.JobQueue.Item
+  alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
 
@@ -16,20 +19,86 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   @holder_id <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16>>
 
   defmodule SuccessJob do
+    @moduledoc false
     def perform(_args, _meta), do: :ok
     def timeout, do: 1000
   end
 
   defmodule CrashingJob do
+    @moduledoc false
     def perform(_args, _meta), do: exit(:crash)
     def timeout, do: 1000
   end
 
   defmodule ActionHook do
+    @moduledoc false
     def apply(repo, root, lease, action, handler_result, queue_result, test_pid) do
       send(test_pid, {:action_hook, repo, root, lease.item_id, action, handler_result, queue_result})
       :ok
     end
+  end
+
+  defmodule FailingWriteHook do
+    @moduledoc false
+    def apply(repo, _root, _lease, _action, _handler_result, _queue_result) do
+      repo.put("action_hook/write", "partial")
+      {:error, :hook_failed}
+    end
+  end
+
+  defmodule UnusedCluster do
+    @moduledoc false
+    def link!, do: raise("the test always supplies an active transaction")
+  end
+
+  defmodule TransactionalRepo do
+    use Bedrock.Repo, cluster: UnusedCluster
+  end
+
+  defmodule RecordingTransaction do
+    @moduledoc false
+    use GenServer
+
+    def start_link(values), do: GenServer.start_link(__MODULE__, {values, self()})
+    def writes(transaction), do: GenServer.call(transaction, :writes)
+
+    @impl true
+    def init({values, test_pid}), do: {:ok, %{values: values, writes: [], test_pid: test_pid}}
+
+    @impl true
+    def handle_call(:nested_transaction, _from, state) do
+      send(state.test_pid, :nested_transaction)
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:commit, _from, state) do
+      send(state.test_pid, {:commit, state.writes})
+      {:reply, :ok, state}
+    end
+
+    def handle_call({:get, key, _opts}, _from, state) do
+      case Map.fetch(state.values, key) do
+        {:ok, value} -> {:reply, {:ok, value}, state}
+        :error -> {:reply, {:error, :not_found}, state}
+      end
+    end
+
+    def handle_call(:writes, _from, state), do: {:reply, state.writes, state}
+
+    @impl true
+    def handle_cast({:clear, key, opts}, state), do: {:noreply, add_write(state, {:clear, key, opts})}
+
+    def handle_cast({:set_key, key, value, opts}, state), do: {:noreply, add_write(state, {:set_key, key, value, opts})}
+
+    def handle_cast({:atomic, operation, key, value}, state),
+      do: {:noreply, add_write(state, {:atomic, operation, key, value})}
+
+    def handle_cast(:rollback, state) do
+      send(state.test_pid, :rollback)
+      {:noreply, %{state | writes: []}}
+    end
+
+    defp add_write(state, write), do: %{state | writes: [write | state.writes]}
   end
 
   setup do
@@ -144,4 +213,63 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       assert item_id == item.id
     end
   end
+
+  describe "action hook failures" do
+    for action <- [:complete, :requeue] do
+      test "rolls back #{action} and hook writes when the hook fails" do
+        action = unquote(action)
+        {lease, values} = lease_transaction_values(action)
+        {:ok, transaction} = RecordingTransaction.start_link(values)
+        TransactionContext.put_builder(TransactionalRepo, transaction)
+
+        on_exit(fn -> TransactionContext.clear(TransactionalRepo) end)
+
+        assert {:error, {:action_hook_failed, :hook_failed}} =
+                 Action.run(
+                   TransactionalRepo,
+                   Keyspace.new("job_queue/test/"),
+                   lease,
+                   action,
+                   handler_result_for(action),
+                   action_hook: {FailingWriteHook, :apply},
+                   backoff_fn: fn _attempt -> 1_000 end
+                 )
+
+        assert_receive :nested_transaction
+        assert_receive :rollback
+        refute_receive {:commit, _}
+        assert RecordingTransaction.writes(transaction) == []
+      end
+    end
+  end
+
+  defp lease_transaction_values(action) do
+    root = Keyspace.new("job_queue/test/")
+    item = Item.new("tenant_1", "test:success", %{}, id: "item-id", vesting_time: 1_000)
+    lease = Lease.new(item, @holder_id, now: 2_000)
+    keyspaces = Store.queue_keyspaces(root, item.queue_id)
+
+    values = %{
+      Keyspace.pack(keyspaces.leases, item.id) => :erlang.term_to_binary(lease)
+    }
+
+    values =
+      if action == :requeue do
+        leased_item = %{
+          item
+          | lease_id: lease.id,
+            lease_expires_at: lease.expires_at,
+            vesting_time: lease.expires_at
+        }
+
+        Map.put(values, Keyspace.pack(keyspaces.items, lease.item_key), :erlang.term_to_binary(leased_item))
+      else
+        values
+      end
+
+    {lease, values}
+  end
+
+  defp handler_result_for(:complete), do: :ok
+  defp handler_result_for(:requeue), do: {:error, :failed}
 end

@@ -30,6 +30,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   use GenServer
 
   alias Bedrock.JobQueue.Config
+  alias Bedrock.JobQueue.Consumer.Action
   alias Bedrock.JobQueue.Consumer.LeaseExtender
   alias Bedrock.JobQueue.Consumer.Worker
   alias Bedrock.JobQueue.Store
@@ -59,8 +60,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   # Per QuiCK paper: prevents thundering herd on hot queues
   @default_queue_lease_duration 5_000
 
-  def start_link(opts),
-    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @impl true
   def init(opts) do
@@ -73,8 +73,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
       concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
       batch_size: Keyword.get(opts, :batch_size, @default_batch_size),
       lease_duration: Keyword.get(opts, :lease_duration, @default_lease_duration),
-      queue_lease_duration:
-        Keyword.get(opts, :queue_lease_duration, @default_queue_lease_duration),
+      queue_lease_duration: Keyword.get(opts, :queue_lease_duration, @default_queue_lease_duration),
       holder_id: Keyword.get(opts, :holder_id, :crypto.strong_rand_bytes(16)),
       backoff_fn: Keyword.get(opts, :backoff_fn, &Config.default_backoff/1)
     }
@@ -209,8 +208,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
     end
   end
 
-  defp handle_dequeue_result(state, {:ok, {items, leases}}),
-    do: dispatch_jobs(state, items, leases)
+  defp handle_dequeue_result(state, {:ok, {items, leases}}), do: dispatch_jobs(state, items, leases)
 
   defp handle_dequeue_result(state, {:skip, :queue_leased}), do: state
 
@@ -261,9 +259,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
         run_job_action(state, lease, :requeue, result)
 
       {:discard, reason} ->
-        Logger.info(
-          "Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}"
-        )
+        Logger.info("Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}")
 
         run_job_action(state, lease, :complete, result)
 
@@ -273,50 +269,9 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   end
 
   defp run_job_action(state, lease, action, handler_result) do
-    state.repo.transact(fn ->
-      queue_result =
-        case action do
-          :complete ->
-            Store.complete(state.repo, state.root, lease)
-
-          :requeue ->
-            Store.requeue(state.repo, state.root, lease, backoff_fn: state.backoff_fn)
-
-          {:snooze, delay_ms} ->
-            # Snooze uses explicit delay, bypassing backoff_fn
-            Store.requeue(state.repo, state.root, lease, base_delay: delay_ms, max_delay: delay_ms)
-        end
-
-      with :ok <- normalize_queue_result(queue_result),
-           :ok <- run_action_hook(state, lease, action, handler_result, queue_result) do
-        queue_result
-      end
-    end)
-  end
-
-  defp normalize_queue_result(:ok), do: :ok
-  defp normalize_queue_result({:ok, _status}), do: :ok
-  defp normalize_queue_result({:error, reason}), do: {:error, reason}
-
-  defp run_action_hook(%{action_hook: nil}, _lease, _action, _handler_result, _queue_result), do: :ok
-
-  defp run_action_hook(state, lease, action, handler_result, queue_result) do
-    hook_args = [state.repo, state.root, lease, action, handler_result, queue_result]
-
-    hook_result =
-      case state.action_hook do
-        {module, function} ->
-          apply(module, function, hook_args)
-
-        {module, function, extra_args} when is_list(extra_args) ->
-          apply(module, function, hook_args ++ extra_args)
-      end
-
-    case hook_result do
-      :ok -> :ok
-      {:ok, _value} -> :ok
-      {:error, reason} -> {:error, reason}
-      other -> {:error, {:invalid_action_hook_return, other}}
-    end
+    Action.run(state.repo, state.root, lease, action, handler_result,
+      action_hook: state.action_hook,
+      backoff_fn: state.backoff_fn
+    )
   end
 end

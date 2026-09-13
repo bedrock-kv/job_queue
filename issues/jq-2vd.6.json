@@ -2,14 +2,15 @@
   "assignee": "Jason Allum",
   "blocked_by": [],
   "blocks": [],
+  "closed_at": "2026-09-13T06:58:01Z",
   "created": "2026-09-13T06:46:36Z",
   "description": "Store stores items by {priority, vesting_time, id} but stores leases solely by item_id. Reproduced: enqueue the same custom id at vesting times 1000 and 2000 -\u003e two stored items and pending_count 2. They can share/overwrite one lease record and defeat completion/fencing. Re-enqueueing the identical item key also increments pending despite overwriting one row. QuiCK's optional supplied item ID can support idempotent enqueue; this API currently does not ensure it. Define the intended uniqueness scope, enforce uniqueness or reject duplicates, and test repeat enqueue before lease, while leased, and after completion.",
   "id": "jq-2vd.6",
   "labels": [],
   "parent": "jq-2vd",
   "priority": 2,
-  "status": "in_progress",
+  "status": "closed",
   "title": "Define and enforce custom job ID uniqueness",
   "type": "bug",
-  "updated_at": "2026-09-13T06:50:07Z"
+  "updated_at": "2026-09-13T06:58:01Z"
 }

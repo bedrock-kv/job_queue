@@ -4,6 +4,7 @@ defmodule Bedrock.JobQueue.InternalTest do
   import Bedrock.JobQueue.Test.StoreHelpers
   import Mox
 
+  alias Bedrock.Internal.Repo.TransactionContext
   alias Bedrock.JobQueue.Internal
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Store
@@ -41,6 +42,49 @@ defmodule Bedrock.JobQueue.InternalTest do
     use Bedrock.JobQueue, otp_app: :bedrock_job_queue, repo: MockRepo
   end
 
+  # The generated Repo module takes the real nested-transaction path whenever
+  # TransactionContext contains a builder. The transaction below is deliberately
+  # minimal because migrate_queue/2 must reject before it reaches Store or makes
+  # a write in that nested physical transaction.
+  defmodule NestedMigrationCluster do
+    @moduledoc false
+    def link!, do: raise("the test always supplies an active transaction")
+  end
+
+  defmodule NestedMigrationRepo do
+    @moduledoc false
+    use Bedrock.Repo, cluster: NestedMigrationCluster
+  end
+
+  defmodule NestedMigrationQueue do
+    @moduledoc false
+    def __config__, do: %{repo: NestedMigrationRepo}
+  end
+
+  defmodule NestedMigrationTransaction do
+    @moduledoc false
+    use GenServer
+
+    def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid)
+    def writes(transaction), do: GenServer.call(transaction, :writes)
+
+    @impl true
+    def init(test_pid), do: {:ok, %{test_pid: test_pid, writes: []}}
+
+    @impl true
+    def handle_call(:nested_transaction, _from, state) do
+      send(state.test_pid, :nested_transaction)
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:commit, _from, state) do
+      send(state.test_pid, {:nested_commit, state.writes})
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:writes, _from, state), do: {:reply, state.writes, state}
+  end
+
   describe "enqueue/5" do
     test "enqueues item with immediate processing" do
       test_pid = self()
@@ -57,7 +101,7 @@ defmodule Bedrock.JobQueue.InternalTest do
       end)
 
       # 2. Store.enqueue calls repo.put for item (keyspace, key, value)
-      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {priority, vesting_time, id} = key
           assert priority == 100
@@ -65,7 +109,7 @@ defmodule Bedrock.JobQueue.InternalTest do
           assert is_binary(id)
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key == {"initialized"}
+          assert_priority_index_bootstrap_key(key)
         end
 
         :ok
@@ -109,13 +153,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {_priority, vesting_time, _id} = key
           assert vesting_time == expected_vesting
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key == {"initialized"}
+          assert_priority_index_bootstrap_key(key)
         end
 
         :ok
@@ -144,13 +188,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {_priority, vesting_time, _id} = key
           assert vesting_time == expected_vesting
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key == {"initialized"}
+          assert_priority_index_bootstrap_key(key)
         end
 
         :ok
@@ -177,13 +221,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, 2, fn keyspace, key, _value ->
+      expect(MockRepo, :put, 68, fn keyspace, key, _value ->
         if Keyspace.prefix(keyspace) =~ "items" do
           {priority, _vesting_time, _id} = key
           assert priority == 0
         else
           assert Keyspace.prefix(keyspace) =~ "priority_index/"
-          assert key == {"initialized"}
+          assert_priority_index_bootstrap_key(key)
         end
 
         :ok
@@ -229,7 +273,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         callback.()
       end)
 
-      expect(MockRepo, :get, 134, fn %Keyspace{} = keyspace, key ->
+      expect(MockRepo, :get, 4, fn %Keyspace{} = keyspace, key ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do
@@ -250,13 +294,13 @@ defmodule Bedrock.JobQueue.InternalTest do
         end
       end)
 
-      expect(MockRepo, :put, 3, fn %Keyspace{} = keyspace, key, _value ->
+      expect(MockRepo, :put, 69, fn %Keyspace{} = keyspace, key, _value ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do
           prefix =~ "identities/" -> assert key == "request-42"
           prefix =~ "items/" -> :ok
-          prefix =~ "priority_index/" -> assert key == {"initialized"}
+          prefix =~ "priority_index/" -> assert_priority_index_bootstrap_key(key)
           true -> flunk("Unexpected put: #{inspect({keyspace, key})}")
         end
 
@@ -296,6 +340,27 @@ defmodule Bedrock.JobQueue.InternalTest do
 
       assert {:error, :writer_fence_required} = TestJobQueue.migrate_queue("tenant_1")
     end
+
+    test "rejects migration inside a real nested Repo transaction before Store can mutate" do
+      {:ok, transaction} = NestedMigrationTransaction.start_link(self())
+      TransactionContext.put_builder(NestedMigrationRepo, transaction)
+
+      on_exit(fn -> TransactionContext.clear(NestedMigrationRepo) end)
+
+      assert {:error, :top_level_transaction_required} =
+               NestedMigrationRepo.transact(fn ->
+                 Internal.migrate_queue(NestedMigrationQueue, "legacy", writer_fence: :offline)
+               end)
+
+      assert_receive :nested_transaction
+      assert_receive {:nested_commit, []}
+      assert NestedMigrationTransaction.writes(transaction) == []
+    end
+  end
+
+  defp assert_priority_index_bootstrap_key(key) do
+    assert key == {"initialized"} or key == {"root"} or
+             match?({sign, level, node} when sign in [0, 1] and level in 0..64 and is_integer(node), key)
   end
 
   describe "stats/3" do

@@ -99,7 +99,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     expected_key = Item.key(item)
 
     repo
-    |> expect(:get, 133, fn %Keyspace{} = ks, key ->
+    |> expect(:get, 3, fn %Keyspace{} = ks, key ->
       prefix = Keyspace.prefix(ks)
 
       cond do
@@ -114,7 +114,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
           flunk("Unexpected get keyspace: #{prefix}")
       end
     end)
-    |> expect(:put, 2, fn %Keyspace{} = ks, key, value ->
+    |> expect(:put, 68, fn %Keyspace{} = ks, key, value ->
       prefix = Keyspace.prefix(ks)
 
       if String.contains?(prefix, "items/") do
@@ -128,7 +128,9 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
         assert decoded.queue_id == item.queue_id
       else
         assert String.contains?(prefix, "priority_index/"), "Unexpected put keyspace: #{prefix}"
-        assert key == {"initialized"}
+
+        assert key == {"initialized"} or key == {"root"} or
+                 match?({sign, level, node} when sign in [0, 1] and level in 0..64 and is_integer(node), key)
       end
 
       :ok

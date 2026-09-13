@@ -11,10 +11,14 @@ defmodule Bedrock.JobQueue.Internal do
   """
 
   alias Bedrock.Directory
+  alias Bedrock.Internal.Repo.TransactionContext
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
   alias Bedrock.ToKeyspace
+
+  @type migration_result ::
+          :more | :ready | :empty | {:error, :writer_fence_required | :top_level_transaction_required}
 
   @doc """
   Enqueues a job for processing.
@@ -68,15 +72,24 @@ defmodule Bedrock.JobQueue.Internal do
   all normal queue operations are held. The first administrative call commits
   the index clear; later calls advance one bounded raw-item chunk. Call
   repeatedly until the result is `:ready` or `:empty`, then resume writers and
-  consumers.
+  consumers. Each call must begin outside `repo.transact/2`: nested Bedrock
+  transactions commit only into their parent, so migration returns
+  `{:error, :top_level_transaction_required}` rather than sharing a physical
+  transaction with another operation.
   """
+  @spec migrate_queue(module(), String.t(), keyword()) :: migration_result()
   def migrate_queue(job_queue_module, queue_id, opts \\ []) do
     config = job_queue_module.__config__()
-    root = root_keyspace(job_queue_module)
 
-    config.repo.transact(fn ->
-      Store.migrate_priority_index(config.repo, root, queue_id, opts)
-    end)
+    if TransactionContext.builder(config.repo) do
+      {:error, :top_level_transaction_required}
+    else
+      root = root_keyspace(job_queue_module)
+
+      config.repo.transact(fn ->
+        Store.migrate_priority_index(config.repo, root, queue_id, opts)
+      end)
+    end
   end
 
   defp process_scheduling_opts(opts, now) do

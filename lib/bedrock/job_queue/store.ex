@@ -314,13 +314,13 @@ defmodule Bedrock.JobQueue.Store do
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
 
-    with :ok <- initialize_empty_priority_index(repo, keyspaces) do
+    with {:ok, priority_index_mode} <- initialize_empty_priority_index(repo, keyspaces) do
       identity_state = identity_state(repo, keyspaces)
 
       if custom_id?(item, opts) do
-        enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state)
+        enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state, priority_index_mode)
       else
-        write_new_item(repo, keyspaces, pointers, item, now)
+        write_new_item(repo, keyspaces, pointers, item, now, priority_index_mode)
       end
     end
   end
@@ -329,22 +329,22 @@ defmodule Bedrock.JobQueue.Store do
     Keyword.get(opts, :custom_id?, Map.get(item, :custom_id?, false))
   end
 
-  defp enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state) do
+  defp enqueue_custom_id(repo, keyspaces, pointers, item, now, identity_state, priority_index_mode) do
     case repo.get(keyspaces.identities, item.id) do
       nil ->
-        enqueue_unindexed_custom_id(repo, keyspaces, pointers, item, now, identity_state)
+        enqueue_unindexed_custom_id(repo, keyspaces, pointers, item, now, identity_state, priority_index_mode)
 
       value ->
         {:ok, decode(value)}
     end
   end
 
-  defp enqueue_unindexed_custom_id(repo, keyspaces, pointers, item, now, :current) do
+  defp enqueue_unindexed_custom_id(repo, keyspaces, pointers, item, now, :current, priority_index_mode) do
     repo.put(keyspaces.identities, item.id, encode(item))
-    write_new_item(repo, keyspaces, pointers, item, now)
+    write_new_item(repo, keyspaces, pointers, item, now, priority_index_mode)
   end
 
-  defp enqueue_unindexed_custom_id(repo, keyspaces, _pointers, item, _now, :legacy) do
+  defp enqueue_unindexed_custom_id(repo, keyspaces, _pointers, item, _now, :legacy, _priority_index_mode) do
     case legacy_items_with_id(repo, keyspaces, item.id) do
       [legacy_item] ->
         repo.put(keyspaces.identities, item.id, encode(legacy_item))
@@ -394,10 +394,14 @@ defmodule Bedrock.JobQueue.Store do
     |> Enum.any?()
   end
 
-  defp write_new_item(repo, keyspaces, pointers, item, now) do
+  defp write_new_item(repo, keyspaces, pointers, item, now, priority_index_mode) do
     item_key = Item.key(item)
     repo.put(keyspaces.items, item_key, encode(item))
-    refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
+
+    case priority_index_mode do
+      :bootstrap -> initialize_priority_index_for_first_item(repo, keyspaces.priority_index, item)
+      :current -> refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
+    end
 
     update_pointer(repo, pointers, item.vesting_time, item.queue_id, now)
     update_stats(repo, keyspaces, 1, 0)
@@ -1214,7 +1218,7 @@ defmodule Bedrock.JobQueue.Store do
     case priority_index_state(keyspaces, repo, migration_state) do
       :writer_fence_required -> initialize_empty_legacy_priority_index(repo, keyspaces)
       :migrating -> {:error, :priority_index_migration_required}
-      _current -> :ok
+      _current -> {:ok, :current}
     end
   end
 
@@ -1224,7 +1228,7 @@ defmodule Bedrock.JobQueue.Store do
     else
       repo.clear_range(keyspaces.priority_index)
       put_priority_index_initialized(repo, keyspaces.priority_index)
-      :ok
+      {:ok, :bootstrap}
     end
   end
 
@@ -1325,6 +1329,22 @@ defmodule Bedrock.JobQueue.Store do
 
   defp refresh_priority_index_after_mutation(repo, keyspaces, priority),
     do: refresh_priority_index(repo, keyspaces, priority)
+
+  # The empty-range read immediately before this function conflict-tracks the
+  # raw item namespace. Its clear_range may leave stale point values visible to
+  # this transaction, so the first current-format item builds its entire
+  # non-empty min-tree path with writes only. Sparse absent nodes are the exact
+  # representation of every other priority range.
+  defp initialize_priority_index_for_first_item(repo, index, item) do
+    {sign, leaf} = priority_location(item.priority)
+
+    for level <- @priority_bits..0//-1 do
+      node = leaf >>> (@priority_bits - level)
+      put_priority_node(repo, index, {sign, level, node}, item.vesting_time)
+    end
+
+    put_priority_node(repo, index, {"root"}, item.vesting_time)
+  end
 
   defp refresh_priority_index(repo, keyspaces, priority) do
     minimum = priority_minimum(repo, keyspaces.items, priority)

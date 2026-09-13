@@ -96,6 +96,16 @@ defmodule Bedrock.JobQueue.StoreTest do
       :ok
     end
 
+    def max(key, value) when is_binary(key) and is_binary(value) do
+      record({:max, key, value})
+      :ok
+    end
+
+    def add(key, value) when is_binary(key) and is_binary(value) do
+      record({:add, key, value})
+      :ok
+    end
+
     def get_range(range, opts \\ []) do
       {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
       record({:get_range, start_key, end_key, opts})
@@ -619,6 +629,45 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :ready = Store.priority_index_status(MockRepo, root(), item.queue_id)
       assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), item.queue_id, now: now)
       assert item_id == item.id
+    end
+
+    test "bootstraps an empty queue without reading stale tree nodes after its clear" do
+      now = 100
+      queue_id = "transactional-empty-bootstrap"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "first", %{}, priority: 0, vesting_time: now)
+
+      # A marker-less stale negative subtree is precisely the state an empty
+      # upgraded queue may inherit. Tx.clear_range/2 does not mask this value
+      # from a later point read in the pinned TransactionBuilder.
+      stale_negative_root = Keyspace.pack(keyspaces.priority_index, {0, 0, 0})
+      {:ok, store} = TxVisibilityRepo.start_link([{stale_negative_root, <<0::64-little>>}])
+
+      TxVisibilityRepo.with_store(store, fn ->
+        assert {:ok, ^item} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.enqueue_with_item(TxVisibilityRepo, root(), item, now: now)
+                 end)
+
+        operations = TxVisibilityRepo.operations(store)
+
+        refute Enum.any?(operations, fn
+                 {:get, key} -> key == stale_negative_root
+                 _operation -> false
+               end)
+
+        assert now ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: item_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                 end)
+
+        assert item_id == item.id
+      end)
     end
 
     test "holds a nonempty pre-index queue until an administrator confirms its writer fence" do

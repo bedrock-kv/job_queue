@@ -180,10 +180,19 @@ defmodule Bedrock.JobQueue do
       call. Call repeatedly until it returns `:ready` or `:empty`; each call
       runs one bounded transaction. The first call prepares and commits the
       cleared index; later calls process at most one migration chunk.
+      Call this function outside `repo.transact/2`: it returns
+      `{:error, :top_level_transaction_required}` when a Bedrock transaction
+      is already active, because a nested transaction cannot physically commit
+      the clear or an indexing chunk.
       While it is `:migrating`, all normal queue operations are held and the
       Manager will not dispatch jobs. Resume writers and consumers only after
       the terminal result.
       """
+      @spec migrate_queue(String.t(), keyword()) ::
+              :more
+              | :ready
+              | :empty
+              | {:error, :writer_fence_required | :top_level_transaction_required}
       def migrate_queue(queue_id, opts \\ []), do: Internal.migrate_queue(__MODULE__, queue_id, opts)
 
       @doc """

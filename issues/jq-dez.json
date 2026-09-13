@@ -1,0 +1,14 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-09-13T03:40:26Z",
+  "description": "Upgrade the Bedrock dependency to its latest compatible release, resolve API changes, and execute every project Livebook successfully.",
+  "id": "jq-dez",
+  "labels": [],
+  "priority": 1,
+  "status": "open",
+  "title": "Upgrade to latest Bedrock and validate Livebooks",
+  "type": "task",
+  "updated_at": "2026-09-13T03:40:26Z"
+}

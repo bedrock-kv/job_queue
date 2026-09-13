@@ -14,6 +14,9 @@ defmodule Bedrock.JobQueue.StoreTest do
 
   setup :verify_on_exit!
 
+  @migration_chunk_size 8
+  @migration_tree_point_operations_per_item 197
+
   # Stub transact to execute callbacks immediately
   setup do
     stub(MockRepo, :transact, fn callback -> callback.() end)
@@ -47,6 +50,7 @@ defmodule Bedrock.JobQueue.StoreTest do
                priority_index: priority_index,
                stats: stats
              } = keyspaces
+
       assert dead_letter.key_encoding == nil
       assert identity_metadata.key_encoding == nil
       assert identities.key_encoding == nil
@@ -186,6 +190,7 @@ defmodule Bedrock.JobQueue.StoreTest do
         {packed_item_key, :erlang.term_to_binary(item)}
       ])
 
+      assert [] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
       assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
       assert item_id == item.id
     end
@@ -219,6 +224,7 @@ defmodule Bedrock.JobQueue.StoreTest do
         Item.new("tenant_1", "topic", %{data: "earlier"}, priority: 100, vesting_time: 1000)
 
       later = Item.new("tenant_1", "topic", %{data: "later"}, priority: 100, vesting_time: 2000)
+
       for item <- [later, earlier] do
         assert :ok = Store.enqueue(MockRepo, root(), item, now: 1_000)
       end
@@ -455,7 +461,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :ok = result
     end
 
-    test "rebuilds an upgraded queue's priority index before reading it" do
+    test "migrates an upgraded queue in fixed chunks before dispatching or reporting an exact minimum" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
@@ -465,24 +471,169 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       # Simulate an upgraded queue: all of these rows predate the scheduling
       # index, so no index keys have been written yet.
-      for sequence <- 1..1_000 do
+      for priority <- 0..999 do
         future =
-          Item.new(queue_id, "future", %{sequence: sequence},
-            id: <<sequence::128>>,
-            priority: 0,
+          Item.new(queue_id, "future", %{priority: priority},
+            id: <<priority::128>>,
+            priority: priority,
             vesting_time: 20_000
           )
 
         store_item(store, keyspaces.items, future)
       end
 
-      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      ready = Item.new(queue_id, "ready", %{}, priority: 1_000, vesting_time: now)
       store_item(store, keyspaces.items, ready)
 
-      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
-      assert MockRepo.get(keyspaces.priority_index, {"root"}) != nil
+      # The first calls each process one bounded chunk. Until the final empty
+      # chunk proves coverage, the partial tree is never a dispatch source and
+      # the minimum is the immediate-rescan sentinel rather than a false exact
+      # value from the scanned prefix.
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == 0
+      assert MockRepo.get(keyspaces.priority_index, {"migration"})
+
+      total_rows = 1_001
+      nonempty_chunks = div(total_rows + @migration_chunk_size - 1, @migration_chunk_size)
+
+      # `peek` and this direct minimum query each process one nonempty chunk.
+      # Manager passes `advance_migration?: false`, so its callback still uses
+      # only the peek chunk. The remaining chunks are non-dispatching; the
+      # final empty chunk atomically marks the complete index ready.
+      for _ <- 1..(nonempty_chunks - 2) do
+        assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      end
+
       assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert ready_id == ready.id
+      assert MockRepo.get(keyspaces.priority_index, {"root"})
+      assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "bounds one migration transaction independently of legacy queue size" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store, [], observer: self())
+
+      queue_id = "bounded-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      for priority <- 0..999 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "future", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: 20_000
+          )
+        )
+      end
+
+      # A manager-style minimum read never starts a migration by itself. It
+      # returns the sentinel and leaves the one-chunk advance to peek/4.
+      assert Store.min_vesting_time(MockRepo, root(), queue_id, advance_migration?: false) == 0
+      assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
+      refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
+
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: 10_000)
+
+      operations = drain_store_operations()
+
+      assert [{:get_range, {_start_key, _end_key}, opts}] =
+               Enum.filter(operations, &match?({:get_range, {_, _}, _}, &1))
+
+      assert opts[:limit] == @migration_chunk_size
+
+      index_point_operations =
+        Enum.count(operations, fn
+          {operation, %Keyspace{} = keyspace, _key} when operation in [:get, :put, :clear] ->
+            String.contains?(Keyspace.prefix(keyspace), "priority_index/")
+
+          _ ->
+            false
+        end)
+
+      assert index_point_operations <=
+               @migration_chunk_size * @migration_tree_point_operations_per_item + 8
+
+      # Manager reads the sentinel without advancing a second chunk after its
+      # peek, keeping the whole callback bounded by the one chunk above.
+      assert Store.min_vesting_time(MockRepo, root(), queue_id, advance_migration?: false) == 0
+
+      refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
+    end
+
+    test "replays a migration chunk idempotently after a retry" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "retrying-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      future = Item.new(queue_id, "future", %{}, priority: 0, vesting_time: now + 10_000)
+      ready = Item.new(queue_id, "ready", %{}, priority: 1, vesting_time: now)
+      Enum.each([future, ready], &store_item(store, keyspaces.items, &1))
+
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+
+      # A real transaction retry rolls back both the tree writes and cursor
+      # update. Replaying this already-merged chunk is stricter: it proves the
+      # merge itself is idempotent even if only the cursor is retried.
+      MockRepo.put(
+        keyspaces.priority_index,
+        {"migration"},
+        :erlang.term_to_binary({:building, nil})
+      )
+
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "preserves mutations and enqueues on either side of a migration cursor" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "legacy-mutations"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      static_items =
+        for priority <- 0..15 do
+          Item.new(queue_id, "static", %{priority: priority},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: 20_000
+          )
+        end
+
+      Enum.each(static_items, &store_item(store, keyspaces.items, &1))
+
+      # The first chunk covers priorities 0..7.
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+
+      # This mutation is before the persisted cursor and must update the
+      # partial tree directly instead of waiting for a scan that will not
+      # revisit it.
+      assert {:ok, _lease} =
+               Store.obtain_lease(MockRepo, root(), hd(static_items), "worker", 1_000, now: now)
+
+      # This new item sorts before the cursor and therefore cannot be found by
+      # a later raw-range chunk. Its direct leaf refresh is what preserves it.
+      before_cursor = Item.new(queue_id, "before", %{}, priority: -1, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), before_cursor, now: now)
+
+      # This item is behind the cursor. It is refreshed directly and will also
+      # be observed by a later migration chunk without corrupting the final
+      # index.
+      behind_cursor = Item.new(queue_id, "behind", %{}, priority: 100, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), behind_cursor, now: now)
+
+      assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [first.id, second.id] == [before_cursor.id, behind_cursor.id]
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
     test "uses a custom ID as a queue-scoped idempotency key before leasing" do
@@ -674,6 +825,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, leased_item)
 
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert item_id == item.id
 
@@ -737,6 +889,7 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert {:ok, :requeued} = Store.requeue(MockRepo, root(), lease, now: now, base_delay: 1_000)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 999)
+
       assert [%Item{id: item_id, error_count: 1}] =
                Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
 
@@ -868,22 +1021,40 @@ defmodule Bedrock.JobQueue.StoreTest do
   end
 
   describe "priority domain" do
+    test "rejects priorities outside the tuple encoding domain with a validation error" do
+      for invalid_priority <- [-(1 <<< 64), 1 <<< 64] do
+        assert_raise ArgumentError, ~r/priority must be an integer between/, fn ->
+          Item.new("invalid-priority", "topic", %{}, priority: invalid_priority)
+        end
+
+        invalid_item = %{
+          Item.new("invalid-priority", "topic", %{}, priority: 0)
+          | priority: invalid_priority
+        }
+
+        assert_raise ArgumentError, ~r/priority must be an integer between/, fn ->
+          Store.enqueue(MockRepo, root(), invalid_item)
+        end
+      end
+    end
+
     test "preserves negative and large priorities accepted by the item key encoding" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
       now = 10_000
       queue_id = "signed-priorities"
+      lowest = Item.new(queue_id, "lowest", %{}, priority: -((1 <<< 64) - 1), vesting_time: now)
       negative = Item.new(queue_id, "negative", %{}, priority: -1, vesting_time: now)
       ordinary = Item.new(queue_id, "ordinary", %{}, priority: 100, vesting_time: now)
       large = Item.new(queue_id, "large", %{}, priority: 1 <<< 63, vesting_time: now)
 
-      for item <- [negative, ordinary, large] do
+      for item <- [lowest, negative, ordinary, large] do
         assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
       end
 
-      assert [first, second, third] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert [first.id, second.id, third.id] == [negative.id, ordinary.id, large.id]
+      assert [first, second, third, fourth] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [first.id, second.id, third.id, fourth.id] == [lowest.id, negative.id, ordinary.id, large.id]
     end
 
     test "keeps same-vesting maximum-priority items after lower priorities in ID order" do
@@ -938,6 +1109,14 @@ defmodule Bedrock.JobQueue.StoreTest do
     |> Map.put(:__struct__, Item)
     |> :erlang.term_to_binary()
     |> :erlang.binary_to_term()
+  end
+
+  defp drain_store_operations(operations \\ []) do
+    receive do
+      {:store_operation, operation} -> drain_store_operations([operation | operations])
+    after
+      0 -> Enum.reverse(operations)
+    end
   end
 
   defp count_entries(store, keyspace) do

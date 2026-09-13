@@ -32,6 +32,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   end
 
   defmodule BlockingJob do
+    @moduledoc false
     def perform(_args, _meta) do
       Process.register(self(), :manager_lifecycle_handler)
       send(:manager_lifecycle_test_process, {:handler_started, self()})

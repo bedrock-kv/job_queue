@@ -12,6 +12,8 @@ defmodule Bedrock.JobQueue.Store do
           items/                         # {priority, vesting_time, id} -> Item
           priority_index/{sign, level, node} # -> earliest vesting time in priority range
           priority_index/{"root"}            # -> earliest vesting time in queue
+          priority_index/{"initialized"}     # -> complete index marker
+          priority_index/{"migration"}       # -> resumable legacy cursor
           identities/{item_id}           # -> canonical custom-ID Item
           identity_metadata/state         # -> current | legacy
           leases/{item_id}               # -> Lease
@@ -49,8 +51,11 @@ defmodule Bedrock.JobQueue.Store do
   # fixed-height subtrees retain that complete ordering without narrowing the
   # priorities accepted by existing item keys.
   @priority_bits 64
-  @min_priority -(1 <<< @priority_bits)
   @max_priority (1 <<< @priority_bits) - 1
+  @min_priority -@max_priority
+  @migration_chunk_size 8
+  @priority_index_initialized_key {"initialized"}
+  @priority_index_migration_key {"migration"}
 
   @type repo :: module()
   @type root_keyspace :: Keyspace.t()
@@ -218,6 +223,7 @@ defmodule Bedrock.JobQueue.Store do
           {:ok, Item.t()}
           | {:error, :legacy_custom_id_unknown | :legacy_duplicate_custom_id}
   def enqueue_with_item(repo, root, %Item{} = item, opts \\ []) do
+    Item.validate_priority!(item.priority)
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
@@ -300,14 +306,9 @@ defmodule Bedrock.JobQueue.Store do
   end
 
   defp write_new_item(repo, keyspaces, pointers, item, now) do
-    # A root-less, non-empty queue predates this index. Rebuild it after this
-    # write instead of creating a partial index that would omit older rows.
-    index_present? = priority_index_present?(repo, keyspaces)
-    empty_before_write? = not index_present? and not queue_has_items?(repo, keyspaces)
-
     item_key = Item.key(item)
     repo.put(keyspaces.items, item_key, encode(item))
-    refresh_priority_index_after_mutation(repo, keyspaces, item.priority, index_present? or empty_before_write?)
+    refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
 
     update_pointer(repo, pointers, item.vesting_time, item.queue_id, now)
     update_stats(repo, keyspaces, 1, 0)
@@ -328,7 +329,9 @@ defmodule Bedrock.JobQueue.Store do
   The priority index stores the earliest vesting time for each range of
   priorities. It makes it possible to find the next ready priority with a
   fixed number of point reads, rather than scanning future items before
-  filtering them for visibility.
+  filtering them for visibility. A queue written before this index migrates in
+  fixed chunks: `peek/4` returns no jobs until the final empty chunk proves
+  the index covers every item, preserving global priority order throughout.
   """
   @spec peek(repo(), root_keyspace(), String.t(), keyword()) :: [Item.t()]
   def peek(repo, root, queue_id, opts \\ []) do
@@ -337,9 +340,17 @@ defmodule Bedrock.JobQueue.Store do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
 
     case ensure_priority_index(repo, keyspaces) do
+      :migrating -> []
       :empty -> []
       :indexed -> peek_ready_items(repo, keyspaces, limit, now)
     end
+  end
+
+  @doc false
+  @spec migration_in_progress?(repo(), root_keyspace(), String.t()) :: boolean()
+  def migration_in_progress?(repo, root, queue_id) do
+    keyspaces = queue_keyspaces(root, queue_id)
+    match?({:building, _cursor}, migration_cursor(repo, keyspaces.priority_index))
   end
 
   defp peek_ready_items(_repo, _keyspaces, 0, _now), do: []
@@ -462,7 +473,6 @@ defmodule Bedrock.JobQueue.Store do
   end
 
   defp do_obtain_lease(repo, keyspaces, pointers, current_item, holder, duration_ms, now) do
-    index_present? = priority_index_present?(repo, keyspaces)
     lease = Lease.new(current_item, holder, duration_ms: duration_ms, now: now)
     lease_expires_at = now + duration_ms
     pending_item? = current_item.lease_id == nil
@@ -479,7 +489,7 @@ defmodule Bedrock.JobQueue.Store do
     new_item_key = Item.key(updated_item)
     repo.put(keyspaces.items, new_item_key, encode(updated_item))
     repo.put(keyspaces.leases, lease.item_id, encode(lease))
-    refresh_priority_index_after_mutation(repo, keyspaces, current_item.priority, index_present?)
+    refresh_priority_index_after_mutation(repo, keyspaces, current_item.priority)
 
     update_pointer(repo, pointers, lease_expires_at, current_item.queue_id, now)
 
@@ -572,7 +582,7 @@ defmodule Bedrock.JobQueue.Store do
           repo.clear(keyspaces.items, old_item_key)
           new_item_key = Item.key(updated_item)
           repo.put(keyspaces.items, new_item_key, encode(updated_item))
-          refresh_priority_index_if_present(repo, keyspaces, item.priority)
+          refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
 
           # Update lease record
           updated_lease = %{stored_lease | expires_at: new_expires_at, item_key: new_item_key}
@@ -613,7 +623,7 @@ defmodule Bedrock.JobQueue.Store do
       item_key = stored_lease.item_key
       repo.clear(keyspaces.items, item_key)
       repo.clear(keyspaces.leases, lease.item_id)
-      refresh_priority_index_if_present(repo, keyspaces, elem(stored_lease.item_key, 0))
+      refresh_priority_index_after_mutation(repo, keyspaces, elem(stored_lease.item_key, 0))
 
       update_stats(repo, keyspaces, 0, -1)
 
@@ -706,7 +716,7 @@ defmodule Bedrock.JobQueue.Store do
     repo.clear(keyspaces.items, item_key)
     new_item_key = Item.key(updated_item)
     repo.put(keyspaces.items, new_item_key, encode(updated_item))
-    refresh_priority_index_if_present(repo, keyspaces, item.priority)
+    refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
 
     update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
     repo.clear(keyspaces.leases, lease.item_id)
@@ -757,14 +767,24 @@ defmodule Bedrock.JobQueue.Store do
 
   The priority index root stores this value exactly, so indexed queues need one
   point read rather than a bounded approximation over priority-ordered item
-  rows. An upgraded queue is rebuilt transactionally on its first read.
+  rows. While an upgraded queue is migrating in fixed chunks, this returns `0`
+  as an immediate-rescan sentinel; it is not an exact minimum until migration
+  completes.
+
+  ## Options
+
+  - `:advance_migration?` - Whether this call may process one migration chunk
+    (default: `true`). The consumer passes `false` after `peek/4` so one
+    manager transaction cannot consume multiple chunks.
   """
   @spec min_vesting_time(repo(), root_keyspace(), String.t(), keyword()) ::
           non_neg_integer() | nil
-  def min_vesting_time(repo, root, queue_id, _opts \\ []) do
+  def min_vesting_time(repo, root, queue_id, opts \\ []) do
     keyspaces = queue_keyspaces(root, queue_id)
+    advance_migration? = Keyword.get(opts, :advance_migration?, true)
 
-    case ensure_priority_index(repo, keyspaces) do
+    case minimum_priority_index_status(repo, keyspaces, advance_migration?) do
+      :migrating -> 0
       :empty -> nil
       :indexed -> priority_index_minimum(repo, keyspaces)
     end
@@ -898,15 +918,7 @@ defmodule Bedrock.JobQueue.Store do
 
   defp queue_empty?(repo, root, queue_id) do
     keyspaces = queue_keyspaces(root, queue_id)
-    not queue_has_items?(repo, keyspaces)
-  end
-
-  defp queue_has_items?(repo, keyspaces) do
-    keyspaces.items
-    # Do not limit the raw range before filtering malformed or legacy rows
-    # beneath the prefix: the first raw row is not necessarily an item.
-    |> item_keyspace_range(repo, [])
-    |> Enum.any?()
+    ensure_priority_index(repo, keyspaces) == :empty
   end
 
   # Private helpers
@@ -1024,14 +1036,14 @@ defmodule Bedrock.JobQueue.Store do
   # If binary is larger than 8 bytes, something is wrong - return 0
   defp decode_counter(_), do: 0
 
-  defp move_to_dead_letter(repo, keyspaces, item_key, item, now, index_present?) do
+  defp move_to_dead_letter(repo, keyspaces, item_key, item, now) do
     # Write to dead letter with failed_at timestamp
     dl_key = "#{now}/#{item.id}"
     repo.put(keyspaces.dead_letter, dl_key, encode(item))
 
     # Delete from main queue and update stats
     repo.clear(keyspaces.items, item_key)
-    refresh_priority_index_after_mutation(repo, keyspaces, item.priority, index_present?)
+    refresh_priority_index_after_mutation(repo, keyspaces, item.priority)
     update_stats(repo, keyspaces, 0, -1)
   end
 
@@ -1044,43 +1056,146 @@ defmodule Bedrock.JobQueue.Store do
 
   defp priority_index_present?(repo, keyspaces), do: not is_nil(priority_index_minimum(repo, keyspaces))
 
+  # A root is exact only after the initialized marker has been written. Older
+  # queues are migrated in resumable chunks; their partial tree is deliberately
+  # never used to dispatch work or report a precise minimum.
   defp ensure_priority_index(repo, keyspaces) do
-    if priority_index_present?(repo, keyspaces) do
-      :indexed
-    else
-      if queue_has_items?(repo, keyspaces) do
-        # An upgrade must inspect every stored item once to derive an exact
-        # root. Doing that inside this transaction makes the new index appear
-        # atomically; current-format reads never use a capped fallback scan.
-        rebuild_priority_index(repo, keyspaces)
-        :indexed
-      else
-        :empty
-      end
+    index = keyspaces.priority_index
+
+    case migration_cursor(repo, index) do
+      {:building, cursor} ->
+        advance_priority_migration(repo, keyspaces, cursor)
+
+      nil ->
+        cond do
+          priority_index_initialized?(repo, index) ->
+            priority_index_status(repo, keyspaces)
+
+          priority_index_present?(repo, keyspaces) ->
+            # Indexes written by the first indexed release have a complete
+            # root but no lifecycle marker. Adopt them without rebuilding.
+            put_priority_index_initialized(repo, index)
+            :indexed
+
+          true ->
+            start_priority_migration(repo, keyspaces)
+        end
     end
   end
 
-  defp rebuild_priority_index(repo, keyspaces) do
-    repo.clear_range(keyspaces.priority_index)
-
-    keyspaces.items
-    |> item_keyspace_range(repo, [])
-    |> Stream.map(fn {_key, value} -> decode(value) end)
-    |> Stream.transform(nil, fn item, previous_priority ->
-      if item.priority == previous_priority do
-        {[], previous_priority}
-      else
-        {[item], item.priority}
-      end
-    end)
-    |> Enum.each(&merge_priority_index(repo, keyspaces, &1))
+  # Manager transactions call peek/4 followed by min_vesting_time/4. A
+  # migration marker means peek already consumed this transaction's one chunk,
+  # so minimum reads the progress sentinel rather than consuming another.
+  # A direct minimum query still starts and advances a migration when needed.
+  defp minimum_priority_index_status(repo, keyspaces, true) do
+    case migration_cursor(repo, keyspaces.priority_index) do
+      {:building, cursor} -> advance_priority_migration(repo, keyspaces, cursor)
+      nil -> ensure_priority_index(repo, keyspaces)
+    end
   end
 
-  defp refresh_priority_index_after_mutation(repo, keyspaces, priority, true),
-    do: refresh_priority_index(repo, keyspaces, priority)
+  defp minimum_priority_index_status(repo, keyspaces, false) do
+    case migration_cursor(repo, keyspaces.priority_index) do
+      {:building, _cursor} ->
+        :migrating
 
-  defp refresh_priority_index_after_mutation(repo, keyspaces, _priority, false),
-    do: rebuild_priority_index(repo, keyspaces)
+      nil ->
+        index = keyspaces.priority_index
+
+        cond do
+          priority_index_initialized?(repo, index) ->
+            priority_index_status(repo, keyspaces)
+
+          priority_index_present?(repo, keyspaces) ->
+            # This is the complete root written by the first indexed release;
+            # adopting it does not scan or advance a migration chunk.
+            put_priority_index_initialized(repo, index)
+            :indexed
+
+          true ->
+            # `advance_migration?: false` is used only after peek/4 by the
+            # manager. Do not let it start a migration outside that bounded
+            # peek step if a caller uses it independently.
+            :migrating
+        end
+    end
+  end
+
+  defp start_priority_migration(repo, keyspaces) do
+    index = keyspaces.priority_index
+    repo.clear_range(index)
+    put_migration_cursor(repo, index, nil)
+    advance_priority_migration(repo, keyspaces, nil)
+  end
+
+  defp advance_priority_migration(repo, keyspaces, cursor) do
+    {start_key, end_key} = migration_item_range(keyspaces.items, cursor)
+
+    rows =
+      {start_key, end_key}
+      |> repo.get_range(limit: @migration_chunk_size)
+      |> Enum.to_list()
+
+    Enum.each(rows, &merge_migrated_item(repo, keyspaces, &1))
+
+    case List.last(rows) do
+      nil ->
+        index = keyspaces.priority_index
+        repo.clear(index, @priority_index_migration_key)
+        put_priority_index_initialized(repo, index)
+        priority_index_status(repo, keyspaces)
+
+      {last_key, _value} ->
+        put_migration_cursor(repo, keyspaces.priority_index, last_key)
+        :migrating
+    end
+  end
+
+  defp migration_item_range(item_keyspace, nil) do
+    item_keyspace
+    |> Keyspace.prefix()
+    |> Bedrock.KeyRange.from_prefix()
+  end
+
+  defp migration_item_range(item_keyspace, cursor) do
+    {_start_key, end_key} =
+      item_keyspace
+      |> Keyspace.prefix()
+      |> Bedrock.KeyRange.from_prefix()
+
+    {Bedrock.Key.key_after(cursor), end_key}
+  end
+
+  defp merge_migrated_item(repo, keyspaces, {key, value}) do
+    if item_storage_key?(key, Keyspace.prefix(keyspaces.items)) do
+      merge_priority_index(repo, keyspaces, decode(value))
+    end
+  end
+
+  defp priority_index_status(repo, keyspaces) do
+    if priority_index_present?(repo, keyspaces), do: :indexed, else: :empty
+  end
+
+  defp priority_index_initialized?(repo, index), do: repo.get(index, @priority_index_initialized_key) == "ready"
+
+  defp put_priority_index_initialized(repo, index), do: repo.put(index, @priority_index_initialized_key, "ready")
+
+  defp migration_cursor(repo, index) do
+    case repo.get(index, @priority_index_migration_key) do
+      nil -> nil
+      value -> decode(value)
+    end
+  end
+
+  defp put_migration_cursor(repo, index, cursor),
+    do: repo.put(index, @priority_index_migration_key, encode({:building, cursor}))
+
+  defp refresh_priority_index_after_mutation(repo, keyspaces, priority) do
+    case ensure_priority_index(repo, keyspaces) do
+      :empty -> :ok
+      _status -> refresh_priority_index(repo, keyspaces, priority)
+    end
+  end
 
   defp refresh_priority_index(repo, keyspaces, priority) do
     minimum = priority_minimum(repo, keyspaces.items, priority)

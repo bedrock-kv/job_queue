@@ -19,6 +19,8 @@ defmodule Bedrock.JobQueue.Item do
 
   alias Bedrock.JobQueue.Payload
 
+  import Bitwise
+
   @type t :: %__MODULE__{
           id: binary(),
           custom_id?: boolean(),
@@ -49,6 +51,27 @@ defmodule Bedrock.JobQueue.Item do
 
   @default_priority 100
   @default_max_retries 3
+  @max_priority (1 <<< 64) - 1
+  @min_priority -@max_priority
+
+  @doc false
+  @spec min_priority() :: integer()
+  def min_priority, do: @min_priority
+
+  @doc false
+  @spec max_priority() :: integer()
+  def max_priority, do: @max_priority
+
+  @doc false
+  @spec validate_priority!(term()) :: integer()
+  def validate_priority!(priority)
+      when is_integer(priority) and priority >= @min_priority and priority <= @max_priority,
+      do: priority
+
+  def validate_priority!(priority) do
+    raise ArgumentError,
+          "priority must be an integer between #{@min_priority} and #{@max_priority}, got: #{inspect(priority)}"
+  end
 
   @doc """
   Creates a new job item with defaults.
@@ -66,18 +89,19 @@ defmodule Bedrock.JobQueue.Item do
 
   Jobs are processed in priority order where **lower values = higher priority**.
   For example, priority -1 is processed before priority 0, which is processed
-  before priority 100. Priorities use the integer range supported by the
-  tuple-key encoder.
+  before priority 100. Priorities are restricted to the tuple-key encoder's
+  range, `-18_446_744_073_709_551_615..18_446_744_073_709_551_615`.
   """
   @spec new(String.t(), String.t(), term(), keyword()) :: t()
   def new(queue_id, topic, payload, opts \\ []) do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
+    priority = opts |> Keyword.get(:priority, @default_priority) |> validate_priority!()
 
     %__MODULE__{
       id: Keyword.get(opts, :id, generate_id()),
       custom_id?: Keyword.has_key?(opts, :id),
       topic: topic,
-      priority: Keyword.get(opts, :priority, @default_priority),
+      priority: priority,
       vesting_time: Keyword.get(opts, :vesting_time, now),
       lease_id: nil,
       lease_expires_at: nil,

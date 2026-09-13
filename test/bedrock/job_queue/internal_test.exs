@@ -29,6 +29,8 @@ defmodule Bedrock.JobQueue.InternalTest do
 
     stub(MockRepo, :get_range, fn _range, _opts -> [] end)
     stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
+    stub(MockRepo, :clear_range, fn _keyspace -> :ok end)
+    stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
 
     :ok
   end
@@ -56,13 +58,17 @@ defmodule Bedrock.JobQueue.InternalTest do
       end)
 
       # 2. Store.enqueue calls repo.put for item (keyspace, key, value)
-      expect(MockRepo, :put, fn keyspace, item_key, _value ->
-        assert Keyspace.prefix(keyspace) =~ "items"
-        assert is_tuple(item_key)
-        {priority, vesting_time, id} = item_key
-        assert priority == 100
-        assert vesting_time == now
-        assert is_binary(id)
+      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {priority, vesting_time, id} = key
+          assert priority == 100
+          assert vesting_time == now
+          assert is_binary(id)
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert key in [{"migration"}, {"initialized"}]
+        end
+
         :ok
       end)
 
@@ -104,9 +110,15 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, fn _keyspace, item_key, _value ->
-        {_priority, vesting_time, _id} = item_key
-        assert vesting_time == expected_vesting
+      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {_priority, vesting_time, _id} = key
+          assert vesting_time == expected_vesting
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert key in [{"migration"}, {"initialized"}]
+        end
+
         :ok
       end)
 
@@ -133,9 +145,15 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, fn _keyspace, item_key, _value ->
-        {_priority, vesting_time, _id} = item_key
-        assert vesting_time == expected_vesting
+      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {_priority, vesting_time, _id} = key
+          assert vesting_time == expected_vesting
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert key in [{"migration"}, {"initialized"}]
+        end
+
         :ok
       end)
 
@@ -160,9 +178,15 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, fn _keyspace, item_key, _value ->
-        {priority, _vesting_time, _id} = item_key
-        assert priority == 0
+      expect(MockRepo, :put, 3, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {priority, _vesting_time, _id} = key
+          assert priority == 0
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert key in [{"migration"}, {"initialized"}]
+        end
+
         :ok
       end)
 
@@ -206,7 +230,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         callback.()
       end)
 
-      expect(MockRepo, :get, 133, fn %Keyspace{} = keyspace, key ->
+      expect(MockRepo, :get, 6, fn %Keyspace{} = keyspace, key ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do
@@ -227,13 +251,16 @@ defmodule Bedrock.JobQueue.InternalTest do
         end
       end)
 
-      expect(MockRepo, :put, fn %Keyspace{} = keyspace, "request-42", _value ->
-        assert Keyspace.prefix(keyspace) =~ "identities/"
-        :ok
-      end)
+      expect(MockRepo, :put, 4, fn %Keyspace{} = keyspace, key, _value ->
+        prefix = Keyspace.prefix(keyspace)
 
-      expect(MockRepo, :put, fn %Keyspace{} = keyspace, _item_key, _value ->
-        assert Keyspace.prefix(keyspace) =~ "items/"
+        cond do
+          prefix =~ "identities/" -> assert key == "request-42"
+          prefix =~ "items/" -> :ok
+          prefix =~ "priority_index/" -> assert key in [{"migration"}, {"initialized"}]
+          true -> flunk("Unexpected put: #{inspect({keyspace, key})}")
+        end
+
         :ok
       end)
 

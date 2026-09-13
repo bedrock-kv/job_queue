@@ -60,9 +60,9 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      # 2. Verify the lease and item, then check whether this queue has the
-      # scheduling index used by current-format queues.
-      expect(MockRepo, :get, 3, fn ks, key ->
+      # 2. Verify the lease and item, then advance an uninitialized index by
+      # one bounded migration chunk.
+      expect(MockRepo, :get, 6, fn ks, key ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases) ->
             assert key == ctx.item.id
@@ -73,7 +73,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             :erlang.term_to_binary(ctx.leased_item)
 
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
-            assert key == {"root"}
+            assert key in [{"migration"}, {"initialized"}, {"root"}]
             nil
 
           true ->
@@ -81,31 +81,39 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         end
       end)
 
-      # 4. clear old item key
-      expect(MockRepo, :clear, fn ks, key ->
-        assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items)
-        assert key == ctx.lease.item_key
+      # 4. clear the old item key and the completed migration marker.
+      expect(MockRepo, :clear, 2, fn ks, key ->
+        if Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) do
+          assert key == ctx.lease.item_key
+        else
+          assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index)
+          assert key == {"migration"}
+        end
+
         :ok
       end)
 
-      # 5. put updated item with new key
-      expect(MockRepo, :put, fn ks, {priority, vesting_time, id}, value ->
-        assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items)
-        assert priority == ctx.item.priority
-        assert id == ctx.item.id
-        assert vesting_time > ctx.lease.expires_at
-        decoded = :erlang.binary_to_term(value)
-        assert decoded.id == ctx.item.id
-        :ok
-      end)
+      # 5. Write the item, lease, and two lifecycle markers.
+      expect(MockRepo, :put, 4, fn ks, key, value ->
+        cond do
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
+            {priority, vesting_time, id} = key
+            assert priority == ctx.item.priority
+            assert id == ctx.item.id
+            assert vesting_time > ctx.lease.expires_at
+            assert :erlang.binary_to_term(value).id == ctx.item.id
 
-      # 6. put updated lease
-      expect(MockRepo, :put, fn ks, key, value ->
-        assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases)
-        assert key == ctx.item.id
-        decoded = :erlang.binary_to_term(value)
-        assert decoded.id == ctx.lease.id
-        assert decoded.expires_at > ctx.lease.expires_at
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases) ->
+            assert key == ctx.item.id
+            updated_lease = :erlang.binary_to_term(value)
+            assert updated_lease.id == ctx.lease.id
+            assert updated_lease.expires_at > ctx.lease.expires_at
+
+          true ->
+            assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index)
+            assert key in [{"migration"}, {"initialized"}]
+        end
+
         :ok
       end)
 
@@ -141,7 +149,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      expect(MockRepo, :get, 3, fn ks, _key ->
+      expect(MockRepo, :get, 6, fn ks, _key ->
         cond do
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
             nil
@@ -153,9 +161,8 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             :erlang.term_to_binary(ctx.lease)
         end
       end)
-      expect(MockRepo, :clear, fn _, _ -> :ok end)
-      expect(MockRepo, :put, fn _, _, _ -> :ok end)
-      expect(MockRepo, :put, fn _, _, _ -> :ok end)
+      expect(MockRepo, :clear, 2, fn _, _ -> :ok end)
+      expect(MockRepo, :put, 4, fn _, _, _ -> :ok end)
       expect(MockRepo, :max, fn _, _ -> :ok end)
       expect(MockRepo, :clear_range, fn _keyspace -> :ok end)
       expect(MockRepo, :get_range, fn _range, _opts -> [] end)

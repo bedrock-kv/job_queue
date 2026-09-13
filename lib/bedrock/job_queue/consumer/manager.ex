@@ -209,8 +209,16 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
 
   defp do_dequeue(state, queue_id, limit) do
     items = Store.peek(state.repo, state.root, queue_id, limit: limit)
+    migrating? = Store.migration_in_progress?(state.repo, state.root, queue_id)
     leases = obtain_item_leases(state, items)
     update_pointer_for_remaining(state, queue_id)
+
+    # A legacy queue advances one bounded index-migration chunk per store call.
+    # Requeueing the queue message makes progress without an unbounded loop in
+    # this callback; Store.peek/4 still dispatches nothing until the index is
+    # complete.
+    if migrating?, do: send(self(), {:queue_ready, queue_id})
+
     {:ok, {items, leases}}
   end
 
@@ -227,7 +235,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
 
   # Per QuiCK Algorithm 2 lines 6-9: After dequeuing, update pointer to min vesting_time
   defp update_pointer_for_remaining(state, queue_id) do
-    case Store.min_vesting_time(state.repo, state.root, queue_id) do
+    case Store.min_vesting_time(state.repo, state.root, queue_id, advance_migration?: false) do
       nil -> :ok
       min_vesting -> Store.update_queue_pointer(state.repo, state.root, queue_id, min_vesting)
     end

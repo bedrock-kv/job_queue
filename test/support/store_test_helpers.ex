@@ -93,7 +93,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     expected_key = Item.key(item)
 
     repo
-    |> expect(:get, 132, fn %Keyspace{} = ks, key ->
+    |> expect(:get, 5, fn %Keyspace{} = ks, key ->
       prefix = Keyspace.prefix(ks)
 
       cond do
@@ -108,19 +108,23 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
           flunk("Unexpected get keyspace: #{prefix}")
       end
     end)
-    |> expect(:put, fn %Keyspace{} = ks, key, value ->
+    |> expect(:put, 3, fn %Keyspace{} = ks, key, value ->
       prefix = Keyspace.prefix(ks)
 
-      assert String.contains?(prefix, "items/"), "Unexpected put keyspace: #{prefix}"
+      if String.contains?(prefix, "items/") do
+        assert key == expected_key,
+               "Expected item key #{inspect(expected_key)}, got: #{inspect(key)}"
 
-      assert key == expected_key,
-             "Expected item key #{inspect(expected_key)}, got: #{inspect(key)}"
+        # Verify value decodes to matching item
+        decoded = :erlang.binary_to_term(value)
+        assert decoded.id == item.id
+        assert decoded.topic == item.topic
+        assert decoded.queue_id == item.queue_id
+      else
+        assert String.contains?(prefix, "priority_index/"), "Unexpected put keyspace: #{prefix}"
+        assert key in [{"migration"}, {"initialized"}]
+      end
 
-      # Verify value decodes to matching item
-      decoded = :erlang.binary_to_term(value)
-      assert decoded.id == item.id
-      assert decoded.topic == item.topic
-      assert decoded.queue_id == item.queue_id
       :ok
     end)
     |> expect(:max, fn pointer_key, <<_timestamp::64-little>> ->
@@ -298,19 +302,23 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
   The `initial_items` parameter provides items that will be returned by peek/get_range.
   """
-  def setup_integration_stubs(repo, store_agent, initial_items \\ []) do
+  def setup_integration_stubs(repo, store_agent, initial_items \\ [], opts \\ []) do
+    observer = Keyword.get(opts, :observer)
+
     # Store initial items
     for {key, value} <- initial_items do
       Agent.update(store_agent, &Map.put(&1, key, value))
     end
 
     stub(repo, :put, fn %Keyspace{} = ks, key, value ->
+      observe(observer, {:put, ks, key})
       storage_key = {Keyspace.prefix(ks), key}
       Agent.update(store_agent, &Map.put(&1, storage_key, value))
       :ok
     end)
 
     stub(repo, :get, fn %Keyspace{} = ks, key ->
+      observe(observer, {:get, ks, key})
       storage_key = {Keyspace.prefix(ks), key}
       packed_key = Keyspace.pack(ks, key)
 
@@ -320,12 +328,14 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     end)
 
     stub(repo, :clear, fn %Keyspace{} = ks, key ->
+      observe(observer, {:clear, ks, key})
       storage_key = {Keyspace.prefix(ks), key}
       Agent.update(store_agent, &Map.delete(&1, storage_key))
       :ok
     end)
 
     stub(repo, :clear_range, fn range ->
+      observe(observer, {:clear_range, range})
       {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
 
       Agent.update(store_agent, fn state ->
@@ -344,13 +354,15 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
     # Support Keyspace-based get_range and tuple-based raw key range
     stub(repo, :get_range, fn
-      %Keyspace{} = ks, _opts ->
+      %Keyspace{} = ks, range_opts ->
+        observe(observer, {:get_range, ks, range_opts})
         prefix = Keyspace.prefix(ks)
         get_items_by_prefix(store_agent, prefix)
 
       # Support tuple-based raw key range {start_key, end_key}
       # Used by pointer cleanup and GC functions
       {start_key, end_key}, opts when is_binary(start_key) and is_binary(end_key) ->
+        observe(observer, {:get_range, {start_key, end_key}, opts})
         get_items_by_range(store_agent, start_key, end_key, opts)
     end)
 
@@ -378,6 +390,9 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
   defp maybe_take(entries, nil), do: entries
   defp maybe_take(entries, limit), do: Enum.take(entries, limit)
+
+  defp observe(nil, _event), do: :ok
+  defp observe(observer, event), do: send(observer, {:store_operation, event})
 
   defp key_in_range?({{prefix, key}, _v}, start_key, end_key) when is_binary(prefix) do
     full_key =

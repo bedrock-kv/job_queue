@@ -2,13 +2,14 @@
   "assignee": "Jason Allum",
   "blocked_by": [],
   "blocks": [],
+  "closed_at": "2026-09-13T03:50:53Z",
   "created": "2026-09-13T03:40:26Z",
   "description": "Upgrade the Bedrock dependency to its latest compatible release, resolve API changes, and execute every project Livebook successfully.",
   "id": "jq-dez",
   "labels": [],
   "priority": 1,
-  "status": "in_progress",
+  "status": "closed",
   "title": "Upgrade to latest Bedrock and validate Livebooks",
   "type": "task",
-  "updated_at": "2026-09-13T03:40:30Z"
+  "updated_at": "2026-09-13T03:50:53Z"
 }

@@ -885,6 +885,37 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert [first, second, third] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert [first.id, second.id, third.id] == [negative.id, ordinary.id, large.id]
     end
+
+    test "keeps same-vesting maximum-priority items after lower priorities in ID order" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "maximum-priority"
+      maximum_priority = (1 <<< 64) - 1
+      first = Item.new(queue_id, "first", %{}, id: <<0>>, priority: 0, vesting_time: now)
+
+      maximum_first =
+        Item.new(queue_id, "maximum-first", %{},
+          id: <<1>>,
+          priority: maximum_priority,
+          vesting_time: now
+        )
+
+      maximum_second =
+        Item.new(queue_id, "maximum-second", %{},
+          id: <<2>>,
+          priority: maximum_priority,
+          vesting_time: now
+        )
+
+      for item <- [maximum_second, first, maximum_first] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [low, max_first, max_second] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [low.id, max_first.id, max_second.id] == [first.id, maximum_first.id, maximum_second.id]
+    end
   end
 
   defp item_count(store, queue_id) do

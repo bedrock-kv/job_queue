@@ -360,7 +360,7 @@ defmodule Bedrock.JobQueue.Store do
         item_count = length(ready_items)
 
         if priority == @max_priority do
-          Enum.reverse(ready_items, items)
+          Enum.reverse(items, ready_items)
         else
           do_peek_ready_items(
             repo,

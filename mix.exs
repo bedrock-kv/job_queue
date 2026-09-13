@@ -54,7 +54,7 @@ defmodule BedrockJobQueue.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bedrock, github: "bedrock-kv/bedrock", branch: "develop"},
+      {:bedrock, "~> 0.7"},
       {:mox, "~> 1.0", only: :test},
       {:ex_doc, "~> 0.39", only: :dev, runtime: false, warn_if_outdated: true},
       {:styler, "~> 1.0", only: [:dev, :test], runtime: false},

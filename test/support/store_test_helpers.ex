@@ -48,6 +48,16 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
       nil
     end)
     |> expect(:get, fn %Keyspace{} = ks, key ->
+      assert String.contains?(Keyspace.prefix(ks), "priority_index/")
+      assert key == {"initialized"}
+      "ready"
+    end)
+    |> expect(:get, fn %Keyspace{} = ks, key ->
+      assert String.contains?(Keyspace.prefix(ks), "priority_index/")
+      assert key == {"root"}
+      nil
+    end)
+    |> expect(:get, fn %Keyspace{} = ks, key ->
       assert String.contains?(Keyspace.prefix(ks), "queue_leases/"),
              "Expected queue_leases keyspace, got: #{Keyspace.prefix(ks)}"
 

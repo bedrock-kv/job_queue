@@ -112,7 +112,9 @@ defmodule Bedrock.JobQueue.Store do
   untrusted v2 marker. It is deliberately held
   until an administrator calls `migrate_priority_index/4` after fencing all
   old writers. A marker written by new code cannot fence an older writer that
-  does not read it.
+  does not read it. Only `:ready` and `:empty` queues permit direct Store
+  mutations, leases, or pointer updates; every held status returns
+  `{:error, :priority_index_migration_required}` from those operations.
   """
   @spec priority_index_status(repo(), root_keyspace(), String.t()) :: priority_index_status()
   def priority_index_status(repo, root, queue_id) do
@@ -198,7 +200,7 @@ defmodule Bedrock.JobQueue.Store do
     ks = queue_lease_keyspace(root)
     clock = clock(opts)
 
-    with :ok <- require_not_migrating(repo, queue_keyspaces(root, queue_id)) do
+    with :ok <- require_queue_operation(repo, queue_keyspaces(root, queue_id)) do
       case repo.get(ks, queue_id) do
         nil ->
           # No existing lease - create new one
@@ -235,7 +237,7 @@ defmodule Bedrock.JobQueue.Store do
   def release_queue_lease(repo, root, %QueueLease{} = lease) do
     ks = queue_lease_keyspace(root)
 
-    with :ok <- require_not_migrating(repo, queue_keyspaces(root, lease.queue_id)) do
+    with :ok <- require_queue_operation(repo, queue_keyspaces(root, lease.queue_id)) do
       case repo.get(ks, lease.queue_id) do
         nil ->
           {:error, :lease_not_found}
@@ -275,7 +277,8 @@ defmodule Bedrock.JobQueue.Store do
   the explicit writer-fenced migration. A genuinely empty queue is initialized
   atomically by its first enqueue. Only use that automatic bootstrap for a
   queue ID that no pre-index writer can subsequently target; otherwise fence
-  old writers and migrate it explicitly before enqueuing.
+  old writers and migrate it explicitly before enqueuing. An unsupported or
+  malformed v2 migration marker is held too, even if the raw queue is empty.
 
   Within a transaction:
   1. Writes item to queue zone with key {priority, vesting_time, id}
@@ -553,7 +556,7 @@ defmodule Bedrock.JobQueue.Store do
     pointers = pointer_keyspace(root)
     clock = clock(opts)
 
-    with :ok <- require_priority_index(repo, keyspaces) do
+    with :ok <- require_queue_operation(repo, keyspaces) do
       # Read current item state
       item_key = Item.key(item)
 
@@ -641,7 +644,7 @@ defmodule Bedrock.JobQueue.Store do
     clock = clock(opts)
     keyspaces = queue_keyspaces(root, lease.queue_id)
 
-    with :ok <- require_priority_index(repo, keyspaces) do
+    with :ok <- require_queue_operation(repo, keyspaces) do
       if lease.expires_at <= clock.() do
         {:error, :lease_expired}
       else
@@ -728,7 +731,7 @@ defmodule Bedrock.JobQueue.Store do
     keyspaces = queue_keyspaces(root, lease.queue_id)
     clock = clock(opts)
 
-    with :ok <- require_priority_index(repo, keyspaces),
+    with :ok <- require_queue_operation(repo, keyspaces),
          {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
          {:ok, _now} <- active_now(stored_lease, clock) do
       item_key = stored_lease.item_key
@@ -776,7 +779,7 @@ defmodule Bedrock.JobQueue.Store do
     pointers = pointer_keyspace(root)
     clock = clock(opts)
 
-    with :ok <- require_priority_index(repo, keyspaces),
+    with :ok <- require_queue_operation(repo, keyspaces),
          {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
          item_key = stored_lease.item_key,
          {:ok, item} <- fetch_item(repo, keyspaces, item_key) do
@@ -914,7 +917,7 @@ defmodule Bedrock.JobQueue.Store do
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
 
-    with :ok <- require_not_migrating(repo, queue_keyspaces(root, queue_id)) do
+    with :ok <- require_queue_operation(repo, queue_keyspaces(root, queue_id)) do
       # If new vesting_time is in the future, clean up any stale pointers in the past
       # This prevents the scanner from repeatedly finding stale pointers that point
       # to queues where all visible items have been processed
@@ -1178,7 +1181,7 @@ defmodule Bedrock.JobQueue.Store do
     index = keyspaces.priority_index
 
     case migration_state do
-      {:offline_building, _cursor} ->
+      {:offline_building, cursor} when is_nil(cursor) or is_binary(cursor) ->
         :migrating
 
       nil ->
@@ -1209,7 +1212,8 @@ defmodule Bedrock.JobQueue.Store do
 
   defp initialize_empty_priority_index_state(repo, keyspaces, migration_state) do
     case priority_index_state(keyspaces, repo, migration_state) do
-      :writer_fence_required -> initialize_empty_v2_priority_index(repo, keyspaces)
+      :writer_fence_required when is_nil(migration_state) -> initialize_empty_v2_priority_index(repo, keyspaces)
+      :writer_fence_required -> {:error, :priority_index_migration_required}
       :migrating -> {:error, :priority_index_migration_required}
       _current -> {:ok, :current}
     end
@@ -1291,18 +1295,14 @@ defmodule Bedrock.JobQueue.Store do
   defp put_migration_state(repo, index, cursor),
     do: repo.put(index, @priority_index_migration_key, encode({:offline_building, cursor}))
 
-  defp require_priority_index(repo, keyspaces) do
+  # Direct Store mutations (other than enqueue's separately conflict-checked
+  # empty bootstrap) are allowed only once v2 is complete or known empty. This
+  # one gate protects leases and pointers from markerless legacy queues and
+  # unsupported v2 markers.
+  defp require_queue_operation(repo, keyspaces) do
     case priority_index_state(keyspaces, repo) do
-      :writer_fence_required -> {:error, :priority_index_migration_required}
-      :migrating -> {:error, :priority_index_migration_required}
-      _current -> :ok
-    end
-  end
-
-  defp require_not_migrating(repo, keyspaces) do
-    case migration_state(repo, keyspaces.priority_index) do
-      {:offline_building, _cursor} -> {:error, :priority_index_migration_required}
-      _not_current_migration -> :ok
+      status when status in [:ready, :empty] -> :ok
+      _fenced_status -> {:error, :priority_index_migration_required}
     end
   end
 

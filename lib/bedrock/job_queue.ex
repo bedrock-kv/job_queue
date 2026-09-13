@@ -181,9 +181,10 @@ defmodule Bedrock.JobQueue do
       runs one bounded transaction and processes at most one migration chunk.
       The migration writes a new versioned index and leaves legacy index values
       inert, so it is also safe to invoke inside a caller-owned transaction.
-      While it is `:migrating`, all normal queue operations are held and the
-      Manager will not dispatch jobs. Resume writers and consumers only after
-      the terminal result.
+      Until the v2 index is `:ready` or `:empty`, all normal queue operations
+      are held and the Manager will not dispatch jobs; this includes an
+      unsupported v2 marker. Resume writers and consumers only after the
+      terminal result.
       """
       @spec migrate_queue(String.t(), keyword()) ::
               :more

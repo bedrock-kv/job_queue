@@ -893,6 +893,81 @@ defmodule Bedrock.JobQueue.StoreTest do
       end)
     end
 
+    test "fences every direct operation for unknown v2 markers and nonempty markerless legacy queues" do
+      now = 10_000
+
+      for {queue_id, entries} <- [
+            {"unsupported-v2-marker",
+             fn keyspaces, _item ->
+               [
+                 {Keyspace.pack(keyspaces.priority_index, {"migration"}),
+                  :erlang.term_to_binary({:future_phase, "opaque"})}
+               ]
+             end},
+            {"malformed-active-v2-marker",
+             fn keyspaces, _item ->
+               [
+                 {Keyspace.pack(keyspaces.priority_index, {"migration"}),
+                  :erlang.term_to_binary({:offline_building, :not_a_key})}
+               ]
+             end},
+            {"markerless-v1-legacy",
+             fn keyspaces, item ->
+               [{Keyspace.pack(keyspaces.items, Item.key(item)), :erlang.term_to_binary(item)}]
+             end}
+          ] do
+        keyspaces = Store.queue_keyspaces(root(), queue_id)
+        item = Item.new(queue_id, "item", %{}, priority: 0, vesting_time: now)
+        lease = Lease.new(item, "worker", now: now)
+        queue_lease = QueueLease.new(queue_id, "worker", now: now)
+        {:ok, store} = TxVisibilityRepo.start_link(entries.(keyspaces, item))
+
+        TxVisibilityRepo.with_store(store, fn ->
+          assert :writer_fence_required =
+                   TxVisibilityRepo.transact(fn ->
+                     Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                   end)
+
+          assert {:error, :priority_index_migration_required} =
+                   TxVisibilityRepo.transact(fn ->
+                     if queue_id != "markerless-v1-legacy" do
+                       assert {:error, :writer_fence_required} =
+                                Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                     end
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.enqueue(TxVisibilityRepo, root(), item, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.obtain_queue_lease(TxVisibilityRepo, root(), queue_id, "worker", 1_000, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.release_queue_lease(TxVisibilityRepo, root(), queue_lease)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.obtain_lease(TxVisibilityRepo, root(), item, "worker", 1_000, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.extend_lease(TxVisibilityRepo, root(), lease, 1_000, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.complete(TxVisibilityRepo, root(), lease)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.requeue(TxVisibilityRepo, root(), lease, now: now)
+
+                     Store.update_queue_pointer(TxVisibilityRepo, root(), queue_id, now, now: now)
+                   end)
+
+          refute Enum.any?(TxVisibilityRepo.operations(store), fn
+                   {operation, _key} when operation in [:put, :clear, :max, :add] -> true
+                   {:clear_range, _, _} -> true
+                   _operation -> false
+                 end)
+        end)
+      end
+    end
+
     test "migrates an empty queue with one raw forward range" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store, [], observer: self())

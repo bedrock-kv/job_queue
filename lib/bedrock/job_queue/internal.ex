@@ -67,9 +67,10 @@ defmodule Bedrock.JobQueue.Internal do
   every call as an
   explicit acknowledgement of that operational precondition; it cannot be
   enforced against an older binary that does not read the new fence marker.
-  Keep the queue offline for every migration call. While it is `:migrating`,
-  all normal queue operations are held. Each call advances one bounded raw-item
-  chunk in a fresh v2 index; legacy index values are never cleared or read.
+  Keep the queue offline for every migration call. Until the v2 index becomes
+  `:ready` or `:empty`, all normal queue operations are held, including an
+  unsupported v2 marker. Each call advances one bounded raw-item chunk in a
+  fresh v2 index; legacy index values are never cleared or read.
   Call repeatedly until the result is `:ready` or `:empty`, then resume writers
   and consumers. It is safe to call through a caller-owned transaction because
   partial v2 state is marker-linked and cannot become a dispatch source.

@@ -66,7 +66,7 @@ defmodule Bedrock.JobQueue.Item do
 
   Jobs are processed in priority order where **lower values = higher priority**.
   For example, priority 0 is processed before priority 100. Use non-negative
-  integers only; negative priorities are not supported.
+  signed 64-bit integers only; negative priorities are not supported.
   """
   @spec new(String.t(), String.t(), term(), keyword()) :: t()
   def new(queue_id, topic, payload, opts \\ []) do

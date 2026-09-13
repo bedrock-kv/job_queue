@@ -10,6 +10,7 @@ defmodule Bedrock.JobQueue.Store do
       job_queue/
         queues/{queue_id}/
           items/                         # {priority, vesting_time, id} -> Item
+          priority_index/{level, node}   # -> earliest vesting time in priority range
           identities/{item_id}           # -> canonical custom-ID Item
           identity_metadata/state         # -> current | legacy
           leases/{item_id}               # -> Lease
@@ -27,6 +28,10 @@ defmodule Bedrock.JobQueue.Store do
   - Then by vesting_time (earlier = visible first)
   - Then by id for uniqueness
 
+  The per-queue priority index is a fixed-height min-tree over the signed
+  64-bit non-negative priority domain. It preserves priority-first dequeueing
+  while keeping visibility checks and minimum-time reads bounded.
+
   Pointer keys use `{vesting_time, queue_id}` for efficient scanning of
   queues with visible items.
   """
@@ -36,6 +41,13 @@ defmodule Bedrock.JobQueue.Store do
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
   alias Bedrock.Keyspace
+
+  import Bitwise
+
+  # Bedrock's tuple encoding supports signed 64-bit integers. Keeping the
+  # priority domain fixed makes every priority-tree walk bounded.
+  @priority_bits 63
+  @max_priority (1 <<< @priority_bits) - 1
 
   @type repo :: module()
   @type root_keyspace :: Keyspace.t()
@@ -51,6 +63,7 @@ defmodule Bedrock.JobQueue.Store do
           identities: Keyspace.t(),
           items: Keyspace.t(),
           leases: Keyspace.t(),
+          priority_index: Keyspace.t(),
           stats: Keyspace.t()
         }
   def queue_keyspaces(root, queue_id) do
@@ -62,6 +75,7 @@ defmodule Bedrock.JobQueue.Store do
       identities: Keyspace.partition(queue_ks, "identities/"),
       items: Keyspace.partition(queue_ks, "items/", key_encoding: TupleEncoding),
       leases: Keyspace.partition(queue_ks, "leases/"),
+      priority_index: Keyspace.partition(queue_ks, "priority_index/", key_encoding: TupleEncoding),
       stats: Keyspace.partition(queue_ks, "stats/")
     }
   end
@@ -284,8 +298,19 @@ defmodule Bedrock.JobQueue.Store do
   end
 
   defp write_new_item(repo, keyspaces, pointers, item, now) do
+    # Never build a partial index over an existing queue. Queues created before
+    # this index continue on the legacy path; a new empty queue can initialize
+    # the index from its first item.
+    indexed? =
+      not is_nil(priority_index_minimum(repo, keyspaces)) or
+        Enum.empty?(item_keyspace_range(keyspaces.items, repo, limit: 1))
+
     item_key = Item.key(item)
     repo.put(keyspaces.items, item_key, encode(item))
+
+    if indexed? do
+      refresh_priority_index(repo, keyspaces, item.priority)
+    end
 
     update_pointer(repo, pointers, item.vesting_time, item.queue_id, now)
     update_stats(repo, keyspaces, 1, 0)
@@ -303,23 +328,65 @@ defmodule Bedrock.JobQueue.Store do
   Options:
   - :limit - Maximum items to return (default: 10)
   - :now - Current time in ms (default: System.system_time(:millisecond))
-  - :max_scan - Maximum items to scan before giving up (default: limit * 10)
+  The priority index stores the earliest vesting time for each range of
+  priorities. It makes it possible to find the next ready priority with a
+  fixed number of point reads, rather than scanning future items before
+  filtering them for visibility.
   """
   @spec peek(repo(), root_keyspace(), String.t(), keyword()) :: [Item.t()]
   def peek(repo, root, queue_id, opts \\ []) do
     keyspaces = queue_keyspaces(root, queue_id)
     limit = Keyword.get(opts, :limit, 10)
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
-    max_scan = Keyword.get(opts, :max_scan, limit * 10)
 
-    # Scan items in priority order, collect visible ones
-    # Uses Stream to avoid loading all items into memory
-    # Stops early once we have enough visible items OR hit max_scan
+    case priority_index_minimum(repo, keyspaces) do
+      nil -> legacy_peek(repo, keyspaces, limit, now)
+      _minimum -> peek_ready_items(repo, keyspaces, limit, now)
+    end
+  end
+
+  # Queues written before the priority index existed keep their original item
+  # layout. Never mix a partial index with those rows: it would be worse than
+  # the legacy scan because indexed reads would silently omit old work.
+  defp legacy_peek(repo, keyspaces, limit, now) do
     keyspaces.items
-    |> item_keyspace_range(repo, limit: max_scan)
+    |> item_keyspace_range(repo, limit: limit * 10)
     |> Stream.map(fn {_key, value} -> decode(value) end)
     |> Stream.filter(&Item.visible?(&1, now))
     |> Enum.take(limit)
+  end
+
+  defp peek_ready_items(_repo, _keyspaces, 0, _now), do: []
+
+  defp peek_ready_items(repo, keyspaces, limit, now) do
+    do_peek_ready_items(repo, keyspaces, limit, now, 0, [])
+  end
+
+  defp do_peek_ready_items(_repo, _keyspaces, 0, _now, _minimum_priority, items),
+    do: Enum.reverse(items)
+
+  defp do_peek_ready_items(repo, keyspaces, remaining, now, minimum_priority, items) do
+    case next_ready_priority(repo, keyspaces, now, minimum_priority) do
+      nil ->
+        Enum.reverse(items)
+
+      priority ->
+        ready_items = priority_ready_items(repo, keyspaces, priority, remaining, now)
+        item_count = length(ready_items)
+
+        if priority == @max_priority do
+          Enum.reverse(ready_items, items)
+        else
+          do_peek_ready_items(
+            repo,
+            keyspaces,
+            remaining - item_count,
+            now,
+            priority + 1,
+            Enum.reverse(ready_items, items)
+          )
+        end
+    end
   end
 
   @doc """
@@ -426,6 +493,7 @@ defmodule Bedrock.JobQueue.Store do
     new_item_key = Item.key(updated_item)
     repo.put(keyspaces.items, new_item_key, encode(updated_item))
     repo.put(keyspaces.leases, lease.item_id, encode(lease))
+    refresh_priority_index_if_present(repo, keyspaces, current_item.priority)
 
     update_pointer(repo, pointers, lease_expires_at, current_item.queue_id, now)
 
@@ -518,6 +586,7 @@ defmodule Bedrock.JobQueue.Store do
           repo.clear(keyspaces.items, old_item_key)
           new_item_key = Item.key(updated_item)
           repo.put(keyspaces.items, new_item_key, encode(updated_item))
+          refresh_priority_index_if_present(repo, keyspaces, item.priority)
 
           # Update lease record
           updated_lease = %{stored_lease | expires_at: new_expires_at, item_key: new_item_key}
@@ -558,6 +627,7 @@ defmodule Bedrock.JobQueue.Store do
         item_key = stored_lease.item_key
         repo.clear(keyspaces.items, item_key)
         repo.clear(keyspaces.leases, lease.item_id)
+        refresh_priority_index_if_present(repo, keyspaces, stored_lease.item_key |> elem(0))
 
         update_stats(repo, keyspaces, 0, -1)
 
@@ -650,6 +720,7 @@ defmodule Bedrock.JobQueue.Store do
     repo.clear(keyspaces.items, item_key)
     new_item_key = Item.key(updated_item)
     repo.put(keyspaces.items, new_item_key, encode(updated_item))
+    refresh_priority_index_if_present(repo, keyspaces, item.priority)
 
     update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
     repo.clear(keyspaces.leases, lease.item_id)
@@ -698,26 +769,29 @@ defmodule Bedrock.JobQueue.Store do
   Per QuiCK Algorithm 2: After dequeuing, read the minimum vesting_time to
   determine when to next scan this queue. Returns nil if queue is empty.
 
-  Options:
-  - :limit - Maximum items to scan (default: 1000)
+  The priority index root stores this value exactly, so current-format queues
+  need one point read rather than a bounded approximation over priority-ordered
+  item rows. Queues written before the index retain the legacy fallback.
   """
   @spec min_vesting_time(repo(), root_keyspace(), String.t(), keyword()) ::
           non_neg_integer() | nil
   def min_vesting_time(repo, root, queue_id, opts \\ []) do
     keyspaces = queue_keyspaces(root, queue_id)
+
+    case priority_index_minimum(repo, keyspaces) do
+      nil -> legacy_min_vesting_time(repo, keyspaces, opts)
+      minimum -> minimum
+    end
+  end
+
+  defp legacy_min_vesting_time(repo, keyspaces, opts) do
     limit = Keyword.get(opts, :limit, 1000)
 
-    # Scan all items and find minimum vesting_time
-    # Items are sorted by {priority, vesting_time, id}, so we need to check all
     keyspaces.items
     |> item_keyspace_range(repo, limit: limit)
     |> Enum.reduce(nil, fn {_key, value}, acc ->
       item = decode(value)
-
-      case acc do
-        nil -> item.vesting_time
-        min -> min(min, item.vesting_time)
-      end
+      if is_nil(acc), do: item.vesting_time, else: min(acc, item.vesting_time)
     end)
   end
 
@@ -980,8 +1054,138 @@ defmodule Bedrock.JobQueue.Store do
 
     # Delete from main queue and update stats
     repo.clear(keyspaces.items, item_key)
+    refresh_priority_index_if_present(repo, keyspaces, item.priority)
     update_stats(repo, keyspaces, 0, -1)
   end
+
+  # Priority index
+
+  # The index is a fixed-height binary min-tree. Leaves represent individual
+  # priorities and contain that priority's earliest vesting time; each parent
+  # contains the minimum of its two children. A lookup therefore finds the
+  # lowest ready priority in 63 point reads, regardless of how many future
+  # items or distinct priorities the queue contains.
+
+  defp refresh_priority_index_if_present(repo, keyspaces, priority) do
+    if priority_index_minimum(repo, keyspaces) do
+      refresh_priority_index(repo, keyspaces, priority)
+    end
+  end
+
+  defp refresh_priority_index(repo, keyspaces, priority)
+       when is_integer(priority) and priority >= 0 and priority <= @max_priority do
+    minimum = priority_minimum(repo, keyspaces.items, priority)
+    index = keyspaces.priority_index
+    put_priority_node(repo, index, {@priority_bits, priority}, minimum)
+    refresh_priority_ancestors(repo, index, @priority_bits - 1, div(priority, 2))
+  end
+
+  defp refresh_priority_index(_repo, _keyspaces, priority) do
+    raise ArgumentError,
+          "priority must be an integer between 0 and #{@max_priority}, got: #{inspect(priority)}"
+  end
+
+  defp priority_minimum(repo, item_keyspace, priority) do
+    start_key = Keyspace.pack(item_keyspace, {priority, 0, <<>>})
+    end_key = Keyspace.pack(item_keyspace, {priority + 1, 0, <<>>})
+
+    {start_key, end_key}
+    |> repo.get_range(limit: 1)
+    |> Stream.map(fn {_key, value} -> decode(value) end)
+    |> Enum.at(0)
+    |> case do
+      nil -> nil
+      item -> item.vesting_time
+    end
+  end
+
+  defp refresh_priority_ancestors(repo, index, level, node) do
+    left = priority_node(repo, index, {level + 1, node * 2})
+    right = priority_node(repo, index, {level + 1, node * 2 + 1})
+    put_priority_node(repo, index, {level, node}, minimum(left, right))
+
+    if level > 0 do
+      refresh_priority_ancestors(repo, index, level - 1, div(node, 2))
+    end
+  end
+
+  defp priority_index_minimum(repo, keyspaces),
+    do: priority_node(repo, keyspaces.priority_index, {0, 0})
+
+  defp priority_node(repo, index, key) do
+    case repo.get(index, key) do
+      nil -> nil
+      value -> decode_timestamp(value)
+    end
+  end
+
+  defp put_priority_node(repo, index, key, nil), do: repo.clear(index, key)
+  defp put_priority_node(repo, index, key, time), do: repo.put(index, key, encode_timestamp(time))
+
+  defp next_ready_priority(repo, keyspaces, now, minimum_priority) do
+    find_ready_priority(
+      repo,
+      keyspaces.priority_index,
+      now,
+      minimum_priority,
+      0,
+      0,
+      0,
+      @max_priority
+    )
+  end
+
+  defp find_ready_priority(_repo, _index, _now, minimum_priority, _level, _node, _low, high)
+       when high < minimum_priority,
+       do: nil
+
+  defp find_ready_priority(repo, index, now, minimum_priority, level, node, low, high) do
+    case priority_node(repo, index, {level, node}) do
+      nil ->
+        nil
+
+      vesting_time when vesting_time > now ->
+        nil
+
+      _vesting_time when level == @priority_bits ->
+        low
+
+      _vesting_time ->
+        midpoint = low + div(high - low, 2)
+
+        case find_ready_priority(repo, index, now, minimum_priority, level + 1, node * 2, low, midpoint) do
+          nil ->
+            find_ready_priority(
+              repo,
+              index,
+              now,
+              minimum_priority,
+              level + 1,
+              node * 2 + 1,
+              midpoint + 1,
+              high
+            )
+
+          priority ->
+            priority
+        end
+    end
+  end
+
+  defp priority_ready_items(repo, keyspaces, priority, limit, now) do
+    start_key = Keyspace.pack(keyspaces.items, {priority, 0, <<>>})
+    end_key = Keyspace.pack(keyspaces.items, {priority + 1, 0, <<>>})
+
+    {start_key, end_key}
+    |> repo.get_range(limit: limit)
+    |> Stream.map(fn {_key, value} -> decode(value) end)
+    |> Stream.filter(&Item.visible?(&1, now))
+    |> Enum.to_list()
+  end
+
+  defp minimum(nil, value), do: value
+  defp minimum(value, nil), do: value
+  defp minimum(left, right), do: min(left, right)
 
   # Pointer key helpers (replacing PointerKey module)
 

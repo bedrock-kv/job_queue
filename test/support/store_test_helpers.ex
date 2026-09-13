@@ -93,16 +93,25 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     expected_key = Item.key(item)
 
     repo
-    |> expect(:get, fn %Keyspace{} = ks, key ->
-      assert String.contains?(Keyspace.prefix(ks), "identity_metadata/"),
-             "Expected identity metadata keyspace, got: #{Keyspace.prefix(ks)}"
+    |> expect(:get, 128, fn %Keyspace{} = ks, key ->
+      prefix = Keyspace.prefix(ks)
 
-      assert key == "state"
-      "current"
+      cond do
+        String.contains?(prefix, "identity_metadata/") ->
+          assert key == "state"
+          "current"
+
+        String.contains?(prefix, "priority_index/") ->
+          nil
+
+        true ->
+          flunk("Unexpected get keyspace: #{prefix}")
+      end
     end)
     |> expect(:put, fn %Keyspace{} = ks, key, value ->
-      assert String.contains?(Keyspace.prefix(ks), "items/"),
-             "Expected items keyspace, got: #{Keyspace.prefix(ks)}"
+      prefix = Keyspace.prefix(ks)
+
+      assert String.contains?(prefix, "items/"), "Unexpected put keyspace: #{prefix}"
 
       assert key == expected_key,
              "Expected item key #{inspect(expected_key)}, got: #{inspect(key)}"
@@ -331,8 +340,8 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
 
       # Support tuple-based raw key range {start_key, end_key}
       # Used by pointer cleanup and GC functions
-      {start_key, end_key}, _opts when is_binary(start_key) and is_binary(end_key) ->
-        get_items_by_range(store_agent, start_key, end_key)
+      {start_key, end_key}, opts when is_binary(start_key) and is_binary(end_key) ->
+        get_items_by_range(store_agent, start_key, end_key, opts)
     end)
 
     store_agent
@@ -347,17 +356,27 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     end)
   end
 
-  defp get_items_by_range(store_agent, start_key, end_key) do
+  defp get_items_by_range(store_agent, start_key, end_key, opts) do
     Agent.get(store_agent, fn state ->
       state
       |> Enum.filter(&key_in_range?(&1, start_key, end_key))
       |> Enum.map(&extract_key_value/1)
       |> Enum.sort()
+      |> maybe_take(Keyword.get(opts, :limit))
     end)
   end
 
-  defp key_in_range?({{prefix, _k}, _v}, start_key, end_key) when is_binary(prefix) do
-    prefix >= start_key and prefix < end_key
+  defp maybe_take(entries, nil), do: entries
+  defp maybe_take(entries, limit), do: Enum.take(entries, limit)
+
+  defp key_in_range?({{prefix, key}, _v}, start_key, end_key) when is_binary(prefix) do
+    full_key =
+      case key do
+        key when is_tuple(key) -> prefix <> TupleEncoding.pack(key)
+        key when is_binary(key) -> prefix <> key
+      end
+
+    full_key >= start_key and full_key < end_key
   end
 
   defp key_in_range?({key, _v}, start_key, end_key) when is_binary(key) do

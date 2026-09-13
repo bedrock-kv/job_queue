@@ -13,10 +13,22 @@ defmodule Bedrock.JobQueue.InternalTest do
   setup :verify_on_exit!
 
   setup do
-    stub(MockRepo, :get, fn %Keyspace{} = keyspace, "state" ->
-      assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
-      "current"
+    stub(MockRepo, :get, fn %Keyspace{} = keyspace, key ->
+      cond do
+        key == "state" ->
+          assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
+          "current"
+
+        String.contains?(Keyspace.prefix(keyspace), "priority_index/") ->
+          nil
+
+        true ->
+          flunk("Unexpected get: #{inspect({keyspace, key})}")
+      end
     end)
+
+    stub(MockRepo, :get_range, fn _range, _opts -> [] end)
+    stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
 
     :ok
   end
@@ -194,15 +206,25 @@ defmodule Bedrock.JobQueue.InternalTest do
         callback.()
       end)
 
-      expect(MockRepo, :get, fn %Keyspace{} = keyspace, "state" ->
-        assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
-        "current"
-      end)
+      expect(MockRepo, :get, 129, fn %Keyspace{} = keyspace, key ->
+        prefix = Keyspace.prefix(keyspace)
 
-      expect(MockRepo, :get, fn %Keyspace{} = keyspace, "request-42" ->
-        assert Keyspace.prefix(keyspace) =~ "identities/"
-        send(test_pid, :identity_point_read)
-        nil
+        cond do
+          key == "state" ->
+            assert prefix =~ "identity_metadata/"
+            "current"
+
+          key == "request-42" ->
+            assert prefix =~ "identities/"
+            send(test_pid, :identity_point_read)
+            nil
+
+          String.contains?(prefix, "priority_index/") ->
+            nil
+
+          true ->
+            flunk("Unexpected get: #{inspect({keyspace, key})}")
+        end
       end)
 
       expect(MockRepo, :put, fn %Keyspace{} = keyspace, "request-42", _value ->

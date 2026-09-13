@@ -60,18 +60,25 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      # 2. verify_lease: get lease from leases keyspace
-      expect(MockRepo, :get, fn ks, key ->
-        assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases)
-        assert key == ctx.item.id
-        :erlang.term_to_binary(ctx.lease)
-      end)
+      # 2. Verify the lease and item, then check whether this queue has the
+      # scheduling index used by current-format queues.
+      expect(MockRepo, :get, 3, fn ks, key ->
+        cond do
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.leases) ->
+            assert key == ctx.item.id
+            :erlang.term_to_binary(ctx.lease)
 
-      # 3. do_extend_lease: get item from items keyspace
-      expect(MockRepo, :get, fn ks, key ->
-        assert Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items)
-        assert key == ctx.lease.item_key
-        :erlang.term_to_binary(ctx.leased_item)
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
+            assert key == ctx.lease.item_key
+            :erlang.term_to_binary(ctx.leased_item)
+
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
+            assert key == {0, 0}
+            nil
+
+          true ->
+            flunk("Unexpected get: #{inspect({ks, key})}")
+        end
       end)
 
       # 4. clear old item key
@@ -127,8 +134,18 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         result
       end)
 
-      expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.lease) end)
-      expect(MockRepo, :get, fn _, _ -> :erlang.term_to_binary(ctx.leased_item) end)
+      expect(MockRepo, :get, 3, fn ks, _key ->
+        cond do
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
+            nil
+
+          Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.items) ->
+            :erlang.term_to_binary(ctx.leased_item)
+
+          true ->
+            :erlang.term_to_binary(ctx.lease)
+        end
+      end)
       expect(MockRepo, :clear, fn _, _ -> :ok end)
       expect(MockRepo, :put, fn _, _, _ -> :ok end)
       expect(MockRepo, :put, fn _, _, _ -> :ok end)

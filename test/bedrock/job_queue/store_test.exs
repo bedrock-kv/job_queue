@@ -16,6 +16,13 @@ defmodule Bedrock.JobQueue.StoreTest do
   # Stub transact to execute callbacks immediately
   setup do
     stub(MockRepo, :transact, fn callback -> callback.() end)
+    # The scheduling index adds internal point and range reads. Individual
+    # tests retain strict expectations for the queue operation under test while
+    # these defaults model an empty index where they do not care about it.
+    stub(MockRepo, :get, fn _keyspace, _key -> nil end)
+    stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
+    stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
+    stub(MockRepo, :get_range, fn _range, _opts -> [] end)
     :ok
   end
 
@@ -35,6 +42,7 @@ defmodule Bedrock.JobQueue.StoreTest do
                identities: identities,
                items: items,
                leases: leases,
+               priority_index: priority_index,
                stats: stats
              } = keyspaces
       assert dead_letter.key_encoding == nil
@@ -42,6 +50,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert identities.key_encoding == nil
       assert items.key_encoding == TupleEncoding
       assert leases.key_encoding == nil
+      assert priority_index.key_encoding == TupleEncoding
       assert stats.key_encoding == nil
 
       # Verify prefix contains expected path components
@@ -50,6 +59,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert String.contains?(Keyspace.prefix(identities), "identities/")
       assert String.contains?(Keyspace.prefix(items), "items/")
       assert String.contains?(Keyspace.prefix(leases), "leases/")
+      assert String.contains?(Keyspace.prefix(priority_index), "priority_index/")
       assert String.contains?(Keyspace.prefix(stats), "stats/")
       refute String.starts_with?(Keyspace.prefix(dead_letter), Keyspace.prefix(items))
     end
@@ -95,6 +105,50 @@ defmodule Bedrock.JobQueue.StoreTest do
   end
 
   describe "peek/4 priority ordering" do
+    test "finds ready lower-priority work beyond future higher-priority rows" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      queue_id = "many-future-items"
+      now = 10_000
+
+      for sequence <- 1..100 do
+        future =
+          Item.new(queue_id, "future", %{sequence: sequence},
+            id: <<sequence::128>>,
+            priority: 0,
+            vesting_time: 20_000
+          )
+
+        assert :ok = Store.enqueue(MockRepo, root(), future, now: now)
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), ready, now: now)
+
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: now)
+      assert ready_id == ready.id
+    end
+
+    test "keeps priority ordering among ready work from multiple priorities" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "mixed-priorities"
+
+      low = Item.new(queue_id, "low", %{}, priority: 200, vesting_time: now)
+      high = Item.new(queue_id, "high", %{}, priority: 10, vesting_time: now)
+      future = Item.new(queue_id, "future", %{}, priority: 0, vesting_time: now + 10_000)
+
+      for item <- [low, high, future] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [first, second] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: now)
+      assert [first.id, second.id] == [high.id, low.id]
+    end
+
     test "ignores non-item rows under the item scan prefix" do
       queue_id = "tenant_1"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
@@ -413,6 +467,26 @@ defmodule Bedrock.JobQueue.StoreTest do
       result = Store.enqueue(MockRepo, root(), item)
 
       assert :ok = result
+    end
+
+    test "does not create a partial priority index for an existing queue" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "legacy-queue"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      existing = Item.new(queue_id, "existing", %{}, priority: 0, vesting_time: now)
+      incoming = Item.new(queue_id, "incoming", %{}, priority: 100, vesting_time: now)
+
+      # Simulate a queue written before the scheduling index was introduced.
+      store_item(store, keyspaces.items, existing)
+
+      assert :ok = Store.enqueue(MockRepo, root(), incoming, now: now)
+      assert MockRepo.get(keyspaces.priority_index, {0, 0}) == nil
+
+      assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [first.id, second.id] == [existing.id, incoming.id]
     end
 
     test "uses a custom ID as a queue-scoped idempotency key before leasing" do
@@ -752,6 +826,48 @@ defmodule Bedrock.JobQueue.StoreTest do
       result = Store.gc_stale_pointers(MockRepo, root(), limit: 10)
 
       assert result == 0
+    end
+  end
+
+  describe "min_vesting_time/4" do
+    test "returns the true minimum beyond the former scan bound" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      queue_id = "many-scheduled-items"
+      now = 10_000
+
+      for sequence <- 1..1_000 do
+        future =
+          Item.new(queue_id, "future", %{sequence: sequence},
+            id: <<sequence::128>>,
+            priority: 0,
+            vesting_time: 20_000
+          )
+
+        assert :ok = Store.enqueue(MockRepo, root(), future, now: now)
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), ready, now: now)
+
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "tracks each queue independently after a lease moves its vesting time" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      first = Item.new("first", "job", %{}, priority: 10, vesting_time: now)
+      second = Item.new("second", "job", %{}, priority: 10, vesting_time: now + 500)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert :ok = Store.enqueue(MockRepo, root(), second, now: now)
+      assert {:ok, _lease} = Store.obtain_lease(MockRepo, root(), first, "worker", 1_000, now: now)
+
+      assert Store.min_vesting_time(MockRepo, root(), "first") == now + 1_000
+      assert Store.min_vesting_time(MockRepo, root(), "second") == now + 500
     end
   end
 

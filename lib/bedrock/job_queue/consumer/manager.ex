@@ -323,7 +323,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   defp handle_action_result(lease, {:error, reason}) do
     Logger.warning(
       "Failed to finalize job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}. " <>
-        "The lease remains active and the job will retry after it expires."
+        "The finalization was not applied; the job may retry once it is visible."
     )
   end
 end

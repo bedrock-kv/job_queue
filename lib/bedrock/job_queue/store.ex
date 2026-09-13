@@ -475,8 +475,9 @@ defmodule Bedrock.JobQueue.Store do
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
     keyspaces = queue_keyspaces(root, lease.queue_id)
 
-    with {:ok, stored_lease} <- verify_lease(repo, keyspaces, lease) do
-      if stored_lease.expires_at > now, do: :ok, else: {:error, :lease_expired}
+    case verify_active_lease(repo, keyspaces, lease, now) do
+      {:ok, _stored_lease} -> :ok
+      error -> error
     end
   end
 
@@ -511,16 +512,22 @@ defmodule Bedrock.JobQueue.Store do
   Completes a leased job, removing it from the queue.
 
   1. Validates lease exists and matches
-  2. Deletes item from queue using stored item_key (O(1) lookup)
-  3. Deletes lease record
-  4. Decrements processing_count
-  """
-  @spec complete(repo(), root_keyspace(), Lease.t()) ::
-          :ok | {:error, :lease_not_found | :lease_mismatch}
-  def complete(repo, root, %Lease{} = lease) do
-    keyspaces = queue_keyspaces(root, lease.queue_id)
+  2. Validates the stored lease has not expired
+  3. Deletes item from queue using stored item_key (O(1) lookup)
+  4. Deletes lease record
+  5. Decrements processing_count
 
-    case verify_lease(repo, keyspaces, lease) do
+  ## Options
+
+  - `:now` - Current time in ms (default: `System.system_time(:millisecond)`)
+  """
+  @spec complete(repo(), root_keyspace(), Lease.t(), keyword()) ::
+          :ok | {:error, :lease_not_found | :lease_mismatch | :lease_expired}
+  def complete(repo, root, %Lease{} = lease, opts \\ []) do
+    keyspaces = queue_keyspaces(root, lease.queue_id)
+    now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+
+    case verify_active_lease(repo, keyspaces, lease, now) do
       {:ok, stored_lease} ->
         item_key = stored_lease.item_key
         repo.clear(keyspaces.items, item_key)
@@ -554,24 +561,25 @@ defmodule Bedrock.JobQueue.Store do
 
   - `{:error, :lease_not_found}` - No lease record exists for this item
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
+  - `{:error, :lease_expired}` - Lease expiry has passed
   - `{:error, :item_not_found}` - Item no longer exists in queue
   """
   @spec requeue(repo(), root_keyspace(), Lease.t(), keyword()) ::
           {:ok, :requeued | :dead_lettered}
-          | {:error, :lease_not_found | :lease_mismatch | :item_not_found}
+          | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
   def requeue(repo, root, %Lease{} = lease, opts) do
     keyspaces = queue_keyspaces(root, lease.queue_id)
     pointers = pointer_keyspace(root)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
 
-    with {:ok, item_key} <- resolve_item_key(repo, keyspaces, lease),
+    with {:ok, item_key} <- resolve_item_key(repo, keyspaces, lease, now),
          {:ok, item} <- fetch_item(repo, keyspaces, item_key) do
       do_requeue(repo, keyspaces, pointers, lease, item, item_key, opts, now)
     end
   end
 
-  defp resolve_item_key(repo, keyspaces, %Lease{} = lease) do
-    case verify_lease(repo, keyspaces, lease) do
+  defp resolve_item_key(repo, keyspaces, %Lease{} = lease, now) do
+    case verify_active_lease(repo, keyspaces, lease, now) do
       {:ok, stored_lease} -> {:ok, stored_lease.item_key}
       error -> error
     end
@@ -834,6 +842,14 @@ defmodule Bedrock.JobQueue.Store do
       value ->
         stored = decode(value)
         if stored.id == lease.id, do: {:ok, stored}, else: {:error, :lease_mismatch}
+    end
+  end
+
+  # Finalization must observe the same active-ownership condition as execution:
+  # an ID match alone is insufficient once another consumer may claim the item.
+  defp verify_active_lease(repo, keyspaces, %Lease{} = lease, now) do
+    with {:ok, stored_lease} <- verify_lease(repo, keyspaces, lease) do
+      if stored_lease.expires_at > now, do: {:ok, stored_lease}, else: {:error, :lease_expired}
     end
   end
 

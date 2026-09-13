@@ -482,8 +482,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
   defp lease_transaction_values(action) do
     root = Keyspace.new("job_queue/test/")
-    item = Item.new("tenant_1", "test:success", %{}, id: "item-id", vesting_time: 1_000)
-    lease = Lease.new(item, @holder_id, now: 2_000)
+    now = System.system_time(:millisecond)
+    item = Item.new("tenant_1", "test:success", %{}, id: "item-id", vesting_time: now)
+    lease = Lease.new(item, @holder_id, now: now)
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
     values = %{

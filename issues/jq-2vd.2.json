@@ -1,0 +1,15 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-09-13T06:46:36Z",
+  "description": "Store.peek/4 (store.ex:187-200) limits the priority-ordered range to limit*10 BEFORE filtering by visibility. Reproduced: 100 priority-0 jobs scheduled at time 20000 plus one priority-100 job ready at time 10000 -\u003e peek(limit: 10, now: 10000) returns []. Store.min_vesting_time/4 (535-550) likewise scans only the first 1000 rows: with 1000 future high-priority jobs plus a ready lower-priority job it reports 20000 instead of 10000. Manager can then reschedule the queue pointer too late. Provide complete ready-item discovery and a correct minimum-time query without an unbounded transaction. Test mixed priorities, delayed work, active leases, and queues above both bounds.",
+  "id": "jq-2vd.2",
+  "labels": [],
+  "parent": "jq-2vd",
+  "priority": 1,
+  "status": "open",
+  "title": "Prevent future jobs from hiding ready jobs behind scan limits",
+  "type": "bug",
+  "updated_at": "2026-09-13T06:46:36Z"
+}

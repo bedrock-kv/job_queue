@@ -2,14 +2,14 @@
   "assignee": "Jason Allum",
   "blocked_by": [],
   "blocks": [],
-  "closed_at": "2026-09-13T06:40:05Z",
+  "closed_at": "2026-09-13T06:46:11Z",
   "created": "2026-09-13T06:36:41Z",
   "description": "",
   "id": "jq-q1m",
   "labels": [],
   "priority": 1,
-  "status": "in_progress",
+  "status": "closed",
   "title": "Release 0.4.0",
   "type": "task",
-  "updated_at": "2026-09-13T06:45:36Z"
+  "updated_at": "2026-09-13T06:46:11Z"
 }

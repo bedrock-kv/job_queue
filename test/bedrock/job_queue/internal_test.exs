@@ -206,7 +206,7 @@ defmodule Bedrock.JobQueue.InternalTest do
         callback.()
       end)
 
-      expect(MockRepo, :get, 129, fn %Keyspace{} = keyspace, key ->
+      expect(MockRepo, :get, 133, fn %Keyspace{} = keyspace, key ->
         prefix = Keyspace.prefix(keyspace)
 
         cond do

@@ -183,6 +183,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       end
     end
 
+    def handle_call({:get_range, _start_key, _end_key, _limit, _opts}, _from, state),
+      do: {:reply, {:ok, {[], false}}, state}
+
     def handle_call(:writes, _from, state), do: {:reply, state.writes, state}
 
     @impl true
@@ -192,6 +195,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
     def handle_cast({:atomic, operation, key, value}, state),
       do: {:noreply, add_write(state, {:atomic, operation, key, value})}
+
+    def handle_cast({:clear_range, start_key, end_key, opts}, state),
+      do: {:noreply, add_write(state, {:clear_range, start_key, end_key, opts})}
 
     def handle_cast(:rollback, state) do
       send(state.test_pid, :rollback)

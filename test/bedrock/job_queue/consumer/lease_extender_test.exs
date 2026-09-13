@@ -73,7 +73,7 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
             :erlang.term_to_binary(ctx.leased_item)
 
           Keyspace.prefix(ks) == Keyspace.prefix(ctx.keyspaces.priority_index) ->
-            assert key == {0, 0}
+            assert key == {"root"}
             nil
 
           true ->
@@ -116,6 +116,13 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
         :ok
       end)
 
+      expect(MockRepo, :clear_range, fn keyspace ->
+        assert Keyspace.prefix(keyspace) == Keyspace.prefix(ctx.keyspaces.priority_index)
+        :ok
+      end)
+
+      expect(MockRepo, :get_range, fn _range, _opts -> [] end)
+
       # Start with short interval
       pid = LeaseExtender.start(MockRepo, ctx.root, ctx.lease, 30_000, interval: 10)
 
@@ -150,6 +157,8 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtenderTest do
       expect(MockRepo, :put, fn _, _, _ -> :ok end)
       expect(MockRepo, :put, fn _, _, _ -> :ok end)
       expect(MockRepo, :max, fn _, _ -> :ok end)
+      expect(MockRepo, :clear_range, fn _keyspace -> :ok end)
+      expect(MockRepo, :get_range, fn _range, _opts -> [] end)
 
       log =
         capture_log(fn ->

@@ -23,7 +23,7 @@ defmodule Bedrock.JobQueue.Item do
           id: binary(),
           custom_id?: boolean(),
           topic: String.t(),
-          priority: non_neg_integer(),
+          priority: integer(),
           vesting_time: non_neg_integer(),
           lease_id: binary() | nil,
           lease_expires_at: non_neg_integer() | nil,
@@ -65,8 +65,9 @@ defmodule Bedrock.JobQueue.Item do
   ## Priority Ordering
 
   Jobs are processed in priority order where **lower values = higher priority**.
-  For example, priority 0 is processed before priority 100. Use non-negative
-  signed 64-bit integers only; negative priorities are not supported.
+  For example, priority -1 is processed before priority 0, which is processed
+  before priority 100. Priorities use the integer range supported by the
+  tuple-key encoder.
   """
   @spec new(String.t(), String.t(), term(), keyword()) :: t()
   def new(queue_id, topic, payload, opts \\ []) do
@@ -138,7 +139,7 @@ defmodule Bedrock.JobQueue.Item do
   Keys are `{priority, vesting_time, id}` which sorts items by priority first,
   then by vesting time, then by unique id.
   """
-  @spec key(t()) :: {non_neg_integer(), non_neg_integer(), binary()}
+  @spec key(t()) :: {integer(), non_neg_integer(), binary()}
   def key(%__MODULE__{priority: p, vesting_time: vt, id: id}), do: {p, vt, id}
 
   defp generate_id, do: :crypto.strong_rand_bytes(16)

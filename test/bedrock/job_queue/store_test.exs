@@ -2,6 +2,7 @@ defmodule Bedrock.JobQueue.StoreTest do
   use ExUnit.Case, async: true
 
   import Bedrock.JobQueue.Test.StoreHelpers
+  import Bitwise
   import Mox
 
   alias Bedrock.Encoding.Tuple, as: TupleEncoding
@@ -22,6 +23,7 @@ defmodule Bedrock.JobQueue.StoreTest do
     stub(MockRepo, :get, fn _keyspace, _key -> nil end)
     stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
     stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
+    stub(MockRepo, :clear_range, fn _range -> :ok end)
     stub(MockRepo, :get_range, fn _range, _opts -> [] end)
     :ok
   end
@@ -149,63 +151,57 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert [first.id, second.id] == [high.id, low.id]
     end
 
-    test "ignores non-item rows under the item scan prefix" do
+    test "keeps priority indexes isolated between queues" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      future = Item.new("queue-a", "future", %{}, priority: 0, vesting_time: now + 10_000)
+      ready_a = Item.new("queue-a", "ready", %{}, priority: 100, vesting_time: now)
+      ready_b = Item.new("queue-b", "ready", %{}, priority: 100, vesting_time: now)
+
+      for item <- [future, ready_a, ready_b] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [%Item{id: id_a}] = Store.peek(MockRepo, root(), "queue-a", now: now)
+      assert id_a == ready_a.id
+      assert [%Item{id: id_b}] = Store.peek(MockRepo, root(), "queue-b", now: now)
+      assert id_b == ready_b.id
+    end
+
+    test "ignores non-item rows while rebuilding an upgraded queue index" do
+      {:ok, store} = start_mock_store()
       queue_id = "tenant_1"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
-      item = Item.new(queue_id, "topic", %{}, priority: 100, vesting_time: 1000)
-      encoded_item = :erlang.term_to_binary(item)
+      item = Item.new(queue_id, "topic", %{}, priority: 100, vesting_time: 1_000)
       packed_item_key = Keyspace.pack(keyspaces.items, Item.key(item))
+
       legacy_dead_letter_key =
         Keyspace.prefix(keyspaces.items) <>
           TupleEncoding.pack("../dead_letter/") <> TupleEncoding.pack("1000/#{item.id}")
-      legacy_dead_letter_item = :erlang.term_to_binary(%{item | id: "dead-lettered"})
 
-      expect(MockRepo, :get_range, fn
-        %Keyspace{}, _opts ->
-          flunk("tuple-encoded item keyspaces must be scanned as raw ranges")
+      setup_integration_stubs(MockRepo, store, [
+        {legacy_dead_letter_key, :erlang.term_to_binary(%{item | id: "dead-lettered"})},
+        {packed_item_key, :erlang.term_to_binary(item)}
+      ])
 
-        {start_key, end_key}, _opts when is_binary(start_key) and is_binary(end_key) ->
-          assert packed_item_key >= start_key
-          assert packed_item_key < end_key
-
-          [
-            {legacy_dead_letter_key, legacy_dead_letter_item},
-            {packed_item_key, encoded_item}
-          ]
-      end)
-
-      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2000)
+      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
       assert item_id == item.id
     end
 
     test "returns items in priority order (lowest number first)" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
       # Create items with different priorities
       high_priority = Item.new("tenant_1", "topic", %{}, priority: 10, vesting_time: 1000)
       medium_priority = Item.new("tenant_1", "topic", %{}, priority: 50, vesting_time: 1000)
       low_priority = Item.new("tenant_1", "topic", %{}, priority: 200, vesting_time: 1000)
-      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
 
-      # Encode items
-      items = [
-        {
-          Keyspace.pack(keyspaces.items, Item.key(low_priority)),
-          :erlang.term_to_binary(low_priority)
-        },
-        {
-          Keyspace.pack(keyspaces.items, Item.key(high_priority)),
-          :erlang.term_to_binary(high_priority)
-        },
-        {
-          Keyspace.pack(keyspaces.items, Item.key(medium_priority)),
-          :erlang.term_to_binary(medium_priority)
-        }
-      ]
-
-      # Mock returns items in arbitrary order - peek should sort by key
-      expect(MockRepo, :get_range, fn {_start_key, _end_key}, _opts ->
-        # Return sorted by key (simulating DB behavior)
-        Enum.sort_by(items, fn {key, _} -> key end)
-      end)
+      for item <- [low_priority, high_priority, medium_priority] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: 1000)
+      end
 
       result = Store.peek(MockRepo, root(), "tenant_1", limit: 10, now: 2000)
 
@@ -215,27 +211,17 @@ defmodule Bedrock.JobQueue.StoreTest do
     end
 
     test "maintains priority order with same priority but different vesting_times" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
       # Same priority, different vesting times
       earlier =
         Item.new("tenant_1", "topic", %{data: "earlier"}, priority: 100, vesting_time: 1000)
 
       later = Item.new("tenant_1", "topic", %{data: "later"}, priority: 100, vesting_time: 2000)
-      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
-
-      items = [
-        {
-          Keyspace.pack(keyspaces.items, Item.key(later)),
-          :erlang.term_to_binary(later)
-        },
-        {
-          Keyspace.pack(keyspaces.items, Item.key(earlier)),
-          :erlang.term_to_binary(earlier)
-        }
-      ]
-
-      expect(MockRepo, :get_range, fn {_start_key, _end_key}, _opts ->
-        Enum.sort_by(items, fn {key, _} -> key end)
-      end)
+      for item <- [later, earlier] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: 1_000)
+      end
 
       result = Store.peek(MockRepo, root(), "tenant_1", limit: 10, now: 3000)
 
@@ -469,24 +455,34 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :ok = result
     end
 
-    test "does not create a partial priority index for an existing queue" do
+    test "rebuilds an upgraded queue's priority index before reading it" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
       now = 10_000
       queue_id = "legacy-queue"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
-      existing = Item.new(queue_id, "existing", %{}, priority: 0, vesting_time: now)
-      incoming = Item.new(queue_id, "incoming", %{}, priority: 100, vesting_time: now)
 
-      # Simulate a queue written before the scheduling index was introduced.
-      store_item(store, keyspaces.items, existing)
+      # Simulate an upgraded queue: all of these rows predate the scheduling
+      # index, so no index keys have been written yet.
+      for sequence <- 1..1_000 do
+        future =
+          Item.new(queue_id, "future", %{sequence: sequence},
+            id: <<sequence::128>>,
+            priority: 0,
+            vesting_time: 20_000
+          )
 
-      assert :ok = Store.enqueue(MockRepo, root(), incoming, now: now)
-      assert MockRepo.get(keyspaces.priority_index, {0, 0}) == nil
+        store_item(store, keyspaces.items, future)
+      end
 
-      assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert [first.id, second.id] == [existing.id, incoming.id]
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
+
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+      assert MockRepo.get(keyspaces.priority_index, {"root"}) != nil
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
     end
 
     test "uses a custom ID as a queue-scoped idempotency key before leasing" do
@@ -868,6 +864,26 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert Store.min_vesting_time(MockRepo, root(), "first") == now + 1_000
       assert Store.min_vesting_time(MockRepo, root(), "second") == now + 500
+    end
+  end
+
+  describe "priority domain" do
+    test "preserves negative and large priorities accepted by the item key encoding" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "signed-priorities"
+      negative = Item.new(queue_id, "negative", %{}, priority: -1, vesting_time: now)
+      ordinary = Item.new(queue_id, "ordinary", %{}, priority: 100, vesting_time: now)
+      large = Item.new(queue_id, "large", %{}, priority: 1 <<< 63, vesting_time: now)
+
+      for item <- [negative, ordinary, large] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [first, second, third] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [first.id, second.id, third.id] == [negative.id, ordinary.id, large.id]
     end
   end
 

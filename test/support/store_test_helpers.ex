@@ -93,7 +93,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     expected_key = Item.key(item)
 
     repo
-    |> expect(:get, 128, fn %Keyspace{} = ks, key ->
+    |> expect(:get, 132, fn %Keyspace{} = ks, key ->
       prefix = Keyspace.prefix(ks)
 
       cond do
@@ -322,6 +322,16 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
     stub(repo, :clear, fn %Keyspace{} = ks, key ->
       storage_key = {Keyspace.prefix(ks), key}
       Agent.update(store_agent, &Map.delete(&1, storage_key))
+      :ok
+    end)
+
+    stub(repo, :clear_range, fn range ->
+      {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
+
+      Agent.update(store_agent, fn state ->
+        Enum.reject(state, &key_in_range?(&1, start_key, end_key)) |> Map.new()
+      end)
+
       :ok
     end)
 

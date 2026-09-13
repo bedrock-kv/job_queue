@@ -172,16 +172,16 @@ defmodule Bedrock.JobQueue do
 
       Before the first call, stop every producer and consumer running a version
       that predates the priority index, and ensure none can resume for this
-      queue. Pass `writer_fence: :offline` to acknowledge that operational
+      queue. Pass `writer_fence: :offline` on every call to acknowledge that operational
       precondition. Older writers cannot observe a new fence key, so migration
       cannot safely begin as an automatic rolling upgrade.
 
-      The first call reserves a migration boundary and keeps the queue held;
-      the second captures the fixed legacy high-water key. Call repeatedly
-      until it returns `:ready` or `:empty`; each call runs one bounded
-      transaction and processes at most one migration chunk. Current writers
-      remain held until that frontier is captured, then index their jobs
-      directly without extending the fixed legacy scan.
+      Keep the queue offline for the whole migration, not just the first
+      call. Call repeatedly until it returns `:ready` or `:empty`; each call
+      runs one bounded transaction and processes at most one migration chunk.
+      While it is `:migrating`, all normal queue operations are held and the
+      Manager will not dispatch jobs. Resume writers and consumers only after
+      the terminal result.
       """
       def migrate_queue(queue_id, opts \\ []), do: Internal.migrate_queue(__MODULE__, queue_id, opts)
 

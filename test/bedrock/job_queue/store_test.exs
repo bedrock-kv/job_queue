@@ -15,7 +15,6 @@ defmodule Bedrock.JobQueue.StoreTest do
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
   alias Bedrock.JobQueue.Store
-  alias Bedrock.KeySelector
   alias Bedrock.Keyspace
 
   setup :verify_on_exit!
@@ -33,7 +32,6 @@ defmodule Bedrock.JobQueue.StoreTest do
     stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
     stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
     stub(MockRepo, :clear_range, fn _range -> :ok end)
-    stub(MockRepo, :select, fn _selector -> nil end)
     stub(MockRepo, :get_range, fn _range, _opts -> [] end)
     :ok
   end
@@ -522,7 +520,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert MockRepo.get(keyspaces.priority_index, {"initialized"}) == nil
     end
 
-    test "only an explicit fenced migration advances a legacy queue" do
+    test "only an explicit offline migration advances a static legacy queue" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
@@ -542,260 +540,135 @@ defmodule Bedrock.JobQueue.StoreTest do
         )
       end
 
-      # A pre-index writer can insert before any would-be cursor. Normal reads
-      # must keep holding the queue rather than claim an unsafe rolling upgrade.
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
-      old_writer = Item.new(queue_id, "old-writer", %{}, priority: -1, vesting_time: now)
-      store_item(store, keyspaces.items, old_writer)
+      ready = Item.new(queue_id, "ready", %{}, priority: 16, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
+
+      # Normal reads never turn legacy data into an implicit rolling migration.
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
 
       assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
-
-      # From this point the operational fence promises old writers are gone.
-      # New code may add an item before the stored raw cursor because it updates
-      # its own index leaf transactionally.
-      new_writer = Item.new(queue_id, "new-writer", %{}, priority: -2, vesting_time: now)
-      assert :ok = Store.enqueue(MockRepo, root(), new_writer, now: now)
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
 
-      assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert [first.id, second.id] == [new_writer.id, old_writer.id]
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
-    test "finishes the fixed legacy snapshot despite current writers at its tail" do
+    test "holds every normal queue operation until an offline migration completes" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
       now = 10_000
-      queue_id = "fixed-migration-frontier"
-      keyspaces = Store.queue_keyspaces(root(), queue_id)
-
-      # These are the complete pre-fence snapshot. The first bounded chunk
-      # consumes all eight rows, but only the following empty chunk proves it
-      # has reached the stored high-water frontier.
-      for priority <- 0..7 do
-        store_item(
-          store,
-          keyspaces.items,
-          Item.new(queue_id, "legacy", %{},
-            id: <<priority::128>>,
-            priority: priority,
-            vesting_time: now + 10_000
-          )
-        )
-      end
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-
-      # New-version work may arrive continuously after the migration begins.
-      # Its direct leaf maintenance makes it visible without extending the
-      # legacy cursor's fixed snapshot.
-      current_items =
-        for priority <- 100..107 do
-          item =
-            Item.new(queue_id, "current", %{},
-              priority: priority,
-              vesting_time: now
-            )
-
-          assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
-          item
-        end
-
-      # A live-tail scan would consume these eight current rows and return
-      # :more. A fixed frontier completes now, then exposes their exact index.
-      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
-
-      assert Enum.map(Store.peek(MockRepo, root(), queue_id, now: now), & &1.id) ==
-               Enum.map(current_items, & &1.id)
-
-      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
-    end
-
-    test "uses a present sentinel to capture an exact Olivine-compatible frontier" do
-      {:ok, store} = start_mock_store()
-      setup_integration_stubs(MockRepo, store)
-
-      now = 10_000
-      queue_id = "staged-migration-frontier"
+      queue_id = "static-offline-migration"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
 
       legacy_items =
-        for priority <- 0..1 do
-          item = Item.new(queue_id, "legacy", %{}, priority: priority, vesting_time: now + 10_000)
+        for priority <- 0..7 do
+          item =
+            Item.new(queue_id, "legacy", %{},
+              id: <<priority::128>>,
+              priority: priority,
+              vesting_time: now + 10_000
+            )
+
           store_item(store, keyspaces.items, item)
           item
         end
 
-      {_start_key, sentinel_key} = Bedrock.KeyRange.from_prefix(Keyspace.prefix(keyspaces.items))
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
 
-      # The first fenced call reserves a real boundary key but deliberately
-      # keeps this queue held. Current writers cannot slip between the fence
-      # and the selector read that captures the snapshot frontier.
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
-      refute Keyspace.contains?(keyspaces.items, sentinel_key)
-      assert MockRepo.get(Keyspace.new(""), sentinel_key)
-
-      assert :capturing_frontier =
-               keyspaces.priority_index
-               |> MockRepo.get({"migration"})
-               |> :erlang.binary_to_term()
-
-      current = Item.new(queue_id, "current", %{}, priority: 100, vesting_time: now)
-      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), current, now: now)
-
-      # With the sentinel now committed, the next bounded call captures the
-      # actual predecessor, removes the sentinel, and starts the first item
-      # chunk. The persisted high-water key is the last legacy item, not a
-      # current tail or a prefix-end approximation.
+      # The first administrative call is one bounded item chunk. From this
+      # point the declared offline fence holds both old and current writers.
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
-      assert MockRepo.get(Keyspace.new(""), sentinel_key) == nil
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
 
-      assert {:building, _cursor, frontier} =
-               keyspaces.priority_index
-               |> MockRepo.get({"migration"})
-               |> :erlang.binary_to_term()
+      current = Item.new(queue_id, "current", %{}, priority: 200, vesting_time: now)
+      lease = Lease.new(hd(legacy_items), "worker", now: now)
+      queue_lease = QueueLease.new(queue_id, "worker", now: now)
 
-      assert frontier == Keyspace.pack(keyspaces.items, Item.key(List.last(legacy_items)))
+      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), current, now: now)
 
-      # Current writers become available only after the frontier is durable.
-      assert :ok = Store.enqueue(MockRepo, root(), current, now: now)
-      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert [%Item{id: current_id} | _legacy] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert current_id == current.id
+      assert {:error, :priority_index_migration_required} =
+               Store.obtain_queue_lease(MockRepo, root(), queue_id, "worker", 1_000, now: now)
 
-      assert Enum.map(Store.peek(MockRepo, root(), queue_id, now: now + 10_000), & &1.id) ==
-               Enum.map(legacy_items ++ [current], & &1.id)
+      assert {:error, :priority_index_migration_required} = Store.release_queue_lease(MockRepo, root(), queue_lease)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.obtain_lease(MockRepo, root(), hd(legacy_items), "worker", 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} = Store.extend_lease(MockRepo, root(), lease, 1_000, now: now)
+      assert {:error, :priority_index_migration_required} = Store.complete(MockRepo, root(), lease)
+      assert {:error, :priority_index_migration_required} = Store.requeue(MockRepo, root(), lease, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.update_queue_pointer(MockRepo, root(), queue_id, now, now: now)
+
+      assert :ready = migrate_queue!(queue_id)
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
-    test "uses a present sentinel with the pinned Olivine selector implementation" do
-      first = "queue/items/a"
-      second = "queue/items/b"
-      sentinel = "queue/items0"
-
-      absent_sentinel = olivine_index_manager([first, second])
-
-      # This is the production behavior that the Store mock cannot stand in
-      # for: the convenient-looking selector fails when its range-end anchor
-      # does not exist.
-      assert {:error, :not_found} =
-               OlivineIndexManager.page_for_key(
-                 absent_sentinel,
-                 KeySelector.last_less_than(sentinel),
-                 Version.zero()
-               )
-
-      present_sentinel = olivine_index_manager([first, second, sentinel])
-
-      assert {:ok, ^second, _page} =
-               OlivineIndexManager.page_for_key(
-                 present_sentinel,
-                 KeySelector.last_less_or_equal(sentinel),
-                 Version.zero()
-               )
-
-      empty_item_range = olivine_index_manager([sentinel])
-
-      assert {:error, :not_found} =
-               OlivineIndexManager.page_for_key(
-                 empty_item_range,
-                 KeySelector.last_less_or_equal(sentinel),
-                 Version.zero()
-               )
-    end
-
-    test "repairs a missing capture sentinel without releasing the writer fence" do
-      {:ok, store} = start_mock_store()
-      setup_integration_stubs(MockRepo, store)
-
-      queue_id = "capture-sentinel-retry"
-      keyspaces = Store.queue_keyspaces(root(), queue_id)
-      legacy = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: 10_000)
-      store_item(store, keyspaces.items, legacy)
-      {_start_key, sentinel_key} = Bedrock.KeyRange.from_prefix(Keyspace.prefix(keyspaces.items))
-
-      # A committed capture marker always keeps the queue held. If its paired
-      # sentinel is missing (for example after external damage), retrying the
-      # operation recreates the pair instead of deriving a false frontier.
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      MockRepo.clear(Keyspace.new(""), sentinel_key)
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
-      assert MockRepo.get(Keyspace.new(""), sentinel_key)
-
-      assert :capturing_frontier =
-               keyspaces.priority_index
-               |> MockRepo.get({"migration"})
-               |> :erlang.binary_to_term()
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert [%Item{id: legacy_id}] = Store.peek(MockRepo, root(), queue_id, now: 10_000)
-      assert legacy_id == legacy.id
-    end
-
-    test "uses an empty frontier when no item row exists" do
+    test "migrates an empty queue with one raw forward range" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store, [], observer: self())
 
-      queue_id = "empty-migration-frontier"
+      queue_id = "empty-offline-migration"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
 
-      # A selector is global, so it can resolve to an unrelated key before the
-      # item prefix. That must not become this queue's frontier.
+      # An unrelated row cannot affect a raw range bounded by the item prefix.
       MockRepo.put(keyspaces.identities, "unrelated", "value")
 
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      current = Item.new(queue_id, "current", %{}, priority: 100, vesting_time: 10_000)
-      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), current, now: 10_000)
       assert :empty = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      current = Item.new(queue_id, "current", %{}, priority: 100, vesting_time: 10_000)
       assert :empty = Store.priority_index_status(MockRepo, root(), queue_id)
 
       operations = drain_store_operations()
-      assert [{:select, %KeySelector{}}] = Enum.filter(operations, &match?({:select, _}, &1))
-      refute Enum.any?(operations, &match?({:get_range, {_, _}, _}, &1))
+      refute Enum.any?(operations, &match?({:select, _}, &1))
+
+      assert [{:get_range, {_start_key, _end_key}, opts}] =
+               Enum.filter(operations, &match?({:get_range, {_, _}, _}, &1))
+
+      assert opts[:limit] == @migration_chunk_size
 
       assert :ok = Store.enqueue(MockRepo, root(), current, now: 10_000)
     end
 
-    test "holds a cursor-only migration marker until the administrator re-fences it" do
+    test "holds an old rolling-upgrade migration marker until the administrator re-fences it" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
       now = 10_000
-      queue_id = "cursor-only-migration-marker"
-      keyspaces = Store.queue_keyspaces(root(), queue_id)
-      item = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: now)
-      store_item(store, keyspaces.items, item)
 
-      # A prior cursor-only marker cannot establish the finite boundary needed
-      # by this migration format, so it never becomes a dispatch source.
-      MockRepo.put(keyspaces.priority_index, {"migration"}, :erlang.term_to_binary({:building, nil}))
+      for {queue_id, marker} <- [
+            {"cursor-only-migration-marker", {:building, nil}},
+            {"frontier-migration-marker", {:building, nil, "old-frontier"}}
+          ] do
+        keyspaces = Store.queue_keyspaces(root(), queue_id)
+        item = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: now)
+        store_item(store, keyspaces.items, item)
 
-      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
-      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+        # A prior rolling-upgrade marker cannot establish this migration's
+        # offline static-queue precondition, so it never becomes a dispatch source.
+        MockRepo.put(keyspaces.priority_index, {"migration"}, :erlang.term_to_binary(marker))
 
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert item_id == item.id
+        assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+        assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+        assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+
+        assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+        assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+        assert item_id == item.id
+      end
     end
 
     test "migrates an upgraded queue in fixed chunks before dispatching or reporting an exact minimum" do
@@ -823,25 +696,21 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, ready)
 
       # Reads hold this legacy queue until an administrator explicitly confirms
-      # the old writers are fenced. Until the final empty chunk proves coverage,
-      # the partial tree is never a dispatch source and the minimum is the
-      # immediate-rescan sentinel rather than a false exact value.
+      # the queue is offline. The partial tree is never a dispatch source and
+      # never reports a false exact minimum.
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert Store.min_vesting_time(MockRepo, root(), queue_id) == 0
       assert MockRepo.get(keyspaces.priority_index, {"migration"})
 
       total_rows = 1_001
       nonempty_chunks = div(total_rows + @migration_chunk_size - 1, @migration_chunk_size)
 
-      # The administrator advances one chunk per transaction. The manager does
-      # the same after this explicit transition; neither path has an unbounded
-      # scan or dispatches from a partial index.
-      for _ <- 1..(nonempty_chunks - 1) do
+      # The administrator advances one chunk per transaction; the final short
+      # raw range proves static coverage and completes immediately.
+      for _ <- 1..(nonempty_chunks - 2) do
         assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       end
 
@@ -876,27 +745,20 @@ defmodule Bedrock.JobQueue.StoreTest do
       # marker-less queue reports the precise fence-required error and does no
       # raw scan; the administrator starts the one-chunk transition.
       assert {:error, :priority_index_migration_required} =
-               Store.min_vesting_time(MockRepo, root(), queue_id, advance_migration?: false)
+               Store.min_vesting_time(MockRepo, root(), queue_id)
 
       assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
-      refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
       refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       operations = drain_store_operations()
 
-      assert [{:select, %KeySelector{key: selector_key, or_equal: true, offset: -1}}] =
-               Enum.filter(operations, &match?({:select, %KeySelector{}}, &1))
-
       assert [{:get_range, {_start_key, _end_key}, opts}] =
                Enum.filter(operations, &match?({:get_range, {_, _}, _}, &1))
 
-      assert selector_key == elem(Bedrock.KeyRange.from_prefix(Keyspace.prefix(keyspaces.items)), 1)
       assert opts[:limit] == @migration_chunk_size
+      refute Enum.any?(operations, &match?({:select, _}, &1))
 
       index_point_operations =
         Enum.count(operations, fn
@@ -910,9 +772,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert index_point_operations <=
                @migration_chunk_size * @migration_tree_point_operations_per_item + 8
 
-      # Manager reads the sentinel without advancing a second chunk after its
-      # peek, keeping the whole callback bounded by the one chunk above.
-      assert Store.min_vesting_time(MockRepo, root(), queue_id, advance_migration?: false) == 0
+      # Reads do not advance the cursor or expose partial state.
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
 
       refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
     end
@@ -924,17 +785,25 @@ defmodule Bedrock.JobQueue.StoreTest do
       now = 10_000
       queue_id = "retrying-migration"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
-      future = Item.new(queue_id, "future", %{}, priority: 0, vesting_time: now + 10_000)
-      ready = Item.new(queue_id, "ready", %{}, priority: 1, vesting_time: now)
-      Enum.each([future, ready], &store_item(store, keyspaces.items, &1))
 
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      items =
+        for priority <- 0..8 do
+          Item.new(queue_id, "item", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: if(priority == 8, do: now, else: now + 10_000)
+          )
+        end
+
+      ready = List.last(items)
+      Enum.each(items, &store_item(store, keyspaces.items, &1))
+
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
       # A real transaction retry rolls back both the tree writes and marker
       # update. Replaying this already-merged chunk is stricter: it proves the
       # merge itself is idempotent even if only the cursor is retried.
-      {:building, _cursor, frontier} =
+      {:offline_building, _cursor} =
         keyspaces.priority_index
         |> MockRepo.get({"migration"})
         |> :erlang.binary_to_term()
@@ -942,7 +811,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       MockRepo.put(
         keyspaces.priority_index,
         {"migration"},
-        :erlang.term_to_binary({:building, nil, frontier})
+        :erlang.term_to_binary({:offline_building, nil})
       )
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
@@ -952,51 +821,53 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
-    test "preserves mutations and enqueues on either side of a migration cursor" do
+    test "uses raw forward pages across the pinned Olivine page boundary" do
+      keys = for key <- 0..128, do: "queue/items/#{String.pad_leading(Integer.to_string(key), 3, "0")}"
+      first_key = "queue/items/000"
+      last_key = "queue/items/128"
+      manager = olivine_index_manager_pages([Enum.take(keys, 128), Enum.drop(keys, 128)])
+
+      assert {:ok, pages} =
+               OlivineIndexManager.pages_for_range(
+                 manager,
+                 first_key,
+                 Bedrock.Key.key_after(last_key),
+                 Version.zero()
+               )
+
+      assert Enum.map(pages, &OlivinePage.id/1) == [0, 1]
+    end
+
+    test "migrates a static cross-page legacy queue without selector frontier capture" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
       now = 10_000
-      queue_id = "legacy-mutations"
+      queue_id = "cross-page-static-migration"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
 
-      static_items =
-        for priority <- 0..15 do
-          Item.new(queue_id, "static", %{priority: priority},
+      for priority <- 0..128 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "future", %{priority: priority},
             id: <<priority::128>>,
             priority: priority,
             vesting_time: 20_000
           )
-        end
+        )
+      end
 
-      Enum.each(static_items, &store_item(store, keyspaces.items, &1))
+      ready = Item.new(queue_id, "ready", %{}, priority: 129, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
 
-      # The first call reserves the Olivine-compatible sentinel; the second
-      # captures the frontier and covers priorities 0..7.
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      for _ <- 1..16 do
+        assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      end
 
-      # This mutation is before the persisted cursor and must update the
-      # partial tree directly instead of waiting for a scan that will not
-      # revisit it.
-      assert {:ok, _lease} =
-               Store.obtain_lease(MockRepo, root(), hd(static_items), "worker", 1_000, now: now)
-
-      # This new item sorts before the cursor and therefore cannot be found by
-      # a later raw-range chunk. Its direct leaf refresh is what preserves it.
-      before_cursor = Item.new(queue_id, "before", %{}, priority: -1, vesting_time: now)
-      assert :ok = Store.enqueue(MockRepo, root(), before_cursor, now: now)
-
-      # This item is beyond the snapshot frontier. It is refreshed directly,
-      # and the fixed migration never chases it as a live tail.
-      behind_cursor = Item.new(queue_id, "behind", %{}, priority: 100, vesting_time: now)
-      assert :ok = Store.enqueue(MockRepo, root(), behind_cursor, now: now)
-
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
-
-      assert [first, second] = Store.peek(MockRepo, root(), queue_id, now: now)
-      assert [first.id, second.id] == [before_cursor.id, behind_cursor.id]
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
@@ -1522,9 +1393,17 @@ defmodule Bedrock.JobQueue.StoreTest do
     end
   end
 
-  defp olivine_index_manager(keys) do
-    page = OlivinePage.new(0, Enum.map(keys, &{&1, <<0::64>>}))
-    page_map = %{0 => {page, 0}}
+  defp olivine_index_manager_pages(key_pages) do
+    page_map =
+      key_pages
+      |> Enum.with_index()
+      |> Map.new(fn {keys, id} ->
+        page = OlivinePage.new(id, Enum.map(keys, &{&1, <<0::64>>}))
+        next_id = if id + 1 == length(key_pages), do: 0, else: id + 1
+        {id, {page, next_id}}
+      end)
+
+    keys = List.flatten(key_pages)
 
     index = %{
       OlivineIndex.new()

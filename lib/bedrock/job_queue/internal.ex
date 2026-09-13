@@ -60,13 +60,14 @@ defmodule Bedrock.JobQueue.Internal do
   Advances one bounded chunk of a writer-fenced scheduling-index migration.
 
   The caller must first stop all pre-index producers and consumers for the
-  queue and ensure they cannot resume. The `:writer_fence` option is an
+  queue and ensure they cannot resume. Pass the `:writer_fence` option on
+  every call as an
   explicit acknowledgement of that operational precondition; it cannot be
   enforced against an older binary that does not read the new fence marker.
-  The first call reserves a fixed migration boundary and the next captures its
-  legacy high-water frontier, so current writers cannot make the bounded
-  migration chase a live tail. Writers remain held until that capture finishes.
-  Call repeatedly until the result is `:ready` or `:empty`.
+  Keep the queue offline for every migration call. While it is `:migrating`,
+  all normal queue operations are held; only this administrative function may
+  advance one bounded raw-item chunk. Call repeatedly until the result is
+  `:ready` or `:empty`, then resume writers and consumers.
   """
   def migrate_queue(job_queue_module, queue_id, opts \\ []) do
     config = job_queue_module.__config__()

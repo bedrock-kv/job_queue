@@ -190,10 +190,9 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
 
   defp dequeue_with_lease(state, queue_id, limit) do
     case Store.priority_index_status(state.repo, state.root, queue_id) do
-      :writer_fence_required ->
-        # A marker cannot fence an older writer. Hold this queue until the
-        # explicit administrative migration starts; do not reschedule or touch
-        # its pointer in a tight loop.
+      status when status in [:writer_fence_required, :migrating] ->
+        # An offline migration is not a dispatch source. Only the explicit
+        # administrator call advances it; do not reschedule or touch pointers.
         {:ok, {[], []}}
 
       _current_or_migrating ->
@@ -220,15 +219,11 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
     items = Store.peek(state.repo, state.root, queue_id, limit: limit)
     index_status = Store.priority_index_status(state.repo, state.root, queue_id)
 
-    if index_status == :writer_fence_required do
+    if index_status in [:writer_fence_required, :migrating] do
       {:ok, {[], []}}
     else
       leases = obtain_item_leases(state, items)
       update_pointer_for_remaining(state, queue_id)
-
-      # A fenced legacy queue advances one bounded index-migration chunk per
-      # callback. Requeueing this one message yields before the next chunk.
-      if index_status == :migrating, do: send(self(), {:queue_ready, queue_id})
 
       {:ok, {items, leases}}
     end
@@ -247,7 +242,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
 
   # Per QuiCK Algorithm 2 lines 6-9: After dequeuing, update pointer to min vesting_time
   defp update_pointer_for_remaining(state, queue_id) do
-    case Store.min_vesting_time(state.repo, state.root, queue_id, advance_migration?: false) do
+    case Store.min_vesting_time(state.repo, state.root, queue_id) do
       {:error, :priority_index_migration_required} -> :ok
       nil -> :ok
       min_vesting -> Store.update_queue_pointer(state.repo, state.root, queue_id, min_vesting)

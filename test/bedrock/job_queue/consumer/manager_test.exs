@@ -295,13 +295,13 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
              end)
     end
 
-    test "completes a fixed migration frontier and dispatches current ready work without rescheduling", ctx do
+    test "holds an offline migration without self-rescheduling, then dispatches after admin completion", ctx do
       now = System.system_time(:millisecond)
-      queue_id = "fixed-migration-frontier"
+      queue_id = "offline-migration-hold"
       keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
 
-      # Seed exactly one legacy chunk. The explicit operator transition scans
-      # it before current-version writers resume.
+      # Seed exactly one full legacy chunk followed by a ready tail. The
+      # operator, not the Manager, owns both bounded migration calls.
       for priority <- 0..7 do
         store_item(
           ctx.store,
@@ -314,20 +314,15 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
         )
       end
 
-      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
-      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
-
-      current =
+      ready =
         Item.new(queue_id, "test:success", %{},
           priority: 100,
           vesting_time: now
         )
 
-      assert :ok = Store.enqueue(MockRepo, ctx.root, current, now: now)
+      store_item(ctx.store, keyspaces.items, ready)
+      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
 
-      # There is one manager dequeue transaction and one successful action
-      # transaction. A live-tail migration would queue another dequeue callback
-      # before dispatching this current item.
       transaction_calls = :counters.new(1, [])
 
       stub(MockRepo, :transact, fn callback ->
@@ -338,13 +333,22 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
       send(manager, {:queue_ready, queue_id})
 
-      assert_receive {:action_hook, MockRepo, _root, current_id, :complete, :ok, :ok}, 500
-      assert current_id == current.id
+      # A migrating queue consumes one notification and remains entirely under
+      # administrative control: no action, pointer write, or self-message.
+      refute_receive {:action_hook, _repo, _root, _item_id, _action, _handler, _result}, 100
       assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
-      assert :ready = Store.priority_index_status(MockRepo, ctx.root, queue_id)
-      assert :counters.get(transaction_calls, 1) == 2
+      assert :migrating = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+      assert :counters.get(transaction_calls, 1) == 1
       assert %{pending_queues: pending_queues} = :sys.get_state(manager)
       assert pending_queues == MapSet.new()
+
+      assert :ready = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
+      send(manager, {:queue_ready, queue_id})
+
+      assert_receive {:action_hook, MockRepo, _root, ready_id, :complete, :ok, :ok}, 500
+      assert ready_id == ready.id
+      assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+      assert :counters.get(transaction_calls, 1) == 3
     end
 
     test "handles task crash with :DOWN message", ctx do

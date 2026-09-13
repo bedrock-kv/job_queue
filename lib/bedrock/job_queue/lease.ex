@@ -50,7 +50,7 @@ defmodule Bedrock.JobQueue.Lease do
   def new(%Item{} = item, holder, opts) do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
     duration = Keyword.get(opts, :duration_ms, @default_lease_duration_ms)
-    expires_at = now + duration
+    expires_at = vesting_time_after!(now, duration)
 
     # Store the NEW item key (with updated vesting_time) for O(1) lookup on complete/requeue
     # After leasing, item's vesting_time becomes expires_at
@@ -78,6 +78,16 @@ defmodule Bedrock.JobQueue.Lease do
     :sha256
     |> :crypto.hash([item_id, to_string(holder), <<now::64>>])
     |> binary_part(0, 16)
+  end
+
+  defp vesting_time_after!(now, duration) do
+    case Item.add_vesting_time(now, duration) do
+      {:ok, expires_at} -> expires_at
+
+      {:error, :vesting_time_out_of_range} ->
+        raise ArgumentError,
+              "lease expiration must be an unsigned 64-bit millisecond timestamp, got now: #{inspect(now)}, duration_ms: #{inspect(duration)}"
+    end
   end
 
   @doc """

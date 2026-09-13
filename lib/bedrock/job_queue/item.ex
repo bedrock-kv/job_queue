@@ -17,13 +17,15 @@ defmodule Bedrock.JobQueue.Item do
   - `queue_id` - The queue/tenant this job belongs to
   """
 
+  import Bitwise
+
   alias Bedrock.JobQueue.Payload
 
   @type t :: %__MODULE__{
           id: binary(),
           custom_id?: boolean(),
           topic: String.t(),
-          priority: non_neg_integer(),
+          priority: integer(),
           vesting_time: non_neg_integer(),
           lease_id: binary() | nil,
           lease_expires_at: non_neg_integer() | nil,
@@ -49,6 +51,55 @@ defmodule Bedrock.JobQueue.Item do
 
   @default_priority 100
   @default_max_retries 3
+  @max_priority (1 <<< 64) - 1
+  @min_priority -@max_priority
+  @max_vesting_time (1 <<< 64) - 1
+
+  @doc false
+  @spec min_priority() :: integer()
+  def min_priority, do: @min_priority
+
+  @doc false
+  @spec max_vesting_time() :: non_neg_integer()
+  def max_vesting_time, do: @max_vesting_time
+
+  @doc false
+  @spec add_vesting_time(term(), term()) ::
+          {:ok, non_neg_integer()} | {:error, :vesting_time_out_of_range}
+  def add_vesting_time(time, delay)
+      when is_integer(time) and is_integer(delay) and time >= 0 and delay >= 0 do
+    if time <= @max_vesting_time and delay <= @max_vesting_time - time do
+      {:ok, time + delay}
+    else
+      {:error, :vesting_time_out_of_range}
+    end
+  end
+
+  def add_vesting_time(_time, _delay), do: {:error, :vesting_time_out_of_range}
+
+  @doc false
+  @spec max_priority() :: integer()
+  def max_priority, do: @max_priority
+
+  @doc false
+  @spec validate_priority!(term()) :: integer()
+  def validate_priority!(priority)
+      when is_integer(priority) and priority >= @min_priority and priority <= @max_priority, do: priority
+
+  def validate_priority!(priority) do
+    raise ArgumentError,
+          "priority must be an integer between #{@min_priority} and #{@max_priority}, got: #{inspect(priority)}"
+  end
+
+  @doc false
+  @spec validate_vesting_time!(term()) :: non_neg_integer()
+  def validate_vesting_time!(vesting_time)
+      when is_integer(vesting_time) and vesting_time >= 0 and vesting_time <= @max_vesting_time, do: vesting_time
+
+  def validate_vesting_time!(vesting_time) do
+    raise ArgumentError,
+          "vesting_time must be an integer between 0 and #{@max_vesting_time}, got: #{inspect(vesting_time)}"
+  end
 
   @doc """
   Creates a new job item with defaults.
@@ -58,26 +109,30 @@ defmodule Bedrock.JobQueue.Item do
   - `:id` - Custom job ID (default: random 16-byte binary). A supplied ID is
     retained as enqueue intent so direct `Store.enqueue/4` calls are idempotent.
   - `:priority` - Integer priority, lower = higher priority (default: 100)
-  - `:vesting_time` - When the job becomes visible in ms since epoch (default: now)
+  - `:vesting_time` - When the job becomes visible in ms since epoch (default: now).
+    Values must fit the queue's unsigned 64-bit timestamp domain.
   - `:max_retries` - Maximum retry attempts before dead-lettering (default: 3)
   - `:now` - Current time in ms, used for vesting_time default (default: System.system_time(:millisecond))
 
   ## Priority Ordering
 
   Jobs are processed in priority order where **lower values = higher priority**.
-  For example, priority 0 is processed before priority 100. Use non-negative
-  integers only; negative priorities are not supported.
+  For example, priority -1 is processed before priority 0, which is processed
+  before priority 100. Priorities are restricted to the tuple-key encoder's
+  range, `-18_446_744_073_709_551_615..18_446_744_073_709_551_615`.
   """
   @spec new(String.t(), String.t(), term(), keyword()) :: t()
   def new(queue_id, topic, payload, opts \\ []) do
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
+    priority = opts |> Keyword.get(:priority, @default_priority) |> validate_priority!()
+    vesting_time = opts |> Keyword.get(:vesting_time, now) |> validate_vesting_time!()
 
     %__MODULE__{
       id: Keyword.get(opts, :id, generate_id()),
       custom_id?: Keyword.has_key?(opts, :id),
       topic: topic,
-      priority: Keyword.get(opts, :priority, @default_priority),
-      vesting_time: Keyword.get(opts, :vesting_time, now),
+      priority: priority,
+      vesting_time: vesting_time,
       lease_id: nil,
       lease_expires_at: nil,
       error_count: 0,
@@ -100,8 +155,7 @@ defmodule Bedrock.JobQueue.Item do
 
   def visible?(%__MODULE__{vesting_time: vt, lease_id: nil}, now), do: now >= vt
 
-  def visible?(%__MODULE__{vesting_time: vt, lease_expires_at: exp}, now)
-      when not is_nil(exp) do
+  def visible?(%__MODULE__{vesting_time: vt, lease_expires_at: exp}, now) when not is_nil(exp) do
     now >= vt and now >= exp
   end
 
@@ -138,7 +192,7 @@ defmodule Bedrock.JobQueue.Item do
   Keys are `{priority, vesting_time, id}` which sorts items by priority first,
   then by vesting time, then by unique id.
   """
-  @spec key(t()) :: {non_neg_integer(), non_neg_integer(), binary()}
+  @spec key(t()) :: {integer(), non_neg_integer(), binary()}
   def key(%__MODULE__{priority: p, vesting_time: vt, id: id}), do: {p, vt, id}
 
   defp generate_id, do: :crypto.strong_rand_bytes(16)

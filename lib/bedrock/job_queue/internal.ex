@@ -16,6 +16,9 @@ defmodule Bedrock.JobQueue.Internal do
   alias Bedrock.Keyspace
   alias Bedrock.ToKeyspace
 
+  @type migration_result ::
+          :more | :ready | :empty | {:error, :writer_fence_required}
+
   @doc """
   Enqueues a job for processing.
 
@@ -29,6 +32,11 @@ defmodule Bedrock.JobQueue.Internal do
     enqueue wins; subsequent calls return that original job, including after completion.
     For queues created before custom-ID tracking, retries migrate an active
     item; an unknown ID returns `{:error, :legacy_custom_id_unknown}`.
+
+  Job vesting times use the unsigned 64-bit millisecond domain
+  `0..18_446_744_073_709_551_615`. An `:in` delay (or an `:at` time) outside
+  that domain returns `{:error, :vesting_time_out_of_range}` before starting a
+  transaction.
 
   ## Examples
 
@@ -48,26 +56,60 @@ defmodule Bedrock.JobQueue.Internal do
     config = job_queue_module.__config__()
     root = root_keyspace(job_queue_module)
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
-    opts = process_scheduling_opts(opts, now)
-    item = Item.new(queue_id, topic, payload, opts)
+
+    with {:ok, opts} <- process_scheduling_opts(opts, now) do
+      item = Item.new(queue_id, topic, payload, opts)
+
+      config.repo.transact(fn ->
+        Store.enqueue_with_item(config.repo, root, item, now: now)
+      end)
+    end
+  end
+
+  @doc """
+  Advances one bounded chunk of a writer-fenced scheduling-index migration.
+
+  The caller must first stop all pre-index producers and consumers for the
+  queue and ensure they cannot resume. Pass the `:writer_fence` option on
+  every call as an
+  explicit acknowledgement of that operational precondition; it cannot be
+  enforced against an older binary that does not read the new fence marker.
+  Keep the queue offline for every migration call. Until the v2 index becomes
+  `:ready` or `:empty`, all normal queue operations are held, including an
+  unsupported v2 marker. Each call advances one bounded raw-item chunk in a
+  fresh v2 index; legacy index values are never cleared or read.
+  Call repeatedly until the result is `:ready` or `:empty`, then resume writers
+  and consumers. It is safe to call through a caller-owned transaction because
+  partial v2 state is marker-linked and cannot become a dispatch source.
+  """
+  @spec migrate_queue(module(), String.t(), keyword()) :: migration_result()
+  def migrate_queue(job_queue_module, queue_id, opts \\ []) do
+    config = job_queue_module.__config__()
+    root = root_keyspace(job_queue_module)
 
     config.repo.transact(fn ->
-      Store.enqueue_with_item(config.repo, root, item, now: now)
+      Store.migrate_priority_index(config.repo, root, queue_id, opts)
     end)
   end
 
   defp process_scheduling_opts(opts, now) do
-    cond do
-      scheduled_at = Keyword.get(opts, :at) ->
-        vesting_time = DateTime.to_unix(scheduled_at, :millisecond)
-        opts |> Keyword.delete(:at) |> Keyword.put(:vesting_time, vesting_time)
+    with {:ok, _} <- Item.add_vesting_time(now, 0) do
+      cond do
+        scheduled_at = Keyword.get(opts, :at) ->
+          vesting_time = DateTime.to_unix(scheduled_at, :millisecond)
 
-      delay_ms = Keyword.get(opts, :in) ->
-        vesting_time = now + delay_ms
-        opts |> Keyword.delete(:in) |> Keyword.put(:vesting_time, vesting_time)
+          with {:ok, _} <- Item.add_vesting_time(vesting_time, 0) do
+            {:ok, opts |> Keyword.delete(:at) |> Keyword.put(:vesting_time, vesting_time)}
+          end
 
-      true ->
-        opts
+        delay_ms = Keyword.get(opts, :in) ->
+          with {:ok, vesting_time} <- Item.add_vesting_time(now, delay_ms) do
+            {:ok, opts |> Keyword.delete(:in) |> Keyword.put(:vesting_time, vesting_time)}
+          end
+
+        true ->
+          {:ok, opts}
+      end
     end
   end
 

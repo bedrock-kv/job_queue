@@ -1,9 +1,11 @@
 defmodule Bedrock.JobQueue.InternalTest do
   use ExUnit.Case, async: false
 
-  import Mox
+  import Bitwise
   import Bedrock.JobQueue.Test.StoreHelpers
+  import Mox
 
+  alias Bedrock.Internal.Repo.TransactionContext
   alias Bedrock.JobQueue.Internal
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Store
@@ -13,19 +15,32 @@ defmodule Bedrock.JobQueue.InternalTest do
   setup :verify_on_exit!
 
   setup do
-    stub(MockRepo, :get, fn %Keyspace{} = keyspace, "state" ->
-      assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
-      "current"
+    stub(MockRepo, :get, fn %Keyspace{} = keyspace, key ->
+      cond do
+        key == "state" ->
+          assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
+          "current"
+
+        String.contains?(Keyspace.prefix(keyspace), "priority_index/") ->
+          nil
+
+        true ->
+          flunk("Unexpected get: #{inspect({keyspace, key})}")
+      end
     end)
+
+    stub(MockRepo, :get_range, fn _range, _opts -> [] end)
+    stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
+    stub(MockRepo, :clear_range, fn _keyspace -> :ok end)
+    stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
 
     :ok
   end
 
   # Test module that simulates a JobQueue module
   defmodule TestJobQueue do
-    def __config__ do
-      %{repo: MockRepo}
-    end
+    @moduledoc false
+    use Bedrock.JobQueue, otp_app: :bedrock_job_queue, repo: MockRepo
   end
 
   describe "enqueue/5" do
@@ -44,13 +59,17 @@ defmodule Bedrock.JobQueue.InternalTest do
       end)
 
       # 2. Store.enqueue calls repo.put for item (keyspace, key, value)
-      expect(MockRepo, :put, fn keyspace, item_key, _value ->
-        assert Keyspace.prefix(keyspace) =~ "items"
-        assert is_tuple(item_key)
-        {priority, vesting_time, id} = item_key
-        assert priority == 100
-        assert vesting_time == now
-        assert is_binary(id)
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {priority, vesting_time, id} = key
+          assert priority == 100
+          assert vesting_time == now
+          assert is_binary(id)
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert_priority_index_bootstrap_key(key)
+        end
+
         :ok
       end)
 
@@ -92,9 +111,15 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, fn _keyspace, item_key, _value ->
-        {_priority, vesting_time, _id} = item_key
-        assert vesting_time == expected_vesting
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {_priority, vesting_time, _id} = key
+          assert vesting_time == expected_vesting
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert_priority_index_bootstrap_key(key)
+        end
+
         :ok
       end)
 
@@ -121,9 +146,15 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, fn _keyspace, item_key, _value ->
-        {_priority, vesting_time, _id} = item_key
-        assert vesting_time == expected_vesting
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {_priority, vesting_time, _id} = key
+          assert vesting_time == expected_vesting
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert_priority_index_bootstrap_key(key)
+        end
+
         :ok
       end)
 
@@ -134,6 +165,13 @@ defmodule Bedrock.JobQueue.InternalTest do
 
       assert {:ok, %Item{}} = result
       assert_receive {:transact_result, {:ok, %Item{vesting_time: ^expected_vesting}}}
+    end
+
+    test "rejects an :in delay that exceeds the timestamp domain before starting a transaction" do
+      maximum = (1 <<< 64) - 1
+
+      assert {:error, :vesting_time_out_of_range} =
+               Internal.enqueue(TestJobQueue, "tenant_1", "test:topic", %{}, in: 1, now: maximum)
     end
 
     test "enqueues item with custom priority" do
@@ -148,9 +186,15 @@ defmodule Bedrock.JobQueue.InternalTest do
         result
       end)
 
-      expect(MockRepo, :put, fn _keyspace, item_key, _value ->
-        {priority, _vesting_time, _id} = item_key
-        assert priority == 0
+      expect(MockRepo, :put, 134, fn keyspace, key, _value ->
+        if Keyspace.prefix(keyspace) =~ "items" do
+          {priority, _vesting_time, _id} = key
+          assert priority == 0
+        else
+          assert Keyspace.prefix(keyspace) =~ "priority_index/"
+          assert_priority_index_bootstrap_key(key)
+        end
+
         :ok
       end)
 
@@ -194,24 +238,37 @@ defmodule Bedrock.JobQueue.InternalTest do
         callback.()
       end)
 
-      expect(MockRepo, :get, fn %Keyspace{} = keyspace, "state" ->
-        assert Keyspace.prefix(keyspace) =~ "identity_metadata/"
-        "current"
+      expect(MockRepo, :get, 4, fn %Keyspace{} = keyspace, key ->
+        prefix = Keyspace.prefix(keyspace)
+
+        cond do
+          key == "state" ->
+            assert prefix =~ "identity_metadata/"
+            "current"
+
+          key == "request-42" ->
+            assert prefix =~ "identities/"
+            send(test_pid, :identity_point_read)
+            nil
+
+          String.contains?(prefix, "priority_index/") ->
+            nil
+
+          true ->
+            flunk("Unexpected get: #{inspect({keyspace, key})}")
+        end
       end)
 
-      expect(MockRepo, :get, fn %Keyspace{} = keyspace, "request-42" ->
-        assert Keyspace.prefix(keyspace) =~ "identities/"
-        send(test_pid, :identity_point_read)
-        nil
-      end)
+      expect(MockRepo, :put, 135, fn %Keyspace{} = keyspace, key, _value ->
+        prefix = Keyspace.prefix(keyspace)
 
-      expect(MockRepo, :put, fn %Keyspace{} = keyspace, "request-42", _value ->
-        assert Keyspace.prefix(keyspace) =~ "identities/"
-        :ok
-      end)
+        cond do
+          prefix =~ "identities/" -> assert key == "request-42"
+          prefix =~ "items/" -> :ok
+          prefix =~ "priority_index/" -> assert_priority_index_bootstrap_key(key)
+          true -> flunk("Unexpected put: #{inspect({keyspace, key})}")
+        end
 
-      expect(MockRepo, :put, fn %Keyspace{} = keyspace, _item_key, _value ->
-        assert Keyspace.prefix(keyspace) =~ "items/"
         :ok
       end)
 
@@ -228,6 +285,57 @@ defmodule Bedrock.JobQueue.InternalTest do
       assert_received :identity_point_read
     end
   end
+
+  describe "migrate_queue/2" do
+    test "runs an empty offline migration in one bounded transaction" do
+      :persistent_term.erase({Internal, TestJobQueue})
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      expect(MockRepo, :transact, fn callback -> callback.() end)
+
+      assert :empty = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
+    end
+
+    test "requires the writer-fence acknowledgement before beginning" do
+      :persistent_term.erase({Internal, TestJobQueue})
+
+      expect(MockRepo, :transact, fn callback -> callback.() end)
+
+      assert {:error, :writer_fence_required} = TestJobQueue.migrate_queue("tenant_1")
+    end
+
+    test "does not reject an active transaction context" do
+      :persistent_term.erase({Internal, TestJobQueue})
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+      TransactionContext.put_builder(MockRepo, self())
+
+      on_exit(fn -> TransactionContext.clear(MockRepo) end)
+
+      expect(MockRepo, :transact, fn callback -> callback.() end)
+
+      assert :empty = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
+    end
+  end
+
+  defp assert_priority_index_bootstrap_key(key) do
+    assert priority_index_bootstrap_key?(key)
+  end
+
+  defp priority_index_bootstrap_key?({"initialized"}), do: true
+  defp priority_index_bootstrap_key?({"root"}), do: true
+
+  defp priority_index_bootstrap_key?({sign, level, node}) when sign in [0, 1] and level in 0..64 and is_integer(node),
+    do: true
+
+  defp priority_index_bootstrap_key?({"member", sign, priority_leaf, vesting_time, item_id})
+       when sign in [0, 1] and is_integer(priority_leaf) and is_integer(vesting_time) and is_binary(item_id), do: true
+
+  defp priority_index_bootstrap_key?({"vesting", sign, priority_leaf, level, node})
+       when sign in [0, 1] and is_integer(priority_leaf) and level in 0..64 and is_integer(node), do: true
+
+  defp priority_index_bootstrap_key?(_key), do: false
 
   describe "stats/3" do
     test "returns queue statistics on success" do
@@ -295,7 +403,7 @@ defmodule Bedrock.JobQueue.InternalTest do
 
       # Verify keyspace was cached
       cached = :persistent_term.get({Internal, TestJobQueue}, nil)
-      assert cached != nil
+      assert cached
       assert Keyspace.prefix(cached) == expected_prefix
 
       # Clean up
@@ -332,6 +440,7 @@ defmodule Bedrock.JobQueue.InternalTest do
 
     test "fallback handles nested module names" do
       defmodule Deeply.Nested.Module do
+        @moduledoc false
         def __config__, do: %{repo: MockRepo}
       end
 

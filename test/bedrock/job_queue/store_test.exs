@@ -2,8 +2,14 @@ defmodule Bedrock.JobQueue.StoreTest do
   use ExUnit.Case, async: true
 
   import Bedrock.JobQueue.Test.StoreHelpers
+  import Bitwise
   import Mox
 
+  alias Bedrock.DataPlane.Materializer.Olivine.Index, as: OlivineIndex
+  alias Bedrock.DataPlane.Materializer.Olivine.Index.Page, as: OlivinePage
+  alias Bedrock.DataPlane.Materializer.Olivine.Index.Tree, as: OlivineTree
+  alias Bedrock.DataPlane.Materializer.Olivine.IndexManager, as: OlivineIndexManager
+  alias Bedrock.DataPlane.Version
   alias Bedrock.Encoding.Tuple, as: TupleEncoding
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Lease
@@ -11,11 +17,214 @@ defmodule Bedrock.JobQueue.StoreTest do
   alias Bedrock.JobQueue.Store
   alias Bedrock.Keyspace
 
+  # Exercises Store against Bedrock's actual transaction accumulator. A range
+  # clear is intentionally not visible to later point reads in that
+  # accumulator, matching the pinned runtime behavior under review.
+  defmodule TxVisibilityRepo do
+    alias Bedrock.Internal.TransactionBuilder.Tx
+
+    @store_key {__MODULE__, :store}
+    @transaction_key {__MODULE__, :transaction}
+
+    def start_link(entries), do: Agent.start_link(fn -> %{data: Map.new(entries), operations: []} end)
+
+    def with_store(store, fun) do
+      Process.put(@store_key, store)
+
+      try do
+        fun.()
+      after
+        Process.delete(@store_key)
+      end
+    end
+
+    def transact(callback) do
+      Process.put(@transaction_key, Tx.new())
+
+      try do
+        result = callback.()
+        commit()
+        result
+      after
+        Process.delete(@transaction_key)
+      end
+    end
+
+    def abort(callback) do
+      Process.put(@transaction_key, Tx.new())
+
+      try do
+        callback.()
+      after
+        Process.delete(@transaction_key)
+      end
+    end
+
+    def get(%Keyspace{} = keyspace, key), do: get(Keyspace.pack(keyspace, key))
+
+    def get(key) when is_binary(key) do
+      record({:get, key})
+      {transaction, result, _store} = Tx.get(transaction!(), key, &fetch/2, store())
+      put_transaction(transaction)
+
+      case result do
+        {:ok, value} -> value
+        {:error, :not_found} -> nil
+      end
+    end
+
+    def put(%Keyspace{} = keyspace, key, value), do: put(Keyspace.pack(keyspace, key), value)
+
+    def put(key, value) when is_binary(key) and is_binary(value) do
+      record({:put, key})
+      transaction!() |> Tx.set(key, value) |> put_transaction()
+      :ok
+    end
+
+    def clear(%Keyspace{} = keyspace, key), do: clear(Keyspace.pack(keyspace, key))
+
+    def clear(key) when is_binary(key) do
+      record({:clear, key})
+      transaction!() |> Tx.clear(key) |> put_transaction()
+      :ok
+    end
+
+    def clear_range(range) do
+      {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
+      record({:clear_range, start_key, end_key})
+      transaction!() |> Tx.clear_range(start_key, end_key) |> put_transaction()
+      :ok
+    end
+
+    def max(key, value) when is_binary(key) and is_binary(value) do
+      record({:max, key, value})
+      :ok
+    end
+
+    def add(key, value) when is_binary(key) and is_binary(value) do
+      record({:add, key, value})
+      :ok
+    end
+
+    def get_range(range, opts \\ []) do
+      {start_key, end_key} = Bedrock.ToKeyRange.to_key_range(range)
+      record({:get_range, start_key, end_key, opts})
+
+      storage_entries =
+        Agent.get(store(), fn %{data: data} ->
+          data
+          |> Enum.filter(fn {key, _value} -> key >= start_key and key < end_key end)
+          |> Enum.sort()
+        end)
+
+      {storage_page, has_more} = storage_page(storage_entries, Keyword.get(opts, :limit))
+      merge_storage_page(transaction!(), storage_entries, storage_page, has_more, start_key, end_key)
+    end
+
+    def operations(store), do: Agent.get(store, &Enum.reverse(&1.operations))
+    def entries(store), do: Agent.get(store, & &1.data)
+    def clear_operations(store), do: Agent.update(store, &%{&1 | operations: []})
+
+    defp fetch(key, store) do
+      case Agent.get(store, &Map.get(&1.data, key)) do
+        nil -> {{:error, :not_found}, store}
+        value -> {{:ok, value}, store}
+      end
+    end
+
+    defp commit do
+      transaction = transaction!()
+
+      Agent.update(store(), fn %{data: data} = state ->
+        data =
+          transaction.mutations
+          |> Enum.reverse()
+          |> Enum.reduce(data, &apply_mutation/2)
+
+        %{state | data: data}
+      end)
+    end
+
+    defp apply_mutation({:set, key, value}, data), do: Map.put(data, key, value)
+    defp apply_mutation({:clear, key}, data), do: Map.delete(data, key)
+
+    defp apply_mutation({:clear_range, start_key, end_key}, data) do
+      data
+      |> Enum.reject(fn {key, _value} -> key >= start_key and key < end_key end)
+      |> Map.new()
+    end
+
+    # This mirrors the pinned transaction builder's range merge rule closely
+    # enough to exercise Store against the important edge: a storage page can
+    # become empty after local clears while `has_more` remains true. In that
+    # case the real stream stops rather than reaching the next storage page.
+    defp storage_page(entries, nil), do: {entries, false}
+
+    defp storage_page(entries, limit) do
+      {Enum.take(entries, limit), length(entries) > limit}
+    end
+
+    defp merge_storage_page(transaction, storage_entries, storage_page, has_more, start_key, end_key) do
+      merge_end =
+        if has_more do
+          storage_page
+          |> List.last()
+          |> elem(0)
+          |> Bedrock.Key.key_after()
+        else
+          end_key
+        end
+
+      storage_entries
+      |> Enum.filter(fn {key, _value} -> key < merge_end end)
+      |> Enum.map(fn {key, stored_value} -> {key, Tx.repeatable_read(transaction, key) || stored_value} end)
+      |> merge_pending_writes(transaction, start_key, merge_end)
+      |> Enum.reject(fn {_key, value} -> value == :clear end)
+      |> Enum.sort()
+    end
+
+    defp merge_pending_writes(entries, transaction, start_key, end_key) do
+      transaction.writes
+      |> :gb_trees.to_list()
+      |> Enum.reduce(Map.new(entries), fn {key, value}, merged ->
+        if key >= start_key and key < end_key do
+          Map.put(merged, key, value)
+        else
+          merged
+        end
+      end)
+      |> Map.to_list()
+    end
+
+    defp record(operation), do: Agent.update(store(), &%{&1 | operations: [operation | &1.operations]})
+
+    defp store do
+      Process.get(@store_key) || raise "TxVisibilityRepo has no store"
+    end
+
+    defp transaction! do
+      Process.get(@transaction_key) || raise "TxVisibilityRepo has no transaction"
+    end
+
+    defp put_transaction(transaction), do: Process.put(@transaction_key, transaction)
+  end
+
   setup :verify_on_exit!
+
+  @migration_chunk_size 8
+  @migration_tree_point_operations_per_item 400
 
   # Stub transact to execute callbacks immediately
   setup do
     stub(MockRepo, :transact, fn callback -> callback.() end)
+    # The scheduling index adds internal point and range reads. Individual
+    # tests retain strict expectations for the queue operation under test while
+    # these defaults model an empty index where they do not care about it.
+    stub(MockRepo, :get, fn _keyspace, _key -> nil end)
+    stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
+    stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
+    stub(MockRepo, :clear_range, fn _range -> :ok end)
+    stub(MockRepo, :get_range, fn _range, _opts -> [] end)
     :ok
   end
 
@@ -35,13 +244,18 @@ defmodule Bedrock.JobQueue.StoreTest do
                identities: identities,
                items: items,
                leases: leases,
+               legacy_priority_index: legacy_priority_index,
+               priority_index: priority_index,
                stats: stats
              } = keyspaces
+
       assert dead_letter.key_encoding == nil
       assert identity_metadata.key_encoding == nil
       assert identities.key_encoding == nil
       assert items.key_encoding == TupleEncoding
       assert leases.key_encoding == nil
+      assert legacy_priority_index.key_encoding == TupleEncoding
+      assert priority_index.key_encoding == TupleEncoding
       assert stats.key_encoding == nil
 
       # Verify prefix contains expected path components
@@ -50,6 +264,9 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert String.contains?(Keyspace.prefix(identities), "identities/")
       assert String.contains?(Keyspace.prefix(items), "items/")
       assert String.contains?(Keyspace.prefix(leases), "leases/")
+      assert String.contains?(Keyspace.prefix(legacy_priority_index), "priority_index/")
+      assert String.contains?(Keyspace.prefix(priority_index), "priority_index/v2/")
+      assert String.contains?(Keyspace.prefix(priority_index), "priority_index/")
       assert String.contains?(Keyspace.prefix(stats), "stats/")
       refute String.starts_with?(Keyspace.prefix(dead_letter), Keyspace.prefix(items))
     end
@@ -61,6 +278,23 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert pointers.key_encoding == TupleEncoding
       assert String.contains?(Keyspace.prefix(pointers), "pointers/")
+    end
+
+    test "scans pointers at the maximum timestamp through the pointer prefix end" do
+      maximum = (1 <<< 64) - 1
+      pointers = Store.pointer_keyspace(root())
+      start_key = Keyspace.pack(pointers, {0, <<>>})
+      {_, prefix_end} = Bedrock.KeyRange.from_prefix(Keyspace.prefix(pointers))
+      pointer_key = Keyspace.pack(pointers, {maximum, "maximum-time"})
+
+      expect(MockRepo, :get_range, fn {received_start, received_end}, opts ->
+        assert received_start == start_key
+        assert received_end == prefix_end
+        assert opts[:limit] == 10
+        [{pointer_key, <<maximum::64-little>>}]
+      end)
+
+      assert ["maximum-time"] = Store.scan_visible_queues(MockRepo, root(), now: maximum, limit: 10)
     end
   end
 
@@ -95,63 +329,103 @@ defmodule Bedrock.JobQueue.StoreTest do
   end
 
   describe "peek/4 priority ordering" do
-    test "ignores non-item rows under the item scan prefix" do
+    test "finds ready lower-priority work beyond future higher-priority rows" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      queue_id = "many-future-items"
+      now = 10_000
+
+      for sequence <- 1..100 do
+        future =
+          Item.new(queue_id, "future", %{sequence: sequence},
+            id: <<sequence::128>>,
+            priority: 0,
+            vesting_time: 20_000
+          )
+
+        assert :ok = Store.enqueue(MockRepo, root(), future, now: now)
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), ready, now: now)
+
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: now)
+      assert ready_id == ready.id
+    end
+
+    test "keeps priority ordering among ready work from multiple priorities" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "mixed-priorities"
+
+      low = Item.new(queue_id, "low", %{}, priority: 200, vesting_time: now)
+      high = Item.new(queue_id, "high", %{}, priority: 10, vesting_time: now)
+      future = Item.new(queue_id, "future", %{}, priority: 0, vesting_time: now + 10_000)
+
+      for item <- [low, high, future] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [first, second] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: now)
+      assert [first.id, second.id] == [high.id, low.id]
+    end
+
+    test "keeps priority indexes isolated between queues" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      future = Item.new("queue-a", "future", %{}, priority: 0, vesting_time: now + 10_000)
+      ready_a = Item.new("queue-a", "ready", %{}, priority: 100, vesting_time: now)
+      ready_b = Item.new("queue-b", "ready", %{}, priority: 100, vesting_time: now)
+
+      for item <- [future, ready_a, ready_b] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [%Item{id: id_a}] = Store.peek(MockRepo, root(), "queue-a", now: now)
+      assert id_a == ready_a.id
+      assert [%Item{id: id_b}] = Store.peek(MockRepo, root(), "queue-b", now: now)
+      assert id_b == ready_b.id
+    end
+
+    test "ignores non-item rows while rebuilding an upgraded queue index" do
+      {:ok, store} = start_mock_store()
       queue_id = "tenant_1"
       keyspaces = Store.queue_keyspaces(root(), queue_id)
-      item = Item.new(queue_id, "topic", %{}, priority: 100, vesting_time: 1000)
-      encoded_item = :erlang.term_to_binary(item)
+      item = Item.new(queue_id, "topic", %{}, priority: 100, vesting_time: 1_000)
       packed_item_key = Keyspace.pack(keyspaces.items, Item.key(item))
+
       legacy_dead_letter_key =
         Keyspace.prefix(keyspaces.items) <>
           TupleEncoding.pack("../dead_letter/") <> TupleEncoding.pack("1000/#{item.id}")
-      legacy_dead_letter_item = :erlang.term_to_binary(%{item | id: "dead-lettered"})
 
-      expect(MockRepo, :get_range, fn
-        %Keyspace{}, _opts ->
-          flunk("tuple-encoded item keyspaces must be scanned as raw ranges")
+      setup_integration_stubs(MockRepo, store, [
+        {legacy_dead_letter_key, :erlang.term_to_binary(%{item | id: "dead-lettered"})},
+        {packed_item_key, :erlang.term_to_binary(item)}
+      ])
 
-        {start_key, end_key}, _opts when is_binary(start_key) and is_binary(end_key) ->
-          assert packed_item_key >= start_key
-          assert packed_item_key < end_key
-
-          [
-            {legacy_dead_letter_key, legacy_dead_letter_item},
-            {packed_item_key, encoded_item}
-          ]
-      end)
-
-      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2000)
+      assert [] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
+      assert :ready = migrate_queue!(queue_id)
+      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, limit: 10, now: 2_000)
       assert item_id == item.id
     end
 
     test "returns items in priority order (lowest number first)" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
       # Create items with different priorities
       high_priority = Item.new("tenant_1", "topic", %{}, priority: 10, vesting_time: 1000)
       medium_priority = Item.new("tenant_1", "topic", %{}, priority: 50, vesting_time: 1000)
       low_priority = Item.new("tenant_1", "topic", %{}, priority: 200, vesting_time: 1000)
-      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
 
-      # Encode items
-      items = [
-        {
-          Keyspace.pack(keyspaces.items, Item.key(low_priority)),
-          :erlang.term_to_binary(low_priority)
-        },
-        {
-          Keyspace.pack(keyspaces.items, Item.key(high_priority)),
-          :erlang.term_to_binary(high_priority)
-        },
-        {
-          Keyspace.pack(keyspaces.items, Item.key(medium_priority)),
-          :erlang.term_to_binary(medium_priority)
-        }
-      ]
-
-      # Mock returns items in arbitrary order - peek should sort by key
-      expect(MockRepo, :get_range, fn {_start_key, _end_key}, _opts ->
-        # Return sorted by key (simulating DB behavior)
-        Enum.sort_by(items, fn {key, _} -> key end)
-      end)
+      for item <- [low_priority, high_priority, medium_priority] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: 1000)
+      end
 
       result = Store.peek(MockRepo, root(), "tenant_1", limit: 10, now: 2000)
 
@@ -161,27 +435,18 @@ defmodule Bedrock.JobQueue.StoreTest do
     end
 
     test "maintains priority order with same priority but different vesting_times" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
       # Same priority, different vesting times
       earlier =
         Item.new("tenant_1", "topic", %{data: "earlier"}, priority: 100, vesting_time: 1000)
 
       later = Item.new("tenant_1", "topic", %{data: "later"}, priority: 100, vesting_time: 2000)
-      keyspaces = Store.queue_keyspaces(root(), "tenant_1")
 
-      items = [
-        {
-          Keyspace.pack(keyspaces.items, Item.key(later)),
-          :erlang.term_to_binary(later)
-        },
-        {
-          Keyspace.pack(keyspaces.items, Item.key(earlier)),
-          :erlang.term_to_binary(earlier)
-        }
-      ]
-
-      expect(MockRepo, :get_range, fn {_start_key, _end_key}, _opts ->
-        Enum.sort_by(items, fn {key, _} -> key end)
-      end)
+      for item <- [later, earlier] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: 1_000)
+      end
 
       result = Store.peek(MockRepo, root(), "tenant_1", limit: 10, now: 3000)
 
@@ -415,6 +680,795 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert :ok = result
     end
 
+    test "atomically initializes an empty queue before accepting its first job" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      item = Item.new("brand-new", "topic", %{}, vesting_time: now)
+
+      assert {:ok, ^item} = Store.enqueue_with_item(MockRepo, root(), item, now: now)
+      assert :ready = Store.priority_index_status(MockRepo, root(), item.queue_id)
+      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), item.queue_id, now: now)
+      assert item_id == item.id
+    end
+
+    test "bootstraps an empty queue in v2 without reading or clearing the inert v1 tree" do
+      now = 100
+      queue_id = "transactional-empty-bootstrap"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "first", %{}, priority: 0, vesting_time: now)
+
+      # A marker-less stale v1 subtree is precisely the state an empty upgraded
+      # queue may inherit. v2 must never read or clear this legacy keyspace.
+      stale_negative_root = Keyspace.pack(keyspaces.legacy_priority_index, {0, 0, 0})
+      {:ok, store} = TxVisibilityRepo.start_link([{stale_negative_root, <<0::64-little>>}])
+
+      TxVisibilityRepo.with_store(store, fn ->
+        assert {:ok, ^item} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.enqueue_with_item(TxVisibilityRepo, root(), item, now: now)
+                 end)
+
+        operations = TxVisibilityRepo.operations(store)
+
+        refute Enum.any?(operations, fn
+                 {:get, key} -> key == stale_negative_root
+                 _operation -> false
+               end)
+
+        refute Enum.any?(operations, &match?({:clear_range, _, _}, &1))
+
+        assert now ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: item_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                 end)
+
+        assert item_id == item.id
+      end)
+    end
+
+    test "holds a nonempty pre-index queue until an administrator confirms its writer fence" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "legacy-fence-required"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      legacy = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: now)
+      new_item = Item.new(queue_id, "new", %{}, priority: 1, vesting_time: now)
+      store_item(store, keyspaces.items, legacy)
+
+      # A root written before the lifecycle marker is untrusted too: an older
+      # release could have built only a partial tree.
+      MockRepo.put(keyspaces.legacy_priority_index, {"root"}, <<now::64-little>>)
+
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.enqueue(MockRepo, root(), new_item, now: now)
+
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.obtain_lease(MockRepo, root(), legacy, "worker", 1_000, now: now)
+
+      lease = Lease.new(legacy, "worker", duration_ms: 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.extend_lease(MockRepo, root(), lease, 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} = Store.complete(MockRepo, root(), lease)
+      assert {:error, :priority_index_migration_required} = Store.requeue(MockRepo, root(), lease, now: now)
+
+      assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
+      assert MockRepo.get(keyspaces.priority_index, {"initialized"}) == nil
+    end
+
+    test "only an explicit offline migration advances a static legacy queue" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "fenced-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      for priority <- 0..15 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "future", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 10_000
+          )
+        )
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 16, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
+
+      # Normal reads never turn legacy data into an implicit rolling migration.
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
+      assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "holds every normal queue operation until an offline migration completes" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "static-offline-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      legacy_items =
+        for priority <- 0..7 do
+          item =
+            Item.new(queue_id, "legacy", %{},
+              id: <<priority::128>>,
+              priority: priority,
+              vesting_time: now + 10_000
+            )
+
+          store_item(store, keyspaces.items, item)
+          item
+        end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
+
+      # The first administrative call builds one v2 chunk. From this point the
+      # declared offline fence holds both old and current writers.
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :migrating = Store.priority_index_status(MockRepo, root(), queue_id)
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      current = Item.new(queue_id, "current", %{}, priority: 200, vesting_time: now)
+      lease = Lease.new(hd(legacy_items), "worker", now: now)
+      queue_lease = QueueLease.new(queue_id, "worker", now: now)
+
+      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), current, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.obtain_queue_lease(MockRepo, root(), queue_id, "worker", 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} = Store.release_queue_lease(MockRepo, root(), queue_lease)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.obtain_lease(MockRepo, root(), hd(legacy_items), "worker", 1_000, now: now)
+
+      assert {:error, :priority_index_migration_required} = Store.extend_lease(MockRepo, root(), lease, 1_000, now: now)
+      assert {:error, :priority_index_migration_required} = Store.complete(MockRepo, root(), lease)
+      assert {:error, :priority_index_migration_required} = Store.requeue(MockRepo, root(), lease, now: now)
+
+      assert {:error, :priority_index_migration_required} =
+               Store.update_queue_pointer(MockRepo, root(), queue_id, now, now: now)
+
+      assert :ready = migrate_queue!(queue_id)
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "builds a fresh v2 tree safely across repeated Store calls in one transaction" do
+      now = 10_000
+      queue_id = "transactional-v2-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      futures =
+        for priority <- 0..15 do
+          Item.new(queue_id, "future", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 10_000
+          )
+        end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      stale_node_keys = for level <- 0..64, do: Keyspace.pack(keyspaces.legacy_priority_index, {1, level, 0})
+      stale_tree_keys = [Keyspace.pack(keyspaces.legacy_priority_index, {"root"}) | stale_node_keys]
+
+      entries =
+        Enum.map(futures ++ [ready], fn item ->
+          {Keyspace.pack(keyspaces.items, Item.key(item)), :erlang.term_to_binary(item)}
+        end) ++ Enum.map(stale_tree_keys, &{&1, <<0::64-little>>})
+
+      {:ok, store} = TxVisibilityRepo.start_link(entries)
+
+      TxVisibilityRepo.with_store(store, fn ->
+        # Two chunks can be built inside one caller-owned transaction without
+        # exposing a terminal result. Aborting it leaves no v2 marker or tree.
+        assert :more =
+                 TxVisibilityRepo.abort(fn ->
+                   assert :more =
+                            Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        assert :writer_fence_required =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        operations = TxVisibilityRepo.operations(store)
+        refute Enum.any?(operations, &match?({:clear_range, _, _}, &1))
+
+        refute Enum.any?(operations, fn
+                 {operation, key} when operation in [:get, :put, :clear] -> key in stale_tree_keys
+                 _operation -> false
+               end)
+
+        # Separate physical transactions resume from a marker-linked v2 tree
+        # and eventually publish one exact, complete index.
+        assert :more =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        assert :more =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        assert :ready =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                 end)
+
+        assert now ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: ready_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                 end)
+
+        assert ready_id == ready.id
+      end)
+    end
+
+    test "keeps a same-priority successor indexed when a lease clears the first merged range page" do
+      now = 10_000
+      queue_id = "merged-range-successor"
+      first = Item.new(queue_id, "first", %{}, id: "a", priority: 0, vesting_time: now)
+      second = Item.new(queue_id, "second", %{}, id: "b", priority: 0, vesting_time: now + 1)
+      {:ok, store} = TxVisibilityRepo.start_link([])
+
+      TxVisibilityRepo.with_store(store, fn ->
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), first, now: now) end)
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), second, now: now) end)
+        TxVisibilityRepo.clear_operations(store)
+
+        assert {:ok, _lease} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), first, "worker", 10_000, now: now)
+                 end)
+
+        refute Enum.any?(TxVisibilityRepo.operations(store), &match?({:get_range, _, _, _}, &1))
+
+        TxVisibilityRepo.clear_operations(store)
+
+        assert now + 1 ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: second_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now + 1)
+                 end)
+
+        assert second_id == second.id
+      end)
+    end
+
+    test "uses no raw range refresh after every mutation that removes a same-priority minimum" do
+      now = 10_000
+
+      for operation <- [:extend, :complete, :requeue, :dead_letter] do
+        queue_id = "merged-range-#{operation}"
+        {first, second, lease, store} = ready_leased_pair(queue_id, now, operation)
+
+        TxVisibilityRepo.with_store(store, fn ->
+          TxVisibilityRepo.clear_operations(store)
+
+          result =
+            TxVisibilityRepo.transact(fn ->
+              case operation do
+                :extend -> Store.extend_lease(TxVisibilityRepo, root(), lease, 15_000, now: now)
+                :complete -> Store.complete(TxVisibilityRepo, root(), lease, now: now)
+                :requeue -> Store.requeue(TxVisibilityRepo, root(), lease, base_delay: 15_000, now: now)
+                :dead_letter -> Store.requeue(TxVisibilityRepo, root(), lease, now: now)
+              end
+            end)
+
+          case operation do
+            :extend -> assert {:ok, _extended} = result
+            :complete -> assert :ok = result
+            :requeue -> assert {:ok, :requeued} = result
+            :dead_letter -> assert {:ok, :dead_lettered} = result
+          end
+
+          refute Enum.any?(TxVisibilityRepo.operations(store), &match?({:get_range, _, _, _}, &1))
+
+          TxVisibilityRepo.clear_operations(store)
+
+          assert second.vesting_time ==
+                   TxVisibilityRepo.transact(fn ->
+                     Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                   end)
+
+          assert [%Item{id: second_id}] =
+                   TxVisibilityRepo.transact(fn ->
+                     Store.peek(TxVisibilityRepo, root(), queue_id, now: second.vesting_time)
+                   end)
+
+          assert second_id == second.id
+          refute first.id == second_id
+        end)
+      end
+    end
+
+    test "keeps a requeued item when its timestamp moves earlier than its former lease expiry" do
+      now = 10_000
+      queue_id = "requeue-earlier-than-lease"
+      {first, _second, lease, store} = ready_leased_pair(queue_id, now, :requeue)
+
+      TxVisibilityRepo.with_store(store, fn ->
+        TxVisibilityRepo.clear_operations(store)
+
+        assert {:ok, :requeued} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.requeue(TxVisibilityRepo, root(), lease, base_delay: 500, now: now)
+                 end)
+
+        assert now + 500 ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: first_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now + 500)
+                 end)
+
+        assert first_id == first.id
+      end)
+    end
+
+    test "counts same-vesting item IDs independently" do
+      now = 10_000
+      queue_id = "same-vesting-members"
+      first = Item.new(queue_id, "first", %{}, id: "a", priority: 0, vesting_time: now)
+      second = Item.new(queue_id, "second", %{}, id: "b", priority: 0, vesting_time: now)
+      {:ok, store} = TxVisibilityRepo.start_link([])
+
+      TxVisibilityRepo.with_store(store, fn ->
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), first, now: now) end)
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), second, now: now) end)
+
+        assert {:ok, _lease} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), first, "worker", 10_000, now: now)
+                 end)
+
+        assert now ==
+                 TxVisibilityRepo.transact(fn ->
+                   Store.min_vesting_time(TxVisibilityRepo, root(), queue_id)
+                 end)
+
+        assert [%Item{id: second_id}] =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                 end)
+
+        assert second_id == second.id
+      end)
+    end
+
+    test "rejects overflowing lease timestamps before mutating queue state" do
+      maximum = (1 <<< 64) - 1
+
+      overflow_obtain_item = Item.new("overflow-obtain", "item", %{}, vesting_time: maximum)
+      {:ok, obtain_store} = TxVisibilityRepo.start_link([])
+
+      TxVisibilityRepo.with_store(obtain_store, fn ->
+        assert :ok =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.enqueue(TxVisibilityRepo, root(), overflow_obtain_item, now: maximum)
+                 end)
+
+        snapshot = TxVisibilityRepo.entries(obtain_store)
+
+        assert {:error, :vesting_time_out_of_range} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), overflow_obtain_item, "worker", 1, now: maximum)
+                 end)
+
+        assert TxVisibilityRepo.entries(obtain_store) == snapshot
+      end)
+
+      for operation <- [:extend, :requeue] do
+        {lease, store} = maximum_lease(operation)
+
+        TxVisibilityRepo.with_store(store, fn ->
+          snapshot = TxVisibilityRepo.entries(store)
+
+          result =
+            TxVisibilityRepo.transact(fn ->
+              case operation do
+                :extend -> Store.extend_lease(TxVisibilityRepo, root(), lease, 2, now: maximum - 1)
+                :requeue -> Store.requeue(TxVisibilityRepo, root(), lease, base_delay: 2, now: maximum - 1)
+              end
+            end)
+
+          assert {:error, :vesting_time_out_of_range} = result
+          assert TxVisibilityRepo.entries(store) == snapshot
+        end)
+      end
+    end
+
+    test "fences every direct operation for unknown v2 markers and nonempty markerless legacy queues" do
+      now = 10_000
+
+      for {queue_id, entries} <- [
+            {"unsupported-v2-marker",
+             fn keyspaces, _item ->
+               [
+                 {Keyspace.pack(keyspaces.priority_index, {"migration"}),
+                  :erlang.term_to_binary({:future_phase, "opaque"})}
+               ]
+             end},
+            {"malformed-active-v2-marker",
+             fn keyspaces, _item ->
+               [
+                 {Keyspace.pack(keyspaces.priority_index, {"migration"}),
+                  :erlang.term_to_binary({:offline_building, :not_a_key})}
+               ]
+             end},
+            {"invalid-v2-marker-bytes",
+             fn keyspaces, _item ->
+               [{Keyspace.pack(keyspaces.priority_index, {"migration"}), <<0, 1, 2, 3>>}]
+             end},
+            {"markerless-v1-legacy",
+             fn keyspaces, item ->
+               [{Keyspace.pack(keyspaces.items, Item.key(item)), :erlang.term_to_binary(item)}]
+             end}
+          ] do
+        keyspaces = Store.queue_keyspaces(root(), queue_id)
+        item = Item.new(queue_id, "item", %{}, priority: 0, vesting_time: now)
+        lease = Lease.new(item, "worker", now: now)
+        queue_lease = QueueLease.new(queue_id, "worker", now: now)
+        {:ok, store} = TxVisibilityRepo.start_link(entries.(keyspaces, item))
+
+        TxVisibilityRepo.with_store(store, fn ->
+          assert :writer_fence_required =
+                   TxVisibilityRepo.transact(fn ->
+                     Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                   end)
+
+          assert [] =
+                   TxVisibilityRepo.transact(fn ->
+                     Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
+                   end)
+
+          assert {:error, :priority_index_migration_required} =
+                   TxVisibilityRepo.transact(fn ->
+                     if queue_id != "markerless-v1-legacy" do
+                       assert {:error, :writer_fence_required} =
+                                Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+                     end
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.enqueue(TxVisibilityRepo, root(), item, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.obtain_queue_lease(TxVisibilityRepo, root(), queue_id, "worker", 1_000, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.release_queue_lease(TxVisibilityRepo, root(), queue_lease)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.obtain_lease(TxVisibilityRepo, root(), item, "worker", 1_000, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.extend_lease(TxVisibilityRepo, root(), lease, 1_000, now: now)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.complete(TxVisibilityRepo, root(), lease)
+
+                     assert {:error, :priority_index_migration_required} =
+                              Store.requeue(TxVisibilityRepo, root(), lease, now: now)
+
+                     Store.update_queue_pointer(TxVisibilityRepo, root(), queue_id, now, now: now)
+                   end)
+
+          refute Enum.any?(TxVisibilityRepo.operations(store), fn
+                   {operation, _key} when operation in [:put, :clear, :max, :add] -> true
+                   {:clear_range, _, _} -> true
+                   _operation -> false
+                 end)
+        end)
+      end
+    end
+
+    test "migrates an empty queue with one raw forward range" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store, [], observer: self())
+
+      queue_id = "empty-offline-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      # An unrelated row cannot affect a raw range bounded by the item prefix.
+      MockRepo.put(keyspaces.identities, "unrelated", "value")
+
+      assert :empty = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      current = Item.new(queue_id, "current", %{}, priority: 100, vesting_time: 10_000)
+      assert :empty = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      operations = drain_store_operations()
+      refute Enum.any?(operations, &match?({:select, _}, &1))
+
+      assert [{:get_range, {_start_key, _end_key}, opts}] =
+               Enum.filter(operations, &match?({:get_range, {_, _}, _}, &1))
+
+      assert opts[:limit] == @migration_chunk_size
+
+      assert :ok = Store.enqueue(MockRepo, root(), current, now: 10_000)
+    end
+
+    test "holds an old rolling-upgrade migration marker until the administrator re-fences it" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+
+      for {queue_id, marker} <- [
+            {"cursor-only-migration-marker", {:building, nil}},
+            {"frontier-migration-marker", {:building, nil, "old-frontier"}}
+          ] do
+        keyspaces = Store.queue_keyspaces(root(), queue_id)
+        item = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: now)
+        store_item(store, keyspaces.items, item)
+
+        # A prior rolling-upgrade marker cannot establish this migration's
+        # offline static-queue precondition, so it never becomes a dispatch source.
+        MockRepo.put(keyspaces.legacy_priority_index, {"migration"}, :erlang.term_to_binary(marker))
+
+        assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+        assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+        assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+
+        assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+        assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+        assert item_id == item.id
+      end
+    end
+
+    test "migrates an upgraded queue in fixed chunks before dispatching or reporting an exact minimum" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "legacy-queue"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      # Simulate an upgraded queue: all of these rows predate the scheduling
+      # index, so no index keys have been written yet.
+      for priority <- 0..999 do
+        future =
+          Item.new(queue_id, "future", %{priority: priority},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: 20_000
+          )
+
+        store_item(store, keyspaces.items, future)
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 1_000, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
+
+      # Reads hold this legacy queue until an administrator explicitly confirms
+      # the queue is offline. The partial tree is never a dispatch source and
+      # never reports a false exact minimum.
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
+      assert MockRepo.get(keyspaces.priority_index, {"migration"})
+
+      total_rows = 1_001
+      nonempty_chunks = div(total_rows + @migration_chunk_size - 1, @migration_chunk_size)
+
+      # The administrator advances one chunk per transaction; the final short
+      # raw range proves static coverage and completes immediately.
+      for _ <- 1..(nonempty_chunks - 2) do
+        assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      end
+
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert MockRepo.get(keyspaces.priority_index, {"root"})
+      assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "bounds one migration transaction independently of legacy queue size" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store, [], observer: self())
+
+      queue_id = "bounded-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      for priority <- 0..999 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "future", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: 20_000
+          )
+        )
+      end
+
+      # A manager-style minimum read never starts a migration by itself. A
+      # marker-less queue reports the precise fence-required error and does no
+      # raw scan; the administrator starts the one-chunk transition.
+      assert {:error, :priority_index_migration_required} =
+               Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      assert MockRepo.get(keyspaces.priority_index, {"migration"}) == nil
+      refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+
+      operations = drain_store_operations()
+
+      assert [{:get_range, {_start_key, _end_key}, opts}] =
+               Enum.filter(operations, &match?({:get_range, {_, _}, _}, &1))
+
+      assert opts[:limit] == @migration_chunk_size
+      refute Enum.any?(operations, &match?({:select, _}, &1))
+
+      index_point_operations =
+        Enum.count(operations, fn
+          {operation, %Keyspace{} = keyspace, _key} when operation in [:get, :put, :clear] ->
+            String.contains?(Keyspace.prefix(keyspace), "priority_index/")
+
+          _ ->
+            false
+        end)
+
+      assert index_point_operations <=
+               @migration_chunk_size * @migration_tree_point_operations_per_item + 8
+
+      # Reads do not advance the cursor or expose partial state.
+      assert {:error, :priority_index_migration_required} = Store.min_vesting_time(MockRepo, root(), queue_id)
+
+      refute Enum.any?(drain_store_operations(), &match?({:get_range, {_, _}, _}, &1))
+    end
+
+    test "replays a migration chunk idempotently after a retry" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "retrying-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      items =
+        for priority <- 0..8 do
+          Item.new(queue_id, "item", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: if(priority == 8, do: now, else: now + 10_000)
+          )
+        end
+
+      ready = List.last(items)
+      Enum.each(items, &store_item(store, keyspaces.items, &1))
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+
+      # A real transaction retry rolls back both the tree writes and marker
+      # update. Replaying this already-merged chunk is stricter: it proves the
+      # merge itself is idempotent even if only the cursor is retried.
+      {:offline_building, _cursor} =
+        keyspaces.priority_index
+        |> MockRepo.get({"migration"})
+        |> :erlang.binary_to_term()
+
+      MockRepo.put(
+        keyspaces.priority_index,
+        {"migration"},
+        :erlang.term_to_binary({:offline_building, nil})
+      )
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "uses raw forward pages across the pinned Olivine page boundary" do
+      keys = for key <- 0..128, do: "queue/items/#{String.pad_leading(Integer.to_string(key), 3, "0")}"
+      first_key = "queue/items/000"
+      last_key = "queue/items/128"
+      manager = olivine_index_manager_pages([Enum.take(keys, 128), Enum.drop(keys, 128)])
+
+      assert {:ok, pages} =
+               OlivineIndexManager.pages_for_range(
+                 manager,
+                 first_key,
+                 Bedrock.Key.key_after(last_key),
+                 Version.zero()
+               )
+
+      assert Enum.map(pages, &OlivinePage.id/1) == [0, 1]
+    end
+
+    test "migrates a static cross-page legacy queue without selector frontier capture" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "cross-page-static-migration"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      for priority <- 0..128 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "future", %{priority: priority},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: 20_000
+          )
+        )
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 129, vesting_time: now)
+      store_item(store, keyspaces.items, ready)
+
+      for _ <- 1..16 do
+        assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      end
+
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert [%Item{id: ready_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert ready_id == ready.id
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
     test "uses a custom ID as a queue-scoped idempotency key before leasing" do
       now = 10_000
       queue_id = "tenant_1"
@@ -502,7 +1556,7 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert 1 == identity_count(store, "tenant_2")
     end
 
-    test "migrates a queued legacy custom ID without creating another item" do
+    test "holds a queued legacy custom ID until the writer-fenced migration" do
       now = 10_000
       queue_id = "tenant_1"
       legacy = legacy_item(queue_id, "email-42", vesting_time: now)
@@ -513,12 +1567,12 @@ defmodule Bedrock.JobQueue.StoreTest do
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, legacy)
 
-      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now)
+      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), retry, now: now)
       assert 1 == item_count(store, queue_id)
-      assert 1 == identity_count(store, queue_id)
+      assert 0 == identity_count(store, queue_id)
     end
 
-    test "migrates a leased legacy custom ID without sharing its lease record" do
+    test "holds a leased legacy custom ID until the writer-fenced migration" do
       now = 10_000
       queue_id = "tenant_1"
       legacy = legacy_item(queue_id, "email-42", vesting_time: now)
@@ -539,11 +1593,11 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, leased_legacy)
       MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
 
-      assert :ok = Store.enqueue(MockRepo, root(), retry, now: now)
+      assert {:error, :priority_index_migration_required} = Store.enqueue(MockRepo, root(), retry, now: now)
 
       assert 1 == item_count(store, queue_id)
       assert 1 == lease_count(store, queue_id)
-      assert 1 == identity_count(store, queue_id)
+      assert 0 == identity_count(store, queue_id)
     end
 
     test "rejects an unknown custom ID in a legacy queue after completion" do
@@ -578,8 +1632,6 @@ defmodule Bedrock.JobQueue.StoreTest do
 
   describe "dequeue/5" do
     test "returns empty list when no visible items" do
-      expect_dequeue_empty(MockRepo, "tenant_1")
-
       result =
         Store.dequeue(MockRepo, root(), "tenant_1", "holder", limit: 5, lease_duration: 5000)
 
@@ -603,6 +1655,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, leased_item)
+
+      assert :ready = migrate_queue!(queue_id)
 
       assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
       assert item_id == item.id
@@ -638,8 +1692,11 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, current_item)
       MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
 
+      assert :ready = migrate_queue!(queue_id)
+
       assert :ok =
                Store.complete(MockRepo, root(), stale_lease, now: extended_expires_at - 1)
+
       assert MockRepo.get(keyspaces.items, current_item_key) == nil
       assert MockRepo.get(keyspaces.leases, stale_lease.item_id) == nil
     end
@@ -665,8 +1722,11 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, leased_item)
       MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
 
+      assert :ready = migrate_queue!(queue_id)
+
       assert {:ok, :requeued} = Store.requeue(MockRepo, root(), lease, now: now, base_delay: 1_000)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 999)
+
       assert [%Item{id: item_id, error_count: 1}] =
                Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
 
@@ -694,6 +1754,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       setup_integration_stubs(MockRepo, store)
       store_item(store, keyspaces.items, current_item)
       MockRepo.put(keyspaces.leases, stale_lease.item_id, :erlang.term_to_binary(stored_lease))
+
+      assert :ready = migrate_queue!(queue_id)
 
       assert {:ok, :requeued} =
                Store.requeue(MockRepo, root(), stale_lease, now: now, base_delay: 1_000)
@@ -725,6 +1787,8 @@ defmodule Bedrock.JobQueue.StoreTest do
       store_item(store, keyspaces.items, leased_item)
       MockRepo.put(keyspaces.leases, lease.item_id, :erlang.term_to_binary(lease))
 
+      assert :ready = migrate_queue!(queue_id)
+
       assert {:ok, :dead_lettered} = Store.requeue(MockRepo, root(), lease, now: now)
       assert [] = Store.peek(MockRepo, root(), queue_id, now: now + 1_000)
       assert MockRepo.get(keyspaces.items, Item.key(leased_item)) == nil
@@ -753,6 +1817,176 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert result == 0
     end
+
+    test "never starts one migration per stale legacy pointer" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store, [], observer: self())
+
+      now = 10_000
+      pointers = Store.pointer_keyspace(root())
+
+      Agent.update(store, fn state ->
+        Enum.reduce(1..100, state, fn sequence, acc ->
+          queue_id = "legacy-gc-#{sequence}"
+          Map.put(acc, {Keyspace.prefix(pointers), {0, queue_id}}, <<0::64-little>>)
+        end)
+      end)
+
+      assert 0 = Store.gc_stale_pointers(MockRepo, root(), limit: 100, grace_period: 1, now: now)
+
+      operations = drain_store_operations()
+
+      assert 1 == Enum.count(operations, &match?({:get_range, {_, _}, _}, &1))
+
+      refute Enum.any?(operations, fn
+               {:clear_range, _range} ->
+                 true
+
+               {:put, %Keyspace{} = keyspace, _key} ->
+                 String.contains?(Keyspace.prefix(keyspace), "priority_index/")
+
+               _ ->
+                 false
+             end)
+    end
+  end
+
+  describe "min_vesting_time/4" do
+    test "returns the true minimum beyond the former scan bound" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      queue_id = "many-scheduled-items"
+      now = 10_000
+
+      for sequence <- 1..1_000 do
+        future =
+          Item.new(queue_id, "future", %{sequence: sequence},
+            id: <<sequence::128>>,
+            priority: 0,
+            vesting_time: 20_000
+          )
+
+        assert :ok = Store.enqueue(MockRepo, root(), future, now: now)
+      end
+
+      ready = Item.new(queue_id, "ready", %{}, priority: 100, vesting_time: now)
+      assert :ok = Store.enqueue(MockRepo, root(), ready, now: now)
+
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "tracks each queue independently after a lease moves its vesting time" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      first = Item.new("first", "job", %{}, priority: 10, vesting_time: now)
+      second = Item.new("second", "job", %{}, priority: 10, vesting_time: now + 500)
+
+      assert :ok = Store.enqueue(MockRepo, root(), first, now: now)
+      assert :ok = Store.enqueue(MockRepo, root(), second, now: now)
+      assert {:ok, _lease} = Store.obtain_lease(MockRepo, root(), first, "worker", 1_000, now: now)
+
+      assert Store.min_vesting_time(MockRepo, root(), "first") == now + 1_000
+      assert Store.min_vesting_time(MockRepo, root(), "second") == now + 500
+    end
+  end
+
+  describe "priority domain" do
+    test "rejects priorities outside the tuple encoding domain with a validation error" do
+      for invalid_priority <- [-(1 <<< 64), 1 <<< 64] do
+        assert_raise ArgumentError, ~r/priority must be an integer between/, fn ->
+          Item.new("invalid-priority", "topic", %{}, priority: invalid_priority)
+        end
+
+        invalid_item = %{
+          Item.new("invalid-priority", "topic", %{}, priority: 0)
+          | priority: invalid_priority
+        }
+
+        assert_raise ArgumentError, ~r/priority must be an integer between/, fn ->
+          Store.enqueue(MockRepo, root(), invalid_item)
+        end
+      end
+    end
+
+    test "preserves negative and large priorities accepted by the item key encoding" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "signed-priorities"
+      lowest = Item.new(queue_id, "lowest", %{}, priority: -((1 <<< 64) - 1), vesting_time: now)
+      negative = Item.new(queue_id, "negative", %{}, priority: -1, vesting_time: now)
+      ordinary = Item.new(queue_id, "ordinary", %{}, priority: 100, vesting_time: now)
+      large = Item.new(queue_id, "large", %{}, priority: 1 <<< 63, vesting_time: now)
+
+      for item <- [lowest, negative, ordinary, large] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [first, second, third, fourth] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [first.id, second.id, third.id, fourth.id] == [lowest.id, negative.id, ordinary.id, large.id]
+    end
+
+    test "keeps same-vesting maximum-priority items after lower priorities in ID order" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "maximum-priority"
+      maximum_priority = (1 <<< 64) - 1
+      first = Item.new(queue_id, "first", %{}, id: <<0>>, priority: 0, vesting_time: now)
+
+      maximum_first =
+        Item.new(queue_id, "maximum-first", %{},
+          id: <<1>>,
+          priority: maximum_priority,
+          vesting_time: now
+        )
+
+      maximum_second =
+        Item.new(queue_id, "maximum-second", %{},
+          id: <<2>>,
+          priority: maximum_priority,
+          vesting_time: now
+        )
+
+      for item <- [maximum_second, first, maximum_first] do
+        assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+      end
+
+      assert [low, max_first, max_second] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert [low.id, max_first.id, max_second.id] == [first.id, maximum_first.id, maximum_second.id]
+    end
+  end
+
+  describe "vesting time domain" do
+    test "accepts the full unsigned 64-bit timestamp range, including zero" do
+      queue_id = "timestamp-domain"
+      maximum = (1 <<< 64) - 1
+
+      assert %Item{vesting_time: 0} = Item.new(queue_id, "zero", %{}, vesting_time: 0)
+      assert %Item{vesting_time: ^maximum} = Item.new(queue_id, "maximum", %{}, vesting_time: maximum)
+    end
+
+    test "rejects invalid timestamps before item or Store writes" do
+      for invalid_vesting_time <- [-1, 1 <<< 64] do
+        assert_raise ArgumentError, ~r/vesting_time must be an integer between/, fn ->
+          Item.new("invalid-timestamp", "topic", %{}, vesting_time: invalid_vesting_time)
+        end
+
+        invalid_item = %{
+          Item.new("invalid-timestamp", "topic", %{}, vesting_time: 0)
+          | vesting_time: invalid_vesting_time
+        }
+
+        assert_raise ArgumentError, ~r/vesting_time must be an integer between/, fn ->
+          Store.enqueue(MockRepo, root(), invalid_item)
+        end
+      end
+    end
   end
 
   defp item_count(store, queue_id) do
@@ -767,6 +2001,69 @@ defmodule Bedrock.JobQueue.StoreTest do
     count_entries(store, root() |> Store.queue_keyspaces(queue_id) |> Map.fetch!(:identities))
   end
 
+  defp ready_leased_pair(queue_id, now, operation) do
+    keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+    original =
+      Item.new(queue_id, "first", %{},
+        id: "first",
+        priority: 0,
+        vesting_time: now,
+        max_retries: if(operation == :dead_letter, do: 1, else: 3)
+      )
+
+    lease = Lease.new(original, "worker", duration_ms: 1_000, now: now)
+
+    first = %{
+      original
+      | lease_id: lease.id,
+        lease_expires_at: lease.expires_at,
+        vesting_time: lease.expires_at
+    }
+
+    second = Item.new(queue_id, "second", %{}, id: "second", priority: 0, vesting_time: now + 10_000)
+
+    entries = [
+      {Keyspace.pack(keyspaces.items, Item.key(first)), :erlang.term_to_binary(first)},
+      {Keyspace.pack(keyspaces.items, Item.key(second)), :erlang.term_to_binary(second)},
+      {Keyspace.pack(keyspaces.leases, lease.item_id), :erlang.term_to_binary(lease)}
+    ]
+
+    {:ok, store} = TxVisibilityRepo.start_link(entries)
+
+    TxVisibilityRepo.with_store(store, fn ->
+      assert :ready =
+               TxVisibilityRepo.transact(fn ->
+                 Store.migrate_priority_index(TxVisibilityRepo, root(), queue_id, writer_fence: :offline)
+               end)
+    end)
+
+    {first, second, lease, store}
+  end
+
+  defp maximum_lease(operation) do
+    maximum = (1 <<< 64) - 1
+    now = maximum - 1
+    queue_id = "overflow-#{operation}"
+    item = Item.new(queue_id, "item", %{}, vesting_time: now)
+    {:ok, store} = TxVisibilityRepo.start_link([])
+
+    lease =
+      TxVisibilityRepo.with_store(store, fn ->
+        assert :ok = TxVisibilityRepo.transact(fn -> Store.enqueue(TxVisibilityRepo, root(), item, now: now) end)
+
+        assert {:ok, lease} =
+                 TxVisibilityRepo.transact(fn ->
+                   Store.obtain_lease(TxVisibilityRepo, root(), item, "worker", 1, now: now)
+                 end)
+
+        assert lease.expires_at == maximum
+        lease
+      end)
+
+    {lease, store}
+  end
+
   defp legacy_item(queue_id, id, opts) do
     queue_id
     |> Item.new("email:send", %{legacy: true}, Keyword.put(opts, :id, id))
@@ -775,6 +2072,44 @@ defmodule Bedrock.JobQueue.StoreTest do
     |> Map.put(:__struct__, Item)
     |> :erlang.term_to_binary()
     |> :erlang.binary_to_term()
+  end
+
+  defp migrate_queue!(queue_id) do
+    case Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline) do
+      :more -> migrate_queue!(queue_id)
+      status when status in [:ready, :empty] -> status
+    end
+  end
+
+  defp olivine_index_manager_pages(key_pages) do
+    page_map =
+      key_pages
+      |> Enum.with_index()
+      |> Map.new(fn {keys, id} ->
+        page = OlivinePage.new(id, Enum.map(keys, &{&1, <<0::64>>}))
+        next_id = if id + 1 == length(key_pages), do: 0, else: id + 1
+        {id, {page, next_id}}
+      end)
+
+    keys = List.flatten(key_pages)
+
+    index = %{
+      OlivineIndex.new()
+      | tree: OlivineTree.from_page_map(page_map),
+        page_map: page_map,
+        min_key: hd(keys),
+        max_key: List.last(keys)
+    }
+
+    %{OlivineIndexManager.new() | versions: [{Version.zero(), {index, %{}}}]}
+  end
+
+  defp drain_store_operations(operations \\ []) do
+    receive do
+      {:store_operation, operation} -> drain_store_operations([operation | operations])
+    after
+      0 -> Enum.reverse(operations)
+    end
   end
 
   defp count_entries(store, keyspace) do

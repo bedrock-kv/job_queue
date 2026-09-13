@@ -16,6 +16,9 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     root = Keyspace.new("job_queue/test/")
     item = Item.new("tenant_1", "test:job", %{}, now: 1_000)
     lease = Lease.new(item, "holder", now: 1_000, duration_ms: 100)
+    keyspaces = Store.queue_keyspaces(root, item.queue_id)
+
+    expect_initialized_priority_index_gets(keyspaces, 0, fn _keyspace, _key -> flunk("unexpected queue read") end)
 
     assert {:error, :lease_expired} = Store.extend_lease(MockRepo, root, lease, 100, now: 1_100)
   end
@@ -26,7 +29,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     item = Item.new("tenant_1", "test:job", %{}, now: now)
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.items
       assert key == Item.key(item)
       Process.sleep(30)
@@ -37,6 +40,8 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
     stub(MockRepo, :max, fn _key, _value -> :ok end)
     stub(MockRepo, :add, fn _key, _value -> :ok end)
+    stub(MockRepo, :get, fn _keyspace, _key -> nil end)
+    stub(MockRepo, :get_range, fn _range, _opts -> [] end)
 
     assert {:ok, lease} = Store.obtain_lease(MockRepo, root, item, "holder", 10)
     assert lease.expires_at > System.system_time(:millisecond)
@@ -47,7 +52,9 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     queue_id = "tenant_1"
     keyspace = Store.queue_lease_keyspace(root)
 
-    expect(MockRepo, :get, fn received_keyspace, received_queue_id ->
+    keyspaces = Store.queue_keyspaces(root, queue_id)
+
+    expect_initialized_priority_index_gets(keyspaces, 1, fn received_keyspace, received_queue_id ->
       assert received_keyspace == keyspace
       assert received_queue_id == queue_id
       Process.sleep(30)
@@ -65,7 +72,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     caller_lease = %{expired_lease | expires_at: expired_lease.expires_at + 1_000}
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       :erlang.term_to_binary(expired_lease)
@@ -85,7 +92,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
     test_pid = self()
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       :erlang.term_to_binary(lease)
@@ -118,7 +125,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     {root, item, lease} = expired_lease()
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       :erlang.term_to_binary(lease)
@@ -131,7 +138,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     {root, item, lease} = expired_lease()
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       :erlang.term_to_binary(lease)
@@ -159,7 +166,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
     test_pid = self()
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       :erlang.term_to_binary(stored_lease)
@@ -199,7 +206,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
 
     expect(MockRepo, :transact, fn callback -> callback.() end)
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       :erlang.term_to_binary(lease)
@@ -227,7 +234,7 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
       expect(MockRepo, :transact, fn callback -> callback.() end)
     end
 
-    expect(MockRepo, :get, fn keyspace, key ->
+    expect_initialized_priority_index_gets(keyspaces, 1, fn keyspace, key ->
       assert keyspace == keyspaces.leases
       assert key == item.id
       send(test_pid, {:lease_read_blocked, read_ref, self()})
@@ -240,8 +247,11 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     task =
       Task.async(fn ->
         case action do
-          :complete -> Store.complete(MockRepo, root, lease, clock: fn -> Agent.get(clock, & &1) end)
-          :requeue -> Store.requeue(MockRepo, root, lease, clock: fn -> Agent.get(clock, & &1) end)
+          :complete ->
+            Store.complete(MockRepo, root, lease, clock: fn -> Agent.get(clock, & &1) end)
+
+          :requeue ->
+            Store.requeue(MockRepo, root, lease, clock: fn -> Agent.get(clock, & &1) end)
 
           :action_complete ->
             Action.run(MockRepo, root, lease, :complete, :ok,
@@ -264,5 +274,27 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     item = Item.new("tenant_1", "test:job", %{}, now: 1_000)
     lease = Lease.new(item, "holder", now: 1_000, duration_ms: 100)
     {root, item, lease}
+  end
+
+  defp expect_initialized_priority_index_gets(keyspaces, operation_reads, operation_read) do
+    expect(MockRepo, :get, operation_reads + 3, fn keyspace, key ->
+      case initialized_priority_index_value(keyspaces, keyspace, key) do
+        {:ok, value} -> value
+        :error -> operation_read.(keyspace, key)
+      end
+    end)
+  end
+
+  defp initialized_priority_index_value(keyspaces, keyspace, key) do
+    if keyspace == keyspaces.priority_index do
+      case key do
+        {"migration"} -> {:ok, nil}
+        {"initialized"} -> {:ok, "ready"}
+        {"root"} -> {:ok, nil}
+        _other_key -> :error
+      end
+    else
+      :error
+    end
   end
 end

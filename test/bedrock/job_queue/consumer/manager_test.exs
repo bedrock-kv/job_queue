@@ -32,6 +32,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   end
 
   defmodule BlockingJob do
+    @moduledoc false
     def perform(_args, _meta) do
       Process.register(self(), :manager_lifecycle_handler)
       send(:manager_lifecycle_test_process, {:handler_started, self()})
@@ -183,6 +184,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       end
     end
 
+    def handle_call({:get_range, _start_key, _end_key, _limit, _opts}, _from, state),
+      do: {:reply, {:ok, {[], false}}, state}
+
     def handle_call(:writes, _from, state), do: {:reply, state.writes, state}
 
     @impl true
@@ -192,6 +196,9 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
     def handle_cast({:atomic, operation, key, value}, state),
       do: {:noreply, add_write(state, {:atomic, operation, key, value})}
+
+    def handle_cast({:clear_range, start_key, end_key, opts}, state),
+      do: {:noreply, add_write(state, {:clear_range, start_key, end_key, opts})}
 
     def handle_cast(:rollback, state) do
       send(state.test_pid, :rollback)
@@ -258,12 +265,141 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
   defp enqueue_item(ctx, queue_id, topic, payload) do
     item = Item.new(queue_id, topic, payload)
-    keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
-    store_item(ctx.store, keyspaces.items, item)
+    assert :ok = Store.enqueue(MockRepo, ctx.root, item)
     item
   end
 
   describe "handle_info/2" do
+    test "holds a writer-fence-required queue without pointer mutation or self-reschedule", ctx do
+      queue_id = "legacy-hold"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+      legacy = Item.new(queue_id, "test:success", %{})
+      store_item(ctx.store, keyspaces.items, legacy)
+      manager = start_manager(ctx)
+
+      send(manager, {:queue_ready, queue_id})
+      Process.sleep(50)
+      _ = :sys.get_state(manager)
+
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+
+      refute Agent.get(ctx.store, fn state ->
+               Enum.any?(state, fn
+                 {{prefix, _key}, _value} ->
+                   prefix == Keyspace.prefix(keyspaces.priority_index) or
+                     prefix == Keyspace.prefix(Store.pointer_keyspace(ctx.root))
+
+                 _ ->
+                   false
+               end)
+             end)
+    end
+
+    test "holds an unsupported v2 migration marker without pointer mutation or self-reschedule", ctx do
+      queue_id = "unsupported-v2-marker"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+      MockRepo.put(keyspaces.priority_index, {"migration"}, :erlang.term_to_binary({:future_phase, "opaque"}))
+      manager = start_manager(ctx)
+
+      send(manager, {:queue_ready, queue_id})
+      Process.sleep(50)
+      _ = :sys.get_state(manager)
+
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+
+      refute Agent.get(ctx.store, fn state ->
+               Enum.any?(state, fn
+                 {{prefix, key}, _value} ->
+                   (prefix == Keyspace.prefix(keyspaces.priority_index) and key != {"migration"}) or
+                     prefix == Keyspace.prefix(Store.pointer_keyspace(ctx.root))
+
+                 _ ->
+                   false
+               end)
+             end)
+    end
+
+    test "holds invalid v2 migration marker bytes without crashing or mutating pointers", ctx do
+      queue_id = "invalid-v2-marker-bytes"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+      MockRepo.put(keyspaces.priority_index, {"migration"}, <<0, 1, 2, 3>>)
+      manager = start_manager(ctx)
+
+      send(manager, {:queue_ready, queue_id})
+      Process.sleep(50)
+      _ = :sys.get_state(manager)
+
+      assert Process.alive?(manager)
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+
+      refute Agent.get(ctx.store, fn state ->
+               Enum.any?(state, fn
+                 {{prefix, key}, _value} ->
+                   (prefix == Keyspace.prefix(keyspaces.priority_index) and key != {"migration"}) or
+                     prefix == Keyspace.prefix(Store.pointer_keyspace(ctx.root))
+
+                 _ ->
+                   false
+               end)
+             end)
+    end
+
+    test "holds an offline migration without self-rescheduling, then dispatches after admin completion", ctx do
+      now = System.system_time(:millisecond)
+      queue_id = "offline-migration-hold"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+
+      # Seed exactly one full legacy chunk followed by a ready tail. The
+      # operator, not the Manager, owns both bounded migration calls.
+      for priority <- 0..7 do
+        store_item(
+          ctx.store,
+          keyspaces.items,
+          Item.new(queue_id, "test:success", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 60_000
+          )
+        )
+      end
+
+      ready =
+        Item.new(queue_id, "test:success", %{},
+          priority: 100,
+          vesting_time: now
+        )
+
+      store_item(ctx.store, keyspaces.items, ready)
+      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
+
+      transaction_calls = :counters.new(1, [])
+
+      stub(MockRepo, :transact, fn callback ->
+        :counters.add(transaction_calls, 1, 1)
+        callback.()
+      end)
+
+      manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
+      send(manager, {:queue_ready, queue_id})
+
+      # A migrating queue consumes one notification and remains entirely under
+      # administrative control: no action, pointer write, or self-message.
+      refute_receive {:action_hook, _repo, _root, _item_id, _action, _handler, _result}, 100
+      assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+      assert :migrating = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+      assert :counters.get(transaction_calls, 1) == 1
+      assert %{pending_queues: pending_queues} = :sys.get_state(manager)
+      assert pending_queues == MapSet.new()
+
+      assert :ready = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
+      send(manager, {:queue_ready, queue_id})
+
+      assert_receive {:action_hook, MockRepo, _root, ready_id, :complete, :ok, :ok}, 500
+      assert ready_id == ready.id
+      assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+      assert :counters.get(transaction_calls, 1) == 4
+    end
+
     test "handles task crash with :DOWN message", ctx do
       _item = enqueue_item(ctx, "test:crash")
       manager = start_manager(ctx)
@@ -525,7 +661,8 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     keyspaces = Store.queue_keyspaces(root, item.queue_id)
 
     values = %{
-      Keyspace.pack(keyspaces.leases, item.id) => :erlang.term_to_binary(lease)
+      Keyspace.pack(keyspaces.leases, item.id) => :erlang.term_to_binary(lease),
+      Keyspace.pack(keyspaces.priority_index, {"initialized"}) => "ready"
     }
 
     values =

@@ -2,8 +2,8 @@
 
 ```elixir
 Mix.install([
-  {:bedrock, github: "bedrock-kv/bedrock", branch: "develop"},
-  {:bedrock_job_queue, github: "bedrock-kv/job_queue", branch: "main"},
+  {:bedrock, "~> 0.7.1"},
+  {:bedrock_job_queue, github: "bedrock-kv/job_queue"},
   {:kino, "~> 0.16.0"}
 ])
 ```
@@ -205,7 +205,8 @@ Start the consumer:
 <!-- livebook:{"reevaluate_automatically":true} -->
 
 ```elixir
-Kino.start_child!({CoffeeShop.JobQueue, concurrency: 2, batch_size: 5})
+# A single worker makes the priority-order demonstration below deterministic.
+Kino.start_child!({CoffeeShop.JobQueue, concurrency: 1, batch_size: 5})
 
 # Give it a moment to initialize
 Process.sleep(500)

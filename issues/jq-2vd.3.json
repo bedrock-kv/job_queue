@@ -2,14 +2,15 @@
   "assignee": "Jason Allum",
   "blocked_by": [],
   "blocks": [],
+  "closed_at": "2026-09-13T09:06:32Z",
   "created": "2026-09-13T06:46:36Z",
   "description": "Store.update_pointer/5 (710-713) stores a separate {vesting_time, queue_id} key at each distinct enqueue/lease/renewal time, rather than a single maintained pointer per queue. scan_visible_queues/3 (605-621) limits raw rows before deduplicating, always from the beginning. cleanup_past_pointers/4 scans only the first 100 global rows, and runs only when the new minimum is in the future; GC will not remove pointers while a queue remains non-empty. Reproduced: hot queue with ready timestamps 1..20, small queue at 30, now 10000; scan(limit: 10) returns only hot before AND after leasing its first ten jobs, while scan(limit: 100) sees both. Consumer.init/1 (consumer.ex:64,98) passes the job batch_size to Scanner, overriding its 20000 default with 10 in normal startup; selection_frac 0.02 then chooses only one queue per scan. Fix pointer lifecycle and scan progression, separate configuration, and provide a starvation-prevention mechanism comparable to QuiCK's ordered scanner. Test sustained skew and stale/duplicate pointers with actual range limits.",
   "id": "jq-2vd.3",
   "labels": [],
   "parent": "jq-2vd",
   "priority": 1,
-  "status": "in_progress",
+  "status": "closed",
   "title": "Restore fair pointer discovery and separate scanner and dequeue batch sizes",
   "type": "bug",
-  "updated_at": "2026-09-13T08:52:39Z"
+  "updated_at": "2026-09-13T09:06:32Z"
 }

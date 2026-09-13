@@ -86,6 +86,11 @@ defmodule Bedrock.JobQueue.Store do
   must first obtain a queue lease before it can dequeue items. Only one
   consumer can hold a queue lease at a time.
 
+  Options:
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying current time after the lease
+    read (default: `System.system_time/1`)
+
   Returns:
   - `{:ok, QueueLease.t()}` - Lease obtained successfully
   - `{:error, :queue_leased}` - Queue already leased by another consumer
@@ -101,17 +106,19 @@ defmodule Bedrock.JobQueue.Store do
           {:ok, QueueLease.t()} | {:error, :queue_leased}
   def obtain_queue_lease(repo, root, queue_id, holder, duration_ms, opts \\ []) do
     ks = queue_lease_keyspace(root)
-    now = Keyword.get(opts, :now, System.system_time(:millisecond))
+    clock = clock(opts)
 
     case repo.get(ks, queue_id) do
       nil ->
         # No existing lease - create new one
+        now = clock.()
         lease = QueueLease.new(queue_id, holder, duration_ms: duration_ms, now: now)
         repo.put(ks, queue_id, encode(lease))
         {:ok, lease}
 
       value ->
         existing = decode(value)
+        now = clock.()
 
         if existing.expires_at <= now do
           # Existing lease expired - replace it
@@ -370,13 +377,18 @@ defmodule Bedrock.JobQueue.Store do
   2. Creates lease record
   3. Updates item's vesting_time to lease expiry (makes it invisible)
   4. Updates pointer index with new min vesting_time
+
+  Options:
+  - `:now` - Fixed current time in ms (primarily useful for tests)
+  - `:clock` - Zero-argument function supplying current time after the item
+    read (default: `System.system_time/1`)
   """
   @spec obtain_lease(repo(), root_keyspace(), Item.t(), binary(), pos_integer(), keyword()) ::
           {:ok, Lease.t()} | {:error, :already_leased | :not_found}
   def obtain_lease(repo, root, %Item{} = item, holder, duration_ms, opts \\ []) do
     keyspaces = queue_keyspaces(root, item.queue_id)
     pointers = pointer_keyspace(root)
-    now = Keyword.get(opts, :now) || System.system_time(:millisecond)
+    clock = clock(opts)
 
     # Read current item state
     item_key = Item.key(item)
@@ -387,6 +399,7 @@ defmodule Bedrock.JobQueue.Store do
 
       value ->
         current_item = decode(value)
+        now = clock.()
 
         if Item.leased?(current_item, now: now) do
           {:error, :already_leased}
@@ -587,9 +600,8 @@ defmodule Bedrock.JobQueue.Store do
 
     with {:ok, stored_lease, _now} <- verify_active_lease(repo, keyspaces, lease, clock),
          item_key = stored_lease.item_key,
-         {:ok, item} <- fetch_item(repo, keyspaces, item_key),
-         {:ok, now} <- active_now(stored_lease, clock) do
-      do_requeue(repo, keyspaces, pointers, lease, item, item_key, opts, now)
+         {:ok, item} <- fetch_item(repo, keyspaces, item_key) do
+      do_requeue(repo, keyspaces, pointers, {lease, stored_lease}, item, item_key, opts, clock)
     end
   end
 
@@ -600,40 +612,50 @@ defmodule Bedrock.JobQueue.Store do
     end
   end
 
-  defp do_requeue(repo, keyspaces, pointers, lease, item, item_key, opts, now) do
+  defp do_requeue(repo, keyspaces, pointers, {lease, stored_lease}, item, item_key, opts, clock) do
+    plan = requeue_plan(item, opts)
+
+    with {:ok, now} <- active_now(stored_lease, clock) do
+      write_requeue(repo, keyspaces, pointers, lease, item, item_key, plan, now)
+    end
+  end
+
+  defp requeue_plan(item, opts) do
     new_error_count = item.error_count + 1
 
     if new_error_count >= item.max_retries do
-      # Move to dead letter
-      move_to_dead_letter(repo, keyspaces, item_key, item, now)
-      repo.clear(keyspaces.leases, lease.item_id)
-      {:ok, :dead_lettered}
+      {:dead_letter, new_error_count}
     else
-      # Calculate backoff delay
-      delay = calculate_backoff_delay(opts, new_error_count)
-      new_vesting_time = now + delay
-
-      # Update item
-      updated_item = %{
-        item
-        | error_count: new_error_count,
-          vesting_time: new_vesting_time,
-          lease_id: nil,
-          lease_expires_at: nil
-      }
-
-      # Delete old key, write new
-      repo.clear(keyspaces.items, item_key)
-      new_item_key = Item.key(updated_item)
-      repo.put(keyspaces.items, new_item_key, encode(updated_item))
-
-      # Update pointer, clear lease, update stats
-      update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
-      repo.clear(keyspaces.leases, lease.item_id)
-      update_stats(repo, keyspaces, 1, -1)
-
-      {:ok, :requeued}
+      {:requeue, new_error_count, calculate_backoff_delay(opts, new_error_count)}
     end
+  end
+
+  defp write_requeue(repo, keyspaces, _pointers, lease, item, item_key, {:dead_letter, _error_count}, now) do
+    move_to_dead_letter(repo, keyspaces, item_key, item, now)
+    repo.clear(keyspaces.leases, lease.item_id)
+    {:ok, :dead_lettered}
+  end
+
+  defp write_requeue(repo, keyspaces, pointers, lease, item, item_key, {:requeue, error_count, delay}, now) do
+    new_vesting_time = now + delay
+
+    updated_item = %{
+      item
+      | error_count: error_count,
+        vesting_time: new_vesting_time,
+        lease_id: nil,
+        lease_expires_at: nil
+    }
+
+    repo.clear(keyspaces.items, item_key)
+    new_item_key = Item.key(updated_item)
+    repo.put(keyspaces.items, new_item_key, encode(updated_item))
+
+    update_pointer(repo, pointers, new_vesting_time, lease.queue_id, now)
+    repo.clear(keyspaces.leases, lease.item_id)
+    update_stats(repo, keyspaces, 1, -1)
+
+    {:ok, :requeued}
   end
 
   # Calculate backoff delay based on options.

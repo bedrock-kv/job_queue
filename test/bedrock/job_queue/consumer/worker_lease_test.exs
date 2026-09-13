@@ -123,6 +123,18 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
     end
   end
 
+  defmodule DelayedPreflightReturnRepo do
+    def transact(callback) do
+      result = callback.()
+      Process.sleep(30)
+      result
+    end
+
+    def get(_keyspace, _item_id) do
+      Agent.get(:worker_lease_delayed_preflight_repo, & &1.encoded_lease)
+    end
+  end
+
   test "kills the running handler when renewal proves the lease was lost" do
     Process.register(self(), :worker_lease_test_process)
 
@@ -228,6 +240,40 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
 
     assert_receive {task_ref, {:cancelled, {:lease_lost, :lease_expired}}}
     assert task_ref == task.ref
+    refute_received :handler_ran
+  end
+
+  test "does not run the handler when preflight returns after lease expiry" do
+    Process.register(self(), :worker_lease_test_process)
+
+    now = System.system_time(:millisecond)
+    item = Item.new("tenant_1", "test:never_run", %{}, now: now)
+    lease = Lease.new(item, "holder", now: now, duration_ms: 10)
+
+    {:ok, _repo_state} =
+      Agent.start_link(
+        fn -> %{encoded_lease: :erlang.term_to_binary(lease)} end,
+        name: :worker_lease_delayed_preflight_repo
+      )
+
+    on_exit(fn ->
+      if Process.whereis(:worker_lease_delayed_preflight_repo) do
+        try do
+          Agent.stop(:worker_lease_delayed_preflight_repo)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    assert {:cancelled, {:lease_lost, :lease_expired}} =
+             Worker.execute(item, %{"test:never_run" => NeverRunJob},
+               repo: DelayedPreflightReturnRepo,
+               root: Keyspace.new("job_queue/test/"),
+               lease: lease,
+               lease_extender_opts: [clock: fn -> lease.expires_at - 100 end]
+             )
+
     refute_received :handler_ran
   end
 

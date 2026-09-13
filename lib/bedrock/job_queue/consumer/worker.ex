@@ -103,19 +103,35 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   end
 
   defp execute_with_lease_guard(item, workers, context) do
-    extender =
-      LeaseExtender.start(
-        context.repo,
-        context.root,
-        context.lease,
-        context.lease_duration,
-        Keyword.put(context.lease_extender_opts, :notify, self())
-      )
+    if lease_still_active?(context.lease, context.lease_check_opts) do
+      extender =
+        LeaseExtender.start(
+          context.repo,
+          context.root,
+          context.lease,
+          context.lease_duration,
+          Keyword.put(context.lease_extender_opts, :notify, self())
+        )
 
-    try do
-      execute_job(item, workers, context.lease)
-    after
-      stop_extender(extender)
+      try do
+        execute_job(item, workers, context.lease)
+      after
+        stop_extender(extender)
+      end
+    else
+      {:cancelled, {:lease_lost, :lease_expired}}
+    end
+  end
+
+  # The transaction confirms stored ownership at its decision point. Its return
+  # can still be delayed, so sample the deadline again immediately before the
+  # extender or handler is started.
+  defp lease_still_active?(lease, opts), do: lease.expires_at > lease_clock(opts).()
+
+  defp lease_clock(opts) do
+    case Keyword.fetch(opts, :clock) do
+      {:ok, clock} when is_function(clock, 0) -> clock
+      :error -> fn -> Keyword.get(opts, :now) || System.system_time(:millisecond) end
     end
   end
 

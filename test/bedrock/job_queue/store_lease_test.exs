@@ -20,6 +20,46 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     assert {:error, :lease_expired} = Store.extend_lease(MockRepo, root, lease, 100, now: 1_100)
   end
 
+  test "creates an item lease from time sampled after a delayed item read" do
+    root = Keyspace.new("job_queue/test/")
+    now = System.system_time(:millisecond)
+    item = Item.new("tenant_1", "test:job", %{}, now: now)
+    keyspaces = Store.queue_keyspaces(root, item.queue_id)
+
+    expect(MockRepo, :get, fn keyspace, key ->
+      assert keyspace == keyspaces.items
+      assert key == Item.key(item)
+      Process.sleep(30)
+      :erlang.term_to_binary(item)
+    end)
+
+    stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
+    stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
+    stub(MockRepo, :max, fn _key, _value -> :ok end)
+    stub(MockRepo, :add, fn _key, _value -> :ok end)
+
+    assert {:ok, lease} = Store.obtain_lease(MockRepo, root, item, "holder", 10)
+    assert lease.expires_at > System.system_time(:millisecond)
+  end
+
+  test "creates a queue lease from time sampled after a delayed lease read" do
+    root = Keyspace.new("job_queue/test/")
+    queue_id = "tenant_1"
+    keyspace = Store.queue_lease_keyspace(root)
+
+    expect(MockRepo, :get, fn received_keyspace, received_queue_id ->
+      assert received_keyspace == keyspace
+      assert received_queue_id == queue_id
+      Process.sleep(30)
+      nil
+    end)
+
+    stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
+
+    assert {:ok, lease} = Store.obtain_queue_lease(MockRepo, root, queue_id, "holder", 10)
+    assert lease.expires_at > System.system_time(:millisecond)
+  end
+
   test "does not revive an expired stored lease from a caller lease with a future expiry" do
     {root, item, expired_lease} = expired_lease()
     caller_lease = %{expired_lease | expires_at: expired_lease.expires_at + 1_000}
@@ -106,6 +146,51 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
 
   test "refuses to requeue when the stored lease expires during its read" do
     assert_finalization_expires_after_blocked_read(:requeue)
+  end
+
+  test "refuses to requeue when backoff computation crosses lease expiry" do
+    root = Keyspace.new("job_queue/test/")
+    now = System.system_time(:millisecond)
+    {:ok, clock} = Agent.start_link(fn -> now end)
+    item = Item.new("tenant_1", "test:job", %{}, now: now)
+    lease = Lease.new(item, "holder", now: now, duration_ms: 30_000)
+    stored_lease = %{lease | item_key: {item.priority, lease.expires_at, item.id}}
+    leased_item = %{item | lease_id: lease.id, lease_expires_at: lease.expires_at, vesting_time: lease.expires_at}
+    keyspaces = Store.queue_keyspaces(root, item.queue_id)
+    test_pid = self()
+
+    expect(MockRepo, :get, fn keyspace, key ->
+      assert keyspace == keyspaces.leases
+      assert key == item.id
+      :erlang.term_to_binary(stored_lease)
+    end)
+
+    expect(MockRepo, :get, fn keyspace, key ->
+      assert keyspace == keyspaces.items
+      assert key == stored_lease.item_key
+      :erlang.term_to_binary(leased_item)
+    end)
+
+    task =
+      Task.async(fn ->
+        Store.requeue(MockRepo, root, lease,
+          clock: fn -> Agent.get(clock, & &1) end,
+          backoff_fn: fn _attempt ->
+            send(test_pid, {:backoff_blocked, self()})
+
+            receive do
+              :finish_backoff -> 1_000
+            end
+          end
+        )
+      end)
+
+    assert_receive {:backoff_blocked, backoff_pid}
+    Agent.update(clock, fn _ -> lease.expires_at end)
+    send(backoff_pid, :finish_backoff)
+
+    assert_receive {task_ref, {:error, :lease_expired}}
+    assert task_ref == task.ref
   end
 
   test "action finalization preserves an expired lease" do

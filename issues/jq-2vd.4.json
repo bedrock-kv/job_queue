@@ -1,0 +1,15 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-09-13T06:46:36Z",
+  "description": "consumer/manager.ex:158-179 obtains, uses, and releases the queue lease inside ONE repo.transact callback. The committed lease state is absent, so other consumers cannot cheaply detect that the queue is reserved before doing competing item reads and mutations. Item transactions still provide exclusion, but this does not provide the coarse-grained contention reduction of QuiCK Algorithm 2. Review the transaction boundary: commit the short queue/pointer lease before batch item work and provide safe release/expiry recovery. Test concurrent managers on a hot queue, observe committed lease state and collision costs, and ensure the lease does not unnecessarily serialize job execution.",
+  "id": "jq-2vd.4",
+  "labels": [],
+  "parent": "jq-2vd",
+  "priority": 1,
+  "status": "open",
+  "title": "Make queue leases visible before performing batch dequeue work",
+  "type": "bug",
+  "updated_at": "2026-09-13T06:46:36Z"
+}

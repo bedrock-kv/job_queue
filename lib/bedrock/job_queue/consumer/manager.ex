@@ -251,20 +251,32 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
   end
 
   defp handle_worker_result(state, lease, result) do
-    case result do
-      success when success in [:ok] or (is_tuple(success) and elem(success, 0) == :ok) ->
-        run_job_action(state, lease, :complete, result)
+    action_result =
+      case result do
+        success when success in [:ok] or (is_tuple(success) and elem(success, 0) == :ok) ->
+          run_job_action(state, lease, :complete, result)
 
-      {:error, _reason} ->
-        run_job_action(state, lease, :requeue, result)
+        {:error, _reason} ->
+          run_job_action(state, lease, :requeue, result)
 
-      {:discard, reason} ->
-        Logger.info("Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}")
+        {:discard, reason} ->
+          Logger.info("Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}")
 
-        run_job_action(state, lease, :complete, result)
+          run_job_action(state, lease, :complete, result)
 
-      {:snooze, delay_ms} ->
-        run_job_action(state, lease, {:snooze, delay_ms}, result)
+        {:snooze, delay_ms} ->
+          run_job_action(state, lease, {:snooze, delay_ms}, result)
+      end
+
+    case action_result do
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to finalize job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}. " <>
+            "The lease remains active and the job will retry after it expires."
+        )
+
+      _ ->
+        :ok
     end
   end
 

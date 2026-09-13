@@ -1,6 +1,7 @@
 defmodule Bedrock.JobQueue.Consumer.Action do
   @moduledoc false
 
+  alias Bedrock.Internal.Repo, as: InternalRepo
   alias Bedrock.JobQueue.Store
 
   @type action :: :complete | :requeue | {:snooze, non_neg_integer()}
@@ -54,12 +55,25 @@ defmodule Bedrock.JobQueue.Consumer.Action do
   defp run_action_hook(action_hook, repo, root, lease, action, handler_result, queue_result) do
     hook_args = [repo, root, lease, action, handler_result, queue_result]
 
-    hook_result =
-      case action_hook do
-        {module, function} -> apply(module, function, hook_args)
-        {module, function, extra_args} when is_list(extra_args) -> apply(module, function, hook_args ++ extra_args)
-      end
+    action_hook
+    |> invoke_action_hook(hook_args)
+    |> normalize_action_hook_result()
+  end
 
+  defp invoke_action_hook(action_hook, hook_args) do
+    case action_hook do
+      {module, function} -> apply(module, function, hook_args)
+      {module, function, extra_args} when is_list(extra_args) -> apply(module, function, hook_args ++ extra_args)
+    end
+  rescue
+    exception -> {:error, {:exception, exception}}
+  catch
+    :throw, {InternalRepo, :rollback, _reason} = rollback -> throw(rollback)
+    :throw, reason -> {:error, {:throw, reason}}
+    :exit, reason -> {:error, {:exit, reason}}
+  end
+
+  defp normalize_action_hook_result(hook_result) do
     case hook_result do
       :ok -> :ok
       {:ok, _value} -> :ok

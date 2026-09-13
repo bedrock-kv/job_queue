@@ -126,6 +126,35 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     use Bedrock.Repo, cluster: UnusedCluster
   end
 
+  defmodule PreflightFailureRepo do
+    @state :manager_preflight_failure_repo
+
+    def transact(callback) do
+      case Agent.get(@state, & &1.phase) do
+        :dequeue ->
+          Agent.update(@state, &Map.put(&1, :phase, :preflight))
+          callback.()
+
+        :preflight ->
+          preflight_result = Agent.get(@state, & &1.preflight_result)
+          Agent.update(@state, &Map.put(&1, :phase, :after_preflight))
+          preflight_result.()
+
+        :after_preflight ->
+          Agent.update(@state, &Map.put(&1, :action_called?, true))
+          callback.()
+      end
+    end
+
+    def get(keyspace, key), do: MockRepo.get(keyspace, key)
+    def get_range(key_range, opts), do: MockRepo.get_range(key_range, opts)
+    def put(keyspace, key, value), do: MockRepo.put(keyspace, key, value)
+    def clear(keyspace, key), do: MockRepo.clear(keyspace, key)
+    def max(key, value), do: MockRepo.max(key, value)
+    def add(key, value), do: MockRepo.add(key, value)
+    def rollback(reason), do: MockRepo.rollback(reason)
+  end
+
   defmodule RecordingTransaction do
     @moduledoc false
     use GenServer
@@ -311,27 +340,11 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     end
 
     test "does not requeue a job when worker lease preflight is unavailable", ctx do
-      item = enqueue_item(ctx, "test:success")
-      {:ok, phase} = Agent.start_link(fn -> :dequeue end)
+      assert_preflight_does_not_requeue(ctx, fn -> {:error, :transaction_failed} end)
+    end
 
-      expect(MockRepo, :transact, 2, fn callback ->
-        Agent.get_and_update(phase, fn
-          :dequeue -> {callback.(), :preflight}
-          :preflight -> {{:error, :transaction_failed}, :done}
-        end)
-      end)
-
-      manager = start_manager(ctx)
-      send(manager, {:queue_ready, item.queue_id})
-
-      assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
-
-      keyspaces = Store.queue_keyspaces(ctx.root, item.queue_id)
-      assert lease_value = MockRepo.get(keyspaces.leases, item.id)
-      lease = :erlang.binary_to_term(lease_value)
-      lease_id = lease.id
-      assert leased_item_value = MockRepo.get(keyspaces.items, lease.item_key)
-      assert %Item{error_count: 0, lease_id: ^lease_id} = :erlang.binary_to_term(leased_item_value)
+    test "does not requeue a job when worker lease preflight raises", ctx do
+      assert_preflight_does_not_requeue(ctx, fn -> raise "preflight unavailable" end)
     end
 
     test "runs action hook inside successful queue action", ctx do
@@ -534,6 +547,39 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
   defp handler_result_for(:complete), do: :ok
   defp handler_result_for(:requeue), do: {:error, :failed}
+
+  defp assert_preflight_does_not_requeue(ctx, preflight_result) do
+    item = enqueue_item(ctx, "test:success")
+
+    {:ok, _state} =
+      Agent.start_link(
+        fn -> %{phase: :dequeue, preflight_result: preflight_result, action_called?: false} end,
+        name: :manager_preflight_failure_repo
+      )
+
+    on_exit(fn ->
+      if Process.whereis(:manager_preflight_failure_repo) do
+        try do
+          Agent.stop(:manager_preflight_failure_repo)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    manager = start_manager(ctx, repo: PreflightFailureRepo)
+    send(manager, {:queue_ready, item.queue_id})
+
+    assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+    refute Agent.get(:manager_preflight_failure_repo, & &1.action_called?)
+
+    keyspaces = Store.queue_keyspaces(ctx.root, item.queue_id)
+    assert lease_value = MockRepo.get(keyspaces.leases, item.id)
+    lease = :erlang.binary_to_term(lease_value)
+    lease_id = lease.id
+    assert leased_item_value = MockRepo.get(keyspaces.items, lease.item_key)
+    assert %Item{error_count: 0, lease_id: ^lease_id} = :erlang.binary_to_term(leased_item_value)
+  end
 
   defp assert_action_rolled_back(transaction) do
     assert_receive :nested_transaction

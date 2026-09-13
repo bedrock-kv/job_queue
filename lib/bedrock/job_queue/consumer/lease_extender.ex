@@ -97,13 +97,10 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
   end
 
   # Extends the lease. Missing/mismatched storage and lease expiry prove the
-  # worker no longer has an exclusive right to execute; transaction failures do
-  # not and are retried until the expiry deadline.
+  # worker no longer has an exclusive right to execute; transaction failures and
+  # exceptions do not and are retried until the expiry deadline.
   defp extend_lease(repo, root, lease, extension, clock) do
-    result =
-      repo.transact(fn ->
-        Store.extend_lease(repo, root, lease, extension, now: clock.())
-      end)
+    result = transaction_result(repo, fn -> Store.extend_lease(repo, root, lease, extension, now: clock.()) end)
 
     case result do
       {:ok, %Lease{} = updated_lease} ->
@@ -117,6 +114,17 @@ defmodule Bedrock.JobQueue.Consumer.LeaseExtender do
       {:error, reason} ->
         {:retry, reason}
     end
+  end
+
+  # An unavailable repository cannot establish that the lease was lost. Keep
+  # the linked extender alive so it can retry until expiry, where ownership is
+  # conclusively no longer safe to assume.
+  defp transaction_result(repo, callback) do
+    repo.transact(callback)
+  rescue
+    exception -> {:error, {:exception, exception}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp remaining_ms(lease, clock) do

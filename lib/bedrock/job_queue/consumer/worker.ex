@@ -72,12 +72,23 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   end
 
   defp execute_with_verified_lease(item, workers, %{repo: repo, root: root, lease: lease} = context) do
-    case repo.transact(fn -> Store.lease_owned?(repo, root, lease) end) do
+    case transaction_result(repo, fn -> Store.lease_owned?(repo, root, lease) end) do
       :ok -> execute_with_lease_guard(item, workers, context)
       {:error, reason} when reason in [:lease_not_found, :lease_mismatch, :lease_expired] ->
         {:cancelled, {:lease_lost, reason}}
       {:error, reason} -> {:deferred, {:lease_check_unavailable, reason}}
     end
+  end
+
+  # A failed preflight is not proof that ownership was lost. Returning a
+  # deferred result prevents an unavailable repository from consuming retry
+  # budget for a handler that never started.
+  defp transaction_result(repo, callback) do
+    repo.transact(callback)
+  rescue
+    exception -> {:error, {:exception, exception}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp execute_job(%Item{} = item, workers, lease) do

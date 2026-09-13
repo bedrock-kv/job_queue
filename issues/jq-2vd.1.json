@@ -1,5 +1,5 @@
 {
-  "assignee": "",
+  "assignee": "Jason Allum",
   "blocked_by": [],
   "blocks": [],
   "created": "2026-09-13T06:46:36Z",
@@ -8,7 +8,7 @@
   "labels": [],
   "parent": "jq-2vd",
   "priority": 1,
-  "status": "open",
+  "status": "in_progress",
   "title": "Roll back queue actions when on_action returns an error",
   "type": "bug",
   "updated_at": "2026-09-13T07:02:21Z"

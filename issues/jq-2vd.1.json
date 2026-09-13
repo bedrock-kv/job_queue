@@ -1,0 +1,15 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-09-13T06:46:36Z",
+  "description": "At v0.4.0, consumer/manager.ex:275-294 completes/requeues the item before invoking the action hook and propagates {:error, reason} as an ordinary return value. Bedrock.Internal.Repo.run_transaction/3 and try_to_commit/3 commit ordinary error returns. A failed hook can therefore delete the job and commit partial hook writes. Manager also ignores the returned action error. Use the repo rollback mechanism for hook failures and define recovery behavior. Reproduced the actual Bedrock transaction control path with a recording builder: {:error, :hook_failed} still invokes :commit. Add a transaction-level test proving the job and hook writes roll back together.",
+  "id": "jq-2vd.1",
+  "labels": [],
+  "parent": "jq-2vd",
+  "priority": 1,
+  "status": "open",
+  "title": "Roll back queue actions when on_action returns an error",
+  "type": "bug",
+  "updated_at": "2026-09-13T06:46:36Z"
+}

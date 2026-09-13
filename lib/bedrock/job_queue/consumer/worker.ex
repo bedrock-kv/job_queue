@@ -43,6 +43,8 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   - `{:snooze, delay_ms}` - Reschedule for later and count it in retry accounting
   - `{:error, :timeout}` - Job exceeded timeout, will be requeued
   - `{:discard, :no_handler}` - No worker configured for this topic
+  - `{:deferred, {:lease_check_unavailable, reason}}` - Ownership could not be
+    checked, so the handler was not run and the lease is left unchanged
 
   ## Timeout
 
@@ -74,7 +76,7 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
       :ok -> execute_with_lease_guard(item, workers, context)
       {:error, reason} when reason in [:lease_not_found, :lease_mismatch, :lease_expired] ->
         {:cancelled, {:lease_lost, reason}}
-      {:error, reason} -> {:error, {:lease_check_failed, reason}}
+      {:error, reason} -> {:deferred, {:lease_check_unavailable, reason}}
     end
   end
 

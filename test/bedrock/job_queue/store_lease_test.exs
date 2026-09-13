@@ -20,6 +20,21 @@ defmodule Bedrock.JobQueue.StoreLeaseTest do
     assert {:error, :lease_expired} = Store.extend_lease(MockRepo, root, lease, 100, now: 1_100)
   end
 
+  test "does not revive an expired stored lease from a caller lease with a future expiry" do
+    {root, item, expired_lease} = expired_lease()
+    caller_lease = %{expired_lease | expires_at: expired_lease.expires_at + 1_000}
+    keyspaces = Store.queue_keyspaces(root, item.queue_id)
+
+    expect(MockRepo, :get, fn keyspace, key ->
+      assert keyspace == keyspaces.leases
+      assert key == item.id
+      :erlang.term_to_binary(expired_lease)
+    end)
+
+    assert {:error, :lease_expired} =
+             Store.extend_lease(MockRepo, root, caller_lease, 100, now: expired_lease.expires_at)
+  end
+
   test "refuses to complete an expired lease without mutating queue state" do
     {root, item, lease} = expired_lease()
     keyspaces = Store.queue_keyspaces(root, item.queue_id)

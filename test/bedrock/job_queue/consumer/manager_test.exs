@@ -310,6 +310,30 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       assert Process.alive?(manager)
     end
 
+    test "does not requeue a job when worker lease preflight is unavailable", ctx do
+      item = enqueue_item(ctx, "test:success")
+      {:ok, phase} = Agent.start_link(fn -> :dequeue end)
+
+      expect(MockRepo, :transact, 2, fn callback ->
+        Agent.get_and_update(phase, fn
+          :dequeue -> {callback.(), :preflight}
+          :preflight -> {{:error, :transaction_failed}, :done}
+        end)
+      end)
+
+      manager = start_manager(ctx)
+      send(manager, {:queue_ready, item.queue_id})
+
+      assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+
+      keyspaces = Store.queue_keyspaces(ctx.root, item.queue_id)
+      assert lease_value = MockRepo.get(keyspaces.leases, item.id)
+      lease = :erlang.binary_to_term(lease_value)
+      lease_id = lease.id
+      assert leased_item_value = MockRepo.get(keyspaces.items, lease.item_key)
+      assert %Item{error_count: 0, lease_id: ^lease_id} = :erlang.binary_to_term(leased_item_value)
+    end
+
     test "runs action hook inside successful queue action", ctx do
       item = enqueue_item(ctx, "test:success")
       manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})

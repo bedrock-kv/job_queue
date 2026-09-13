@@ -430,9 +430,10 @@ defmodule Bedrock.JobQueue.Store do
   to prevent the item from becoming visible to other consumers.
 
   1. Validates lease exists and matches
-  2. Updates item's vesting_time to new expiry
-  3. Updates lease record with new expiry
-  4. Updates pointer index
+  2. Validates the stored lease has not expired
+  3. Updates item's vesting_time to new expiry
+  4. Updates lease record with new expiry
+  5. Updates pointer index
 
   ## Error Cases
 
@@ -452,7 +453,7 @@ defmodule Bedrock.JobQueue.Store do
     else
       keyspaces = queue_keyspaces(root, lease.queue_id)
 
-      case verify_lease(repo, keyspaces, lease) do
+      case verify_active_lease(repo, keyspaces, lease, now) do
         {:ok, stored_lease} ->
           do_extend_lease(repo, root, keyspaces, stored_lease, now + extension_ms, now)
 

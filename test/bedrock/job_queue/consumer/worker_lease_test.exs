@@ -120,6 +120,24 @@ defmodule Bedrock.JobQueue.Consumer.WorkerLeaseTest do
     refute_received :handler_ran
   end
 
+  test "defers without running the handler when preflight is unavailable" do
+    Process.register(self(), :worker_lease_test_process)
+
+    item = Item.new("tenant_1", "test:never_run", %{})
+    lease = Lease.new(item, "holder", duration_ms: 30_000)
+
+    expect(MockRepo, :transact, fn _callback -> {:error, :transaction_failed} end)
+
+    assert {:deferred, {:lease_check_unavailable, :transaction_failed}} =
+             Worker.execute(item, %{"test:never_run" => NeverRunJob},
+               repo: MockRepo,
+               root: Keyspace.new("job_queue/test/"),
+               lease: lease
+             )
+
+    refute_received :handler_ran
+  end
+
   test "kills the running handler when a transient renewal failure reaches expiry" do
     Process.register(self(), :worker_lease_test_process)
 

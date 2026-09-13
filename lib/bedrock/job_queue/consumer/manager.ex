@@ -283,6 +283,15 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
 
         process_pending(state)
 
+      {:deferred, {:lease_check_unavailable, reason}} ->
+        Logger.warning(
+          "Skipping queue action for job #{Base.encode16(lease.item_id, case: :lower)} because lease preflight is unavailable: #{inspect(reason)}"
+        )
+
+        # The handler never ran, so leave the active lease unchanged rather than
+        # consuming retry budget. The item becomes eligible again at lease expiry.
+        process_pending(state)
+
       _ ->
         action = action_for_worker_result(lease, handler_result)
 

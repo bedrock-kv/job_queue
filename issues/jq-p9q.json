@@ -1,0 +1,14 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-09-13T06:20:29Z",
+  "description": "Use the semver-compatible ~\u003e 0.7 constraint for Bedrock in the project and Coffee Shop Livebook.",
+  "id": "jq-p9q",
+  "labels": [],
+  "priority": 1,
+  "status": "open",
+  "title": "Broaden Bedrock constraints to 0.7",
+  "type": "task",
+  "updated_at": "2026-09-13T06:20:29Z"
+}

@@ -2,13 +2,14 @@
   "assignee": "Jason Allum",
   "blocked_by": [],
   "blocks": [],
+  "closed_at": "2026-09-13T06:02:46Z",
   "created": "2026-09-13T05:59:08Z",
   "description": "Replace explicit Git branch dependency references in the Coffee Shop Livebook with versioned Hex dependencies, preserving a runnable tutorial.",
   "id": "jq-8lw",
   "labels": [],
   "priority": 1,
-  "status": "in_progress",
+  "status": "closed",
   "title": "Remove hardcoded Git branches from Livebook dependencies",
   "type": "task",
-  "updated_at": "2026-09-13T05:59:13Z"
+  "updated_at": "2026-09-13T06:02:46Z"
 }

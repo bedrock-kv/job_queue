@@ -83,6 +83,27 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     end
   end
 
+  defmodule SelectiveLinkedChildCrashHook do
+    @moduledoc false
+
+    def apply(_repo, _root, lease, _action, _handler_result, _queue_result, failing_item_id, test_pid) do
+      if lease.item_id == failing_item_id do
+        child =
+          spawn_link(fn ->
+            receive do
+              :crash -> exit(:hook_child_crashed)
+            end
+          end)
+
+        send(test_pid, {:linked_hook_child, child})
+        :ok
+      else
+        send(test_pid, {:unrelated_job_completed, lease.item_id})
+        :ok
+      end
+    end
+  end
+
   defmodule UnusedCluster do
     @moduledoc false
     def link!, do: raise("the test always supplies an active transaction")
@@ -276,7 +297,63 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
           assert_receive {:unrelated_job_completed, unrelated_item_id}, 500
           assert unrelated_item_id == unrelated_item.id
-          assert_eventually(fn -> match?(%{task_info: %{}}, :sys.get_state(manager)) end, timeout: 500)
+          assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+        end)
+
+      assert Process.alive?(manager)
+      assert log =~ "Failed to finalize job"
+    end
+
+    test "isolates a linked hook-child crash and keeps unrelated jobs tracked", ctx do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+      on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+      transaction_calls = :counters.new(1, [])
+      test_pid = self()
+
+      expect(MockRepo, :transact, 4, fn callback ->
+        :counters.add(transaction_calls, 1, 1)
+
+        case :counters.get(transaction_calls, 1) do
+          1 ->
+            callback.()
+
+          2 ->
+            result = callback.()
+            send(test_pid, :action_transaction_ready)
+
+            receive do
+              :commit -> result
+            end
+
+          _ ->
+            callback.()
+        end
+      end)
+
+      failed_item = enqueue_item(ctx, "failed_queue", "test:success", %{})
+
+      manager =
+        start_manager(ctx,
+          action_hook: {SelectiveLinkedChildCrashHook, :apply, [failed_item.id, self()]}
+        )
+
+      log =
+        capture_log(fn ->
+          send(manager, {:queue_ready, failed_item.queue_id})
+
+          assert_receive {:linked_hook_child, child}, 500
+          assert_receive :action_transaction_ready, 500
+          send(child, :crash)
+
+          assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+
+          unrelated_item = enqueue_item(ctx, "unrelated_queue", "test:success", %{})
+          send(manager, {:queue_ready, unrelated_item.queue_id})
+
+          assert_receive {:unrelated_job_completed, unrelated_item_id}, 500
+          assert unrelated_item_id == unrelated_item.id
+          assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
         end)
 
       assert Process.alive?(manager)
@@ -400,4 +477,15 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   defp assert_abnormal_hook_reason(:raise, %RuntimeError{message: "hook raised"}), do: :ok
   defp assert_abnormal_hook_reason(:throw, :hook_thrown), do: :ok
   defp assert_abnormal_hook_reason(:exit, :hook_exited), do: :ok
+
+  defp manager_idle?(manager) do
+    if Process.alive?(manager) do
+      %{task_info: task_info} = :sys.get_state(manager)
+      task_info == %{}
+    else
+      false
+    end
+  catch
+    :exit, _reason -> false
+  end
 end

@@ -50,7 +50,7 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
     :holder_id,
     :backoff_fn,
     pending_queues: MapSet.new(),
-    # Maps task ref -> {lease, extender_pid} for tracking in-flight jobs
+    # Maps task ref -> worker or action task metadata.
     task_info: %{}
   ]
 
@@ -96,10 +96,14 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
         # Unknown task, ignore
         {:noreply, state}
 
-      {{lease, extender_pid}, task_info} ->
+      {{:worker, lease, extender_pid}, task_info} ->
         # Stop the lease extender
         LeaseExtender.stop(extender_pid)
-        handle_worker_result(state, lease, result)
+        state = %{state | task_info: task_info}
+        {:noreply, start_job_action(state, lease, result)}
+
+      {{:action, lease}, task_info} ->
+        handle_action_result(lease, result)
         state = %{state | task_info: task_info}
         {:noreply, process_pending(state)}
     end
@@ -112,11 +116,15 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
         # Unknown task, ignore
         {:noreply, state}
 
-      {{lease, extender_pid}, task_info} ->
+      {{:worker, lease, extender_pid}, task_info} ->
         # Stop the lease extender
         LeaseExtender.stop(extender_pid)
         Logger.error("Job task crashed: #{inspect(reason)}")
-        handle_worker_result(state, lease, {:error, {:crash, reason}})
+        state = %{state | task_info: task_info}
+        {:noreply, start_job_action(state, lease, {:error, {:crash, reason}})}
+
+      {{:action, lease}, task_info} ->
+        handle_action_result(lease, {:error, {:action_task_crashed, reason}})
         state = %{state | task_info: task_info}
         {:noreply, process_pending(state)}
     end
@@ -242,48 +250,54 @@ defmodule Bedrock.JobQueue.Consumer.Manager do
             [item, acc_state.workers]
           )
 
-        # Track the task ref -> {lease, extender_pid} mapping
-        %{acc_state | task_info: Map.put(acc_state.task_info, task.ref, {lease, extender_pid})}
+        # Track the worker task until it produces a result or exits.
+        %{acc_state | task_info: Map.put(acc_state.task_info, task.ref, {:worker, lease, extender_pid})}
       else
         acc_state
       end
     end)
   end
 
-  defp handle_worker_result(state, lease, result) do
-    action_result =
-      case result do
-        success when success in [:ok] or (is_tuple(success) and elem(success, 0) == :ok) ->
-          run_job_action(state, lease, :complete, result)
+  defp start_job_action(state, lease, handler_result) do
+    action = action_for_worker_result(lease, handler_result)
 
-        {:error, _reason} ->
-          run_job_action(state, lease, :requeue, result)
+    task =
+      Task.Supervisor.async_nolink(
+        state.worker_pool,
+        Action,
+        :run,
+        [
+          state.repo,
+          state.root,
+          lease,
+          action,
+          handler_result,
+          [action_hook: state.action_hook, backoff_fn: state.backoff_fn]
+        ]
+      )
 
-        {:discard, reason} ->
-          Logger.info("Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}")
-
-          run_job_action(state, lease, :complete, result)
-
-        {:snooze, delay_ms} ->
-          run_job_action(state, lease, {:snooze, delay_ms}, result)
-      end
-
-    case action_result do
-      {:error, reason} ->
-        Logger.warning(
-          "Failed to finalize job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}. " <>
-            "The lease remains active and the job will retry after it expires."
-        )
-
-      _ ->
-        :ok
-    end
+    %{state | task_info: Map.put(state.task_info, task.ref, {:action, lease})}
   end
 
-  defp run_job_action(state, lease, action, handler_result) do
-    Action.run(state.repo, state.root, lease, action, handler_result,
-      action_hook: state.action_hook,
-      backoff_fn: state.backoff_fn
+  defp action_for_worker_result(_lease, success)
+       when success in [:ok] or (is_tuple(success) and elem(success, 0) == :ok), do: :complete
+
+  defp action_for_worker_result(_lease, {:error, _reason}), do: :requeue
+
+  defp action_for_worker_result(lease, {:discard, reason}) do
+    Logger.info("Discarding job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}")
+    :complete
+  end
+
+  defp action_for_worker_result(_lease, {:snooze, delay_ms}), do: {:snooze, delay_ms}
+
+  defp handle_action_result(_lease, :ok), do: :ok
+  defp handle_action_result(_lease, {:ok, _status}), do: :ok
+
+  defp handle_action_result(lease, {:error, reason}) do
+    Logger.warning(
+      "Failed to finalize job #{Base.encode16(lease.item_id, case: :lower)}: #{inspect(reason)}. " <>
+        "The lease remains active and the job will retry after it expires."
     )
   end
 end

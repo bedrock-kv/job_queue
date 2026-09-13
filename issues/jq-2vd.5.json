@@ -1,16 +1,15 @@
 {
-  "assignee": "Jason Allum",
+  "assignee": "",
   "blocked_by": [],
   "blocks": [],
-  "closed_at": "2026-09-13T08:11:42Z",
   "created": "2026-09-13T06:46:36Z",
   "description": "LeaseExtender (consumer/lease_extender.ex:75-93) only logs lease_not_found, lease_mismatch, or expiry failures and continues looping with the old lease. It never signals Manager/Worker to stop execution, unlike QuiCK's worker flow. Worker.execute/2 also has no lease validation before invoking perform/2. After expiry/reacquisition, the old worker can continue external side effects concurrently with the new owner even though Store.complete/requeue will reject the old lease ID. Add explicit lease-loss signaling, pre-execution validation, and cancellation of the actual perform task; distinguish transient renewal failures before expiry from confirmed lost ownership. Review whether expired-but-unclaimed renewal should be supported (QuiCK permits it; Store.extend_lease currently rejects before reading storage).",
   "id": "jq-2vd.5",
   "labels": [],
   "parent": "jq-2vd",
   "priority": 1,
-  "status": "closed",
+  "status": "open",
   "title": "Stop job execution after losing its item lease",
   "type": "bug",
-  "updated_at": "2026-09-13T08:11:42Z"
+  "updated_at": "2026-09-13T08:18:19Z"
 }

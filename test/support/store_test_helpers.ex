@@ -30,6 +30,7 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
   alias Bedrock.JobQueue.Store
+  alias Bedrock.KeySelector
   alias Bedrock.Keyspace
 
   # ============================================================================
@@ -327,6 +328,11 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
       end)
     end)
 
+    stub(repo, :select, fn %KeySelector{} = selector ->
+      observe(observer, {:select, selector})
+      select_item(store_agent, selector)
+    end)
+
     stub(repo, :clear, fn %Keyspace{} = ks, key ->
       observe(observer, {:clear, ks, key})
       storage_key = {Keyspace.prefix(ks), key}
@@ -385,6 +391,34 @@ defmodule Bedrock.JobQueue.Test.StoreHelpers do
       |> Enum.map(&extract_key_value/1)
       |> Enum.sort()
       |> maybe_take(Keyword.get(opts, :limit))
+    end)
+  end
+
+  defp select_item(store_agent, %KeySelector{key: key, or_equal: or_equal, offset: offset}) do
+    Agent.get(store_agent, fn state ->
+      keys =
+        state
+        |> Enum.flat_map(fn
+          {{prefix, stored_key}, value} when is_binary(prefix) and is_tuple(stored_key) ->
+            [{prefix <> TupleEncoding.pack(stored_key), value}]
+
+          {{prefix, stored_key}, value} when is_binary(prefix) and is_binary(stored_key) ->
+            [{prefix <> stored_key, value}]
+
+          {stored_key, value} when is_binary(stored_key) ->
+            [{stored_key, value}]
+
+          _other ->
+            []
+        end)
+        |> Enum.sort_by(&elem(&1, 0))
+
+      first_greater_or_equal =
+        Enum.find_index(keys, fn {stored_key, _value} -> stored_key >= key end) || length(keys)
+
+      index = first_greater_or_equal + offset - if(or_equal, do: 0, else: 1)
+
+      if index < 0 or index >= length(keys), do: nil, else: Enum.at(keys, index)
     end)
   end
 

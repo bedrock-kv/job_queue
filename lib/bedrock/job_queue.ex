@@ -176,8 +176,11 @@ defmodule Bedrock.JobQueue do
       precondition. Older writers cannot observe a new fence key, so migration
       cannot safely begin as an automatic rolling upgrade.
 
+      The first call fixes the legacy snapshot at its current high-water key.
       Call repeatedly until it returns `:ready` or `:empty`; each call runs one
-      bounded transaction and processes at most one migration chunk.
+      bounded transaction and processes at most one migration chunk. Jobs
+      enqueued by current code during migration are indexed directly and do not
+      extend that fixed legacy scan.
       """
       def migrate_queue(queue_id, opts \\ []), do: Internal.migrate_queue(__MODULE__, queue_id, opts)
 

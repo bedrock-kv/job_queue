@@ -63,7 +63,9 @@ defmodule Bedrock.JobQueue.Internal do
   queue and ensure they cannot resume. The `:writer_fence` option is an
   explicit acknowledgement of that operational precondition; it cannot be
   enforced against an older binary that does not read the new fence marker.
-  Call repeatedly until the result is `:ready` or `:empty`.
+  The first call captures a fixed legacy high-water frontier, so current
+  writers do not make the bounded migration chase a live tail. Call repeatedly
+  until the result is `:ready` or `:empty`.
   """
   def migrate_queue(job_queue_module, queue_id, opts \\ []) do
     config = job_queue_module.__config__()

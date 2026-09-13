@@ -13,7 +13,7 @@ defmodule Bedrock.JobQueue.Store do
           priority_index/{sign, level, node} # -> earliest vesting time in priority range
           priority_index/{"root"}            # -> earliest vesting time in queue
           priority_index/{"initialized"}     # -> complete index marker
-          priority_index/{"migration"}       # -> fenced, resumable legacy cursor
+          priority_index/{"migration"}       # -> fenced, resumable {cursor, fixed frontier}
           identities/{item_id}           # -> canonical custom-ID Item
           identity_metadata/state         # -> current | legacy
           leases/{item_id}               # -> Lease
@@ -45,6 +45,7 @@ defmodule Bedrock.JobQueue.Store do
   alias Bedrock.JobQueue.Item
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
+  alias Bedrock.KeySelector
   alias Bedrock.Keyspace
 
   # The tuple encoder supports 64-bit magnitudes on either side of zero. Two
@@ -124,10 +125,11 @@ defmodule Bedrock.JobQueue.Store do
   resume. This is an operational precondition: an old writer cannot observe a
   new marker, so no in-band key can enforce the fence for it.
 
-  Call repeatedly until `:ready` or `:empty`. Each call scans at most
-  #{@migration_chunk_size} raw item rows. New-code writers may operate while
-  the status is `:migrating`; they update their priority leaf transactionally
-  but do not advance the migration cursor.
+  Call repeatedly until `:ready` or `:empty`. The first call captures the
+  last raw item key as a fixed snapshot frontier; each call scans at most
+  #{@migration_chunk_size} rows at or below that frontier. New-code writers
+  may operate while the status is `:migrating`; they update their priority leaf
+  transactionally but do not extend the legacy scan.
   """
   @spec migrate_priority_index(repo(), root_keyspace(), String.t(), keyword()) ::
           :more | :ready | :empty | {:error, :writer_fence_required}
@@ -143,8 +145,8 @@ defmodule Bedrock.JobQueue.Store do
         end
 
       :migrating ->
-        {:building, cursor} = migration_cursor(repo, keyspaces.priority_index)
-        advance_priority_migration(repo, keyspaces, cursor)
+        {:building, cursor, frontier} = migration_state(repo, keyspaces.priority_index)
+        advance_priority_migration(repo, keyspaces, cursor, frontier)
 
       :ready ->
         :ready
@@ -1149,9 +1151,15 @@ defmodule Bedrock.JobQueue.Store do
   defp priority_index_state(keyspaces, repo) do
     index = keyspaces.priority_index
 
-    case migration_cursor(repo, index) do
-      {:building, _cursor} ->
+    case migration_state(repo, index) do
+      {:building, _cursor, _frontier} ->
         :migrating
+
+      # A marker from the short-lived cursor-only format cannot prove a finite
+      # snapshot boundary. Hold it until the administrator re-establishes the
+      # writer fence and starts a fresh fixed-frontier migration.
+      {:building, _cursor} ->
+        :writer_fence_required
 
       nil ->
         initialized_priority_index_state(repo, keyspaces, index)
@@ -1187,23 +1195,29 @@ defmodule Bedrock.JobQueue.Store do
 
   defp start_priority_index_migration(repo, keyspaces) do
     index = keyspaces.priority_index
+    frontier = migration_frontier(repo, keyspaces.items)
     repo.clear_range(index)
-    put_migration_cursor(repo, index, nil)
-    advance_priority_migration(repo, keyspaces, nil)
+    put_migration_state(repo, index, nil, frontier)
+    advance_priority_migration(repo, keyspaces, nil, frontier)
   end
 
   defp advance_from_peek(repo, keyspaces, limit, now) do
-    {:building, cursor} = migration_cursor(repo, keyspaces.priority_index)
+    {:building, cursor, frontier} = migration_state(repo, keyspaces.priority_index)
 
-    case advance_priority_migration(repo, keyspaces, cursor) do
+    case advance_priority_migration(repo, keyspaces, cursor, frontier) do
       :more -> []
       :empty -> []
       :ready -> peek_ready_items(repo, keyspaces, limit, now)
     end
   end
 
-  defp advance_priority_migration(repo, keyspaces, cursor) do
-    {start_key, end_key} = migration_item_range(keyspaces.items, cursor)
+  # An empty start snapshot needs no raw scan: the selector read in the same
+  # transaction proved there was no item-keyspace row at the transition point.
+  # Later current-version writers maintain their leaves directly.
+  defp advance_priority_migration(repo, keyspaces, _cursor, nil), do: complete_priority_index_migration(repo, keyspaces)
+
+  defp advance_priority_migration(repo, keyspaces, cursor, frontier) do
+    {start_key, end_key} = migration_item_range(keyspaces.items, cursor, frontier)
 
     rows =
       {start_key, end_key}
@@ -1214,30 +1228,44 @@ defmodule Bedrock.JobQueue.Store do
 
     case List.last(rows) do
       nil ->
-        index = keyspaces.priority_index
-        repo.clear(index, @priority_index_migration_key)
-        put_priority_index_initialized(repo, index)
-        priority_index_state(keyspaces, repo)
+        complete_priority_index_migration(repo, keyspaces)
 
       {last_key, _value} ->
-        put_migration_cursor(repo, keyspaces.priority_index, last_key)
+        put_migration_state(repo, keyspaces.priority_index, last_key, frontier)
         :more
     end
   end
 
-  defp migration_item_range(item_keyspace, nil) do
-    item_keyspace
-    |> Keyspace.prefix()
-    |> Bedrock.KeyRange.from_prefix()
+  defp complete_priority_index_migration(repo, keyspaces) do
+    index = keyspaces.priority_index
+    repo.clear(index, @priority_index_migration_key)
+    put_priority_index_initialized(repo, index)
+    priority_index_state(keyspaces, repo)
   end
 
-  defp migration_item_range(item_keyspace, cursor) do
-    {_start_key, end_key} =
+  defp migration_frontier(repo, item_keyspace) do
+    {start_key, end_key} =
       item_keyspace
       |> Keyspace.prefix()
       |> Bedrock.KeyRange.from_prefix()
 
-    {Bedrock.Key.key_after(cursor), end_key}
+    case repo.select(KeySelector.last_less_than(end_key)) do
+      {key, _value} when key >= start_key and key < end_key -> key
+      _outside_item_keyspace_or_empty -> nil
+    end
+  end
+
+  defp migration_item_range(item_keyspace, nil, frontier) do
+    {start_key, _end_key} =
+      item_keyspace
+      |> Keyspace.prefix()
+      |> Bedrock.KeyRange.from_prefix()
+
+    {start_key, Bedrock.Key.key_after(frontier)}
+  end
+
+  defp migration_item_range(_item_keyspace, cursor, frontier) do
+    {Bedrock.Key.key_after(cursor), Bedrock.Key.key_after(frontier)}
   end
 
   defp merge_migrated_item(repo, keyspaces, {key, value}) do
@@ -1250,15 +1278,15 @@ defmodule Bedrock.JobQueue.Store do
 
   defp put_priority_index_initialized(repo, index), do: repo.put(index, @priority_index_initialized_key, "ready")
 
-  defp migration_cursor(repo, index) do
+  defp migration_state(repo, index) do
     case repo.get(index, @priority_index_migration_key) do
       nil -> nil
       value -> decode(value)
     end
   end
 
-  defp put_migration_cursor(repo, index, cursor),
-    do: repo.put(index, @priority_index_migration_key, encode({:building, cursor}))
+  defp put_migration_state(repo, index, cursor, frontier),
+    do: repo.put(index, @priority_index_migration_key, encode({:building, cursor, frontier}))
 
   defp require_priority_index(repo, keyspaces) do
     case priority_index_state(keyspaces, repo) do

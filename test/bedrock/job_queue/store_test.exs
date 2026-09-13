@@ -10,6 +10,7 @@ defmodule Bedrock.JobQueue.StoreTest do
   alias Bedrock.JobQueue.Lease
   alias Bedrock.JobQueue.QueueLease
   alias Bedrock.JobQueue.Store
+  alias Bedrock.KeySelector
   alias Bedrock.Keyspace
 
   setup :verify_on_exit!
@@ -27,6 +28,7 @@ defmodule Bedrock.JobQueue.StoreTest do
     stub(MockRepo, :put, fn _keyspace, _key, _value -> :ok end)
     stub(MockRepo, :clear, fn _keyspace, _key -> :ok end)
     stub(MockRepo, :clear_range, fn _range -> :ok end)
+    stub(MockRepo, :select, fn _selector -> nil end)
     stub(MockRepo, :get_range, fn _range, _opts -> [] end)
     :ok
   end
@@ -563,6 +565,100 @@ defmodule Bedrock.JobQueue.StoreTest do
       assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
     end
 
+    test "finishes the fixed legacy snapshot despite current writers at its tail" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "fixed-migration-frontier"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      # These are the complete pre-fence snapshot. The first bounded chunk
+      # consumes all eight rows, but only the following empty chunk proves it
+      # has reached the stored high-water frontier.
+      for priority <- 0..7 do
+        store_item(
+          store,
+          keyspaces.items,
+          Item.new(queue_id, "legacy", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 10_000
+          )
+        )
+      end
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+
+      # New-version work may arrive continuously after the migration begins.
+      # Its direct leaf maintenance makes it visible without extending the
+      # legacy cursor's fixed snapshot.
+      current_items =
+        for priority <- 100..107 do
+          item =
+            Item.new(queue_id, "current", %{},
+              priority: priority,
+              vesting_time: now
+            )
+
+          assert :ok = Store.enqueue(MockRepo, root(), item, now: now)
+          item
+        end
+
+      # A live-tail scan would consume these eight current rows and return
+      # :more. A fixed frontier completes now, then exposes their exact index.
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      assert Enum.map(Store.peek(MockRepo, root(), queue_id, now: now), & &1.id) ==
+               Enum.map(current_items, & &1.id)
+
+      assert Store.min_vesting_time(MockRepo, root(), queue_id) == now
+    end
+
+    test "uses an empty frontier when no item row exists" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store, [], observer: self())
+
+      queue_id = "empty-migration-frontier"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+
+      # A selector is global, so it can resolve to an unrelated key before the
+      # item prefix. That must not become this queue's frontier.
+      MockRepo.put(keyspaces.identities, "unrelated", "value")
+
+      assert :empty = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :empty = Store.priority_index_status(MockRepo, root(), queue_id)
+
+      operations = drain_store_operations()
+      assert [{:select, %KeySelector{}}] = Enum.filter(operations, &match?({:select, _}, &1))
+      refute Enum.any?(operations, &match?({:get_range, {_, _}, _}, &1))
+    end
+
+    test "holds a cursor-only migration marker until the administrator re-fences it" do
+      {:ok, store} = start_mock_store()
+      setup_integration_stubs(MockRepo, store)
+
+      now = 10_000
+      queue_id = "cursor-only-migration-marker"
+      keyspaces = Store.queue_keyspaces(root(), queue_id)
+      item = Item.new(queue_id, "legacy", %{}, priority: 0, vesting_time: now)
+      store_item(store, keyspaces.items, item)
+
+      # A prior cursor-only marker cannot establish the finite boundary needed
+      # by this migration format, so it never becomes a dispatch source.
+      MockRepo.put(keyspaces.priority_index, {"migration"}, :erlang.term_to_binary({:building, nil}))
+
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, root(), queue_id)
+      assert [] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert {:error, :writer_fence_required} = Store.migrate_priority_index(MockRepo, root(), queue_id)
+
+      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
+      assert [%Item{id: item_id}] = Store.peek(MockRepo, root(), queue_id, now: now)
+      assert item_id == item.id
+    end
+
     test "migrates an upgraded queue in fixed chunks before dispatching or reporting an exact minimum" do
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
@@ -648,9 +744,13 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       operations = drain_store_operations()
 
+      assert [{:select, %KeySelector{key: selector_key, or_equal: false, offset: 0}}] =
+               Enum.filter(operations, &match?({:select, %KeySelector{}}, &1))
+
       assert [{:get_range, {_start_key, _end_key}, opts}] =
                Enum.filter(operations, &match?({:get_range, {_, _}, _}, &1))
 
+      assert selector_key == elem(Bedrock.KeyRange.from_prefix(Keyspace.prefix(keyspaces.items)), 1)
       assert opts[:limit] == @migration_chunk_size
 
       index_point_operations =
@@ -685,13 +785,18 @@ defmodule Bedrock.JobQueue.StoreTest do
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 
-      # A real transaction retry rolls back both the tree writes and cursor
+      # A real transaction retry rolls back both the tree writes and marker
       # update. Replaying this already-merged chunk is stricter: it proves the
       # merge itself is idempotent even if only the cursor is retried.
+      {:building, _cursor, frontier} =
+        keyspaces.priority_index
+        |> MockRepo.get({"migration"})
+        |> :erlang.binary_to_term()
+
       MockRepo.put(
         keyspaces.priority_index,
         {"migration"},
-        :erlang.term_to_binary({:building, nil})
+        :erlang.term_to_binary({:building, nil, frontier})
       )
 
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
@@ -734,13 +839,11 @@ defmodule Bedrock.JobQueue.StoreTest do
       before_cursor = Item.new(queue_id, "before", %{}, priority: -1, vesting_time: now)
       assert :ok = Store.enqueue(MockRepo, root(), before_cursor, now: now)
 
-      # This item is behind the cursor. It is refreshed directly and will also
-      # be observed by a later migration chunk without corrupting the final
-      # index.
+      # This item is beyond the snapshot frontier. It is refreshed directly,
+      # and the fixed migration never chases it as a live tail.
       behind_cursor = Item.new(queue_id, "behind", %{}, priority: 100, vesting_time: now)
       assert :ok = Store.enqueue(MockRepo, root(), behind_cursor, now: now)
 
-      assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :more = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
       assert :ready = Store.migrate_priority_index(MockRepo, root(), queue_id, writer_fence: :offline)
 

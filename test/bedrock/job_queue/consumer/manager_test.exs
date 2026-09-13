@@ -295,6 +295,57 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
              end)
     end
 
+    test "completes a fixed migration frontier and dispatches current ready work without rescheduling", ctx do
+      now = System.system_time(:millisecond)
+      queue_id = "fixed-migration-frontier"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+
+      # Seed exactly one legacy chunk. The explicit operator transition scans
+      # it before current-version writers resume.
+      for priority <- 0..7 do
+        store_item(
+          ctx.store,
+          keyspaces.items,
+          Item.new(queue_id, "test:success", %{},
+            id: <<priority::128>>,
+            priority: priority,
+            vesting_time: now + 60_000
+          )
+        )
+      end
+
+      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
+
+      current =
+        Item.new(queue_id, "test:success", %{},
+          priority: 100,
+          vesting_time: now
+        )
+
+      assert :ok = Store.enqueue(MockRepo, ctx.root, current, now: now)
+
+      # There is one manager dequeue transaction and one successful action
+      # transaction. A live-tail migration would queue another dequeue callback
+      # before dispatching this current item.
+      transaction_calls = :counters.new(1, [])
+
+      stub(MockRepo, :transact, fn callback ->
+        :counters.add(transaction_calls, 1, 1)
+        callback.()
+      end)
+
+      manager = start_manager(ctx, action_hook: {ActionHook, :apply, [self()]})
+      send(manager, {:queue_ready, queue_id})
+
+      assert_receive {:action_hook, MockRepo, _root, current_id, :complete, :ok, :ok}, 500
+      assert current_id == current.id
+      assert_eventually(fn -> manager_idle?(manager) end, timeout: 500)
+      assert :ready = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+      assert :counters.get(transaction_calls, 1) == 2
+      assert %{pending_queues: pending_queues} = :sys.get_state(manager)
+      assert pending_queues == MapSet.new()
+    end
+
     test "handles task crash with :DOWN message", ctx do
       _item = enqueue_item(ctx, "test:crash")
       manager = start_manager(ctx)

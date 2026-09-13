@@ -319,6 +319,31 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
              end)
     end
 
+    test "holds invalid v2 migration marker bytes without crashing or mutating pointers", ctx do
+      queue_id = "invalid-v2-marker-bytes"
+      keyspaces = Store.queue_keyspaces(ctx.root, queue_id)
+      MockRepo.put(keyspaces.priority_index, {"migration"}, <<0, 1, 2, 3>>)
+      manager = start_manager(ctx)
+
+      send(manager, {:queue_ready, queue_id})
+      Process.sleep(50)
+      _ = :sys.get_state(manager)
+
+      assert Process.alive?(manager)
+      assert :writer_fence_required = Store.priority_index_status(MockRepo, ctx.root, queue_id)
+
+      refute Agent.get(ctx.store, fn state ->
+               Enum.any?(state, fn
+                 {{prefix, key}, _value} ->
+                   (prefix == Keyspace.prefix(keyspaces.priority_index) and key != {"migration"}) or
+                     prefix == Keyspace.prefix(Store.pointer_keyspace(ctx.root))
+
+                 _ ->
+                   false
+               end)
+             end)
+    end
+
     test "holds an offline migration without self-rescheduling, then dispatches after admin completion", ctx do
       now = System.system_time(:millisecond)
       queue_id = "offline-migration-hold"

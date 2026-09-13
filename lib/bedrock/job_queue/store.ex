@@ -1288,9 +1288,26 @@ defmodule Bedrock.JobQueue.Store do
   defp migration_state(repo, index) do
     case repo.get(index, @priority_index_migration_key) do
       nil -> nil
-      value -> decode(value)
+      value -> decode_migration_state(value)
     end
   end
+
+  # Migration state is control-plane data read before any queue operation.
+  # Deserialize it with :safe so arbitrary persisted bytes cannot create atoms,
+  # and collapse invalid or unsupported values to one fenced sentinel. A
+  # present marker must never be mistaken for an absent marker.
+  defp decode_migration_state(value) when is_binary(value) do
+    value
+    |> :erlang.binary_to_term([:safe])
+    |> normalize_migration_state()
+  rescue
+    ArgumentError -> :invalid_migration_marker
+  end
+
+  defp decode_migration_state(_value), do: :invalid_migration_marker
+
+  defp normalize_migration_state({:offline_building, cursor}), do: {:offline_building, cursor}
+  defp normalize_migration_state(_other_marker), do: :invalid_migration_marker
 
   defp put_migration_state(repo, index, cursor),
     do: repo.put(index, @priority_index_migration_key, encode({:offline_building, cursor}))

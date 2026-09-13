@@ -911,6 +911,10 @@ defmodule Bedrock.JobQueue.StoreTest do
                   :erlang.term_to_binary({:offline_building, :not_a_key})}
                ]
              end},
+            {"invalid-v2-marker-bytes",
+             fn keyspaces, _item ->
+               [{Keyspace.pack(keyspaces.priority_index, {"migration"}), <<0, 1, 2, 3>>}]
+             end},
             {"markerless-v1-legacy",
              fn keyspaces, item ->
                [{Keyspace.pack(keyspaces.items, Item.key(item)), :erlang.term_to_binary(item)}]
@@ -926,6 +930,11 @@ defmodule Bedrock.JobQueue.StoreTest do
           assert :writer_fence_required =
                    TxVisibilityRepo.transact(fn ->
                      Store.priority_index_status(TxVisibilityRepo, root(), queue_id)
+                   end)
+
+          assert [] =
+                   TxVisibilityRepo.transact(fn ->
+                     Store.peek(TxVisibilityRepo, root(), queue_id, now: now)
                    end)
 
           assert {:error, :priority_index_migration_required} =

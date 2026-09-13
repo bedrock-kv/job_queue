@@ -278,13 +278,14 @@ defmodule Bedrock.JobQueue.InternalTest do
   end
 
   describe "migrate_queue/2" do
-    test "runs one explicit writer-fenced migration chunk in a transaction" do
+    test "runs each writer-fenced capture phase in its own transaction" do
       :persistent_term.erase({Internal, TestJobQueue})
       {:ok, store} = start_mock_store()
       setup_integration_stubs(MockRepo, store)
 
-      expect(MockRepo, :transact, fn callback -> callback.() end)
+      expect(MockRepo, :transact, 2, fn callback -> callback.() end)
 
+      assert :more = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
       assert :empty = TestJobQueue.migrate_queue("tenant_1", writer_fence: :offline)
     end
 

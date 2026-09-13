@@ -315,6 +315,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
       end
 
       assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
+      assert :more = Store.migrate_priority_index(MockRepo, ctx.root, queue_id, writer_fence: :offline)
 
       current =
         Item.new(queue_id, "test:success", %{},

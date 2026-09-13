@@ -10,6 +10,7 @@ defmodule Bedrock.JobQueue.Store do
       job_queue/
         queues/{queue_id}/
           items/                         # {priority, vesting_time, id} -> Item
+          items0                         # reserved transient migration boundary
           priority_index/{sign, level, node} # -> earliest vesting time in priority range
           priority_index/{"root"}            # -> earliest vesting time in queue
           priority_index/{"initialized"}     # -> complete index marker
@@ -57,6 +58,7 @@ defmodule Bedrock.JobQueue.Store do
   @migration_chunk_size 8
   @priority_index_initialized_key {"initialized"}
   @priority_index_migration_key {"migration"}
+  @migration_frontier_sentinel_value "bedrock_job_queue:migration_frontier:v1"
 
   @type repo :: module()
   @type root_keyspace :: Keyspace.t()
@@ -105,10 +107,11 @@ defmodule Bedrock.JobQueue.Store do
   @doc """
   Returns the scheduling-index state for a queue.
 
-  `:writer_fence_required` means the queue contains pre-index work (or an
-  untrusted pre-marker index). It is deliberately held until an administrator
-  calls `migrate_priority_index/4` after fencing all old writers. A marker
-  written by new code cannot fence an older writer that does not read it.
+  `:writer_fence_required` means the queue contains pre-index work, a staged
+  frontier capture, or an untrusted pre-marker index. It is deliberately held
+  until an administrator calls `migrate_priority_index/4` after fencing all
+  old writers. A marker written by new code cannot fence an older writer that
+  does not read it.
   """
   @spec priority_index_status(repo(), root_keyspace(), String.t()) :: priority_index_status()
   def priority_index_status(repo, root, queue_id) do
@@ -125,21 +128,35 @@ defmodule Bedrock.JobQueue.Store do
   resume. This is an operational precondition: an old writer cannot observe a
   new marker, so no in-band key can enforce the fence for it.
 
-  Call repeatedly until `:ready` or `:empty`. The first call captures the
-  last raw item key as a fixed snapshot frontier; each call scans at most
-  #{@migration_chunk_size} rows at or below that frontier. New-code writers
-  may operate while the status is `:migrating`; they update their priority leaf
-  transactionally but do not extend the legacy scan.
+  Call repeatedly until `:ready` or `:empty`. The first call installs a
+  reserved item-range-end sentinel while the queue remains held; the next call
+  uses that committed sentinel to capture the last raw item key as a fixed
+  snapshot frontier. Each later call scans at most #{@migration_chunk_size}
+  rows at or below that frontier. New-code writers may operate once the status
+  is `:migrating`; they update their priority leaf transactionally but do not
+  extend the legacy scan.
   """
   @spec migrate_priority_index(repo(), root_keyspace(), String.t(), keyword()) ::
           :more | :ready | :empty | {:error, :writer_fence_required}
   def migrate_priority_index(repo, root, queue_id, opts \\ []) do
     keyspaces = queue_keyspaces(root, queue_id)
 
-    case priority_index_state(keyspaces, repo) do
+    migration_state = migration_state(repo, keyspaces.priority_index)
+
+    case migration_state do
+      :capturing_frontier ->
+        capture_priority_index_frontier(repo, keyspaces)
+
+      _not_capturing_frontier ->
+        migrate_priority_index_state(repo, keyspaces, migration_state, opts)
+    end
+  end
+
+  defp migrate_priority_index_state(repo, keyspaces, migration_state, opts) do
+    case priority_index_state(keyspaces, repo, migration_state) do
       :writer_fence_required ->
         if Keyword.get(opts, :writer_fence) == :offline do
-          start_priority_index_migration(repo, keyspaces)
+          prepare_priority_index_frontier(repo, keyspaces)
         else
           {:error, :writer_fence_required}
         end
@@ -1149,9 +1166,16 @@ defmodule Bedrock.JobQueue.Store do
   # pre-index writer cannot see or obey a new marker, so only an explicitly
   # writer-fenced administrator may transition it to :migrating.
   defp priority_index_state(keyspaces, repo) do
+    priority_index_state(keyspaces, repo, migration_state(repo, keyspaces.priority_index))
+  end
+
+  defp priority_index_state(keyspaces, repo, migration_state) do
     index = keyspaces.priority_index
 
-    case migration_state(repo, index) do
+    case migration_state do
+      :capturing_frontier ->
+        :writer_fence_required
+
       {:building, _cursor, _frontier} ->
         :migrating
 
@@ -1177,28 +1201,87 @@ defmodule Bedrock.JobQueue.Store do
   # Initializing a truly empty queue is safe and ergonomic: the bounded empty
   # range read and marker write are in the caller's transaction. A nonempty
   # marker-less queue is held instead of guessing that no old writer exists.
+  # A staged migration is also held even when the item range is empty: its raw
+  # boundary sentinel is outside that range, so status alone must preserve the
+  # fence until capture has either completed or been retried.
   defp initialize_empty_priority_index(repo, keyspaces) do
-    case priority_index_state(keyspaces, repo) do
-      :writer_fence_required ->
-        if keyspace_has_entries?(repo, keyspaces.items) do
-          {:error, :priority_index_migration_required}
-        else
-          repo.clear_range(keyspaces.priority_index)
-          put_priority_index_initialized(repo, keyspaces.priority_index)
-          :ok
-        end
+    migration_state = migration_state(repo, keyspaces.priority_index)
 
-      _current_or_migrating ->
-        :ok
+    case migration_state do
+      :capturing_frontier ->
+        {:error, :priority_index_migration_required}
+
+      _not_capturing_frontier ->
+        initialize_empty_priority_index_state(repo, keyspaces, migration_state)
     end
   end
 
-  defp start_priority_index_migration(repo, keyspaces) do
+  defp initialize_empty_priority_index_state(repo, keyspaces, migration_state) do
+    case priority_index_state(keyspaces, repo, migration_state) do
+      :writer_fence_required -> initialize_empty_legacy_priority_index(repo, keyspaces)
+      _current_or_migrating -> :ok
+    end
+  end
+
+  defp initialize_empty_legacy_priority_index(repo, keyspaces) do
+    if keyspace_has_entries?(repo, keyspaces.items) do
+      {:error, :priority_index_migration_required}
+    else
+      repo.clear_range(keyspaces.priority_index)
+      put_priority_index_initialized(repo, keyspaces.priority_index)
+      :ok
+    end
+  end
+
+  # KeySelector's pinned Olivine implementation resolves a predecessor exactly
+  # only when its anchor key exists. Install that anchor in one transaction,
+  # while retaining :writer_fence_required so current writers cannot race the
+  # snapshot. The following call captures the predecessor and removes it.
+  defp prepare_priority_index_frontier(repo, keyspaces) do
     index = keyspaces.priority_index
-    frontier = migration_frontier(repo, keyspaces.items)
+    put_migration_frontier_sentinel(repo, keyspaces.items)
     repo.clear_range(index)
-    put_migration_state(repo, index, nil, frontier)
-    advance_priority_migration(repo, keyspaces, nil, frontier)
+    put_migration_capture_state(repo, index)
+    :more
+  end
+
+  defp capture_priority_index_frontier(repo, keyspaces) do
+    index = keyspaces.priority_index
+
+    if migration_frontier_sentinel?(repo, keyspaces.items) do
+      frontier = migration_frontier(repo, keyspaces.items)
+      clear_migration_frontier_sentinel(repo, keyspaces.items)
+      put_migration_state(repo, index, nil, frontier)
+      advance_priority_migration(repo, keyspaces, nil, frontier)
+    else
+      # A capture marker and its sentinel are committed atomically. If an
+      # operator removed the reserved key, recreate it while preserving the
+      # hold; never guess a frontier from an absent selector anchor.
+      prepare_priority_index_frontier(repo, keyspaces)
+    end
+  end
+
+  defp put_migration_frontier_sentinel(repo, item_keyspace) do
+    repo.put(Keyspace.new(""), migration_frontier_sentinel_key(item_keyspace), @migration_frontier_sentinel_value)
+  end
+
+  defp migration_frontier_sentinel?(repo, item_keyspace) do
+    repo.get(Keyspace.new(""), migration_frontier_sentinel_key(item_keyspace)) == @migration_frontier_sentinel_value
+  end
+
+  defp clear_migration_frontier_sentinel(repo, item_keyspace) do
+    repo.clear(Keyspace.new(""), migration_frontier_sentinel_key(item_keyspace))
+  end
+
+  defp migration_frontier_sentinel_key(item_keyspace) do
+    item_keyspace
+    |> Keyspace.prefix()
+    |> Bedrock.KeyRange.from_prefix()
+    |> elem(1)
+  end
+
+  defp put_migration_capture_state(repo, index) do
+    repo.put(index, @priority_index_migration_key, encode(:capturing_frontier))
   end
 
   defp advance_from_peek(repo, keyspaces, limit, now) do
@@ -1249,7 +1332,7 @@ defmodule Bedrock.JobQueue.Store do
       |> Keyspace.prefix()
       |> Bedrock.KeyRange.from_prefix()
 
-    case repo.select(KeySelector.last_less_than(end_key)) do
+    case repo.select(KeySelector.last_less_or_equal(end_key)) do
       {key, _value} when key >= start_key and key < end_key -> key
       _outside_item_keyspace_or_empty -> nil
     end

@@ -31,6 +31,19 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
     def timeout, do: 1000
   end
 
+  defmodule BlockingJob do
+    def perform(_args, _meta) do
+      Process.register(self(), :manager_lifecycle_handler)
+      send(:manager_lifecycle_test_process, {:handler_started, self()})
+
+      receive do
+        :finish -> :ok
+      end
+    end
+
+    def timeout, do: 1_000
+  end
+
   defmodule ActionHook do
     @moduledoc false
     def apply(repo, root, lease, action, handler_result, queue_result, test_pid) do
@@ -177,7 +190,8 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
 
     workers = %{
       "test:success" => SuccessJob,
-      "test:crash" => CrashingJob
+      "test:crash" => CrashingJob,
+      "test:blocking" => BlockingJob
     }
 
     %{
@@ -232,6 +246,7 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
         end)
 
       assert log =~ "Job task crashed"
+      assert Process.alive?(manager)
     end
 
     test "ignores unknown task reference", ctx do
@@ -258,6 +273,31 @@ defmodule Bedrock.JobQueue.Consumer.ManagerTest do
   end
 
   describe "queue processing" do
+    test "terminates an in-flight handler when the manager stops", ctx do
+      Process.register(self(), :manager_lifecycle_test_process)
+
+      on_exit(fn ->
+        if handler = Process.whereis(:manager_lifecycle_handler) do
+          Process.exit(handler, :kill)
+        end
+      end)
+
+      _item = enqueue_item(ctx, "test:blocking")
+      manager = start_manager(ctx)
+      manager_ref = Process.monitor(manager)
+      Process.unlink(manager)
+
+      send(manager, {:queue_ready, "tenant_1"})
+
+      assert_receive {:handler_started, handler_pid}
+      handler_ref = Process.monitor(handler_pid)
+
+      :ok = GenServer.stop(manager, :shutdown)
+
+      assert_receive {:DOWN, ^manager_ref, :process, ^manager, :shutdown}
+      assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, _reason}
+    end
+
     test "handles no available workers", ctx do
       # Fill up worker slots
       _item = enqueue_item(ctx, "test:success")

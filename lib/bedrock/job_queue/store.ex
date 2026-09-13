@@ -436,27 +436,29 @@ defmodule Bedrock.JobQueue.Store do
 
   ## Error Cases
 
+  - `{:error, :lease_expired}` - Lease expiry has passed
   - `{:error, :lease_not_found}` - No lease record exists for this item
   - `{:error, :lease_mismatch}` - Lease ID doesn't match stored lease
   - `{:error, :item_not_found}` - Item no longer exists in queue
-
-  An expired lease may still be extended if it has not been replaced. This is
-  safe because the stored lease ID is verified transactionally before the
-  extension is written.
   """
   @spec extend_lease(repo(), root_keyspace(), Lease.t(), pos_integer(), keyword()) ::
           {:ok, Lease.t()}
-          | {:error, :lease_not_found | :lease_mismatch | :item_not_found}
+          | {:error, :lease_not_found | :lease_mismatch | :lease_expired | :item_not_found}
   def extend_lease(repo, root, %Lease{} = lease, extension_ms, opts \\ []) do
     now = Keyword.get(opts, :now) || System.system_time(:millisecond)
-    keyspaces = queue_keyspaces(root, lease.queue_id)
 
-    case verify_lease(repo, keyspaces, lease) do
-      {:ok, stored_lease} ->
-        do_extend_lease(repo, root, keyspaces, stored_lease, now + extension_ms, now)
+    if lease.expires_at <= now do
+      {:error, :lease_expired}
+    else
+      keyspaces = queue_keyspaces(root, lease.queue_id)
 
-      error ->
-        error
+      case verify_lease(repo, keyspaces, lease) do
+        {:ok, stored_lease} ->
+          do_extend_lease(repo, root, keyspaces, stored_lease, now + extension_ms, now)
+
+        error ->
+          error
+      end
     end
   end
 

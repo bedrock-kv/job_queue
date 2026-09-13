@@ -49,6 +49,14 @@ defmodule Bedrock.JobQueue.Consumer.Worker do
   Jobs are executed with a timeout (default 30 seconds). If the job module
   implements `timeout/0`, that value is used instead. On timeout, the job
   is killed and `{:error, :timeout}` is returned.
+
+  ## Lease boundary
+
+  Before invoking a handler, a worker confirms that it owns an unexpired lease.
+  It also kills the handler when the extender reports lease loss or expiry.
+  This bounds further handler execution, but cannot undo external side effects
+  the handler performed before cancellation. Job handlers must remain
+  idempotent when they interact with systems outside the queue transaction.
   """
   @spec execute(Item.t(), map(), keyword()) :: term()
   def execute(%Item{} = item, workers, opts \\ []) when is_map(workers) do

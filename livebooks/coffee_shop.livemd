@@ -3,7 +3,7 @@
 ```elixir
 Mix.install([
   {:bedrock, "~> 0.7"},
-  {:bedrock_job_queue, github: "bedrock-kv/job_queue"},
+  {:bedrock_job_queue, "~> 0.4"},
   {:kino, "~> 0.16.0"}
 ])
 ```

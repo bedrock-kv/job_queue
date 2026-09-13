@@ -2,8 +2,8 @@
 
 ```elixir
 Mix.install([
-  {:bedrock, "~> 0.5"},
-  {:bedrock_job_queue, "~> 0.3"},
+  {:bedrock, github: "bedrock-kv/bedrock", branch: "develop"},
+  {:bedrock_job_queue, github: "bedrock-kv/job_queue", branch: "main"},
   {:kino, "~> 0.16.0"}
 ])
 ```
@@ -25,15 +25,28 @@ First, let's set up our Bedrock cluster. This gives us a reliable storage layer 
 working_dir = Path.join(System.tmp_dir!(), "coffee_shop_#{:rand.uniform(99999)}")
 File.mkdir_p!(working_dir)
 
+# Materializer snapshots use Bedrock's configured object-store backend. Keep
+# them in this tutorial's temporary directory instead of the shared default.
+Application.put_env(
+  :bedrock,
+  Bedrock.ObjectStorage,
+  backend: Bedrock.ObjectStorage.backend(Bedrock.ObjectStorage.LocalFilesystem,
+    root: Path.join(working_dir, "object_storage")
+  )
+)
+
 defmodule CoffeeShop.Cluster do
   use Bedrock.Cluster,
     otp_app: :coffee_shop,
     name: "coffee_shop",
     config: [
-      capabilities: [:coordination, :log, :storage],
+      # This tutorial runs a single local node. Production clusters should use
+      # Bedrock's default `:strict` durability mode instead.
+      durability_mode: :relaxed,
+      capabilities: [:coordination, :log, :materializer],
       trace: [],
       coordinator: [path: working_dir],
-      storage: [path: working_dir],
+      materializer: [path: working_dir],
       log: [path: working_dir]
     ]
 end
@@ -56,12 +69,9 @@ Quick test to make sure everything works:
 <!-- livebook:{"reevaluate_automatically":true} -->
 
 ```elixir
-alias Bedrock.JobQueue.Job
-alias CoffeeShop.{Repo, JobQueue}
+CoffeeShop.Repo.transact(fn -> CoffeeShop.Repo.put("test", "coffee ready") end)
 
-Repo.transact(fn -> Repo.put("test", "coffee ready") end)
-
-result = Repo.transact(fn -> Repo.get("test") end)
+result = CoffeeShop.Repo.transact(fn -> CoffeeShop.Repo.get("test") end)
 "Coffee status: #{result}"
 ```
 
@@ -85,7 +95,7 @@ Each job type is a module with a `perform/2` callback. The second argument is me
 
 ```elixir
 defmodule CoffeeShop.Jobs.OrderConfirmation do
-  use Job,
+  use Bedrock.JobQueue.Job,
     topic: "order:confirm",
     priority: 100
 
@@ -98,7 +108,7 @@ defmodule CoffeeShop.Jobs.OrderConfirmation do
 end
 
 defmodule CoffeeShop.Jobs.BrewingStarted do
-  use Job,
+  use Bedrock.JobQueue.Job,
     topic: "order:brewing",
     priority: 50
 
@@ -111,7 +121,7 @@ defmodule CoffeeShop.Jobs.BrewingStarted do
 end
 
 defmodule CoffeeShop.Jobs.ReadyForPickup do
-  use Job,
+  use Bedrock.JobQueue.Job,
     topic: "order:ready",
     priority: 10
 
@@ -124,7 +134,7 @@ defmodule CoffeeShop.Jobs.ReadyForPickup do
 end
 
 defmodule CoffeeShop.Jobs.EspressoShot do
-  use Job,
+  use Bedrock.JobQueue.Job,
     topic: "brew:espresso",
     max_retries: 3,
     priority: 40
@@ -138,7 +148,7 @@ defmodule CoffeeShop.Jobs.EspressoShot do
 end
 
 defmodule CoffeeShop.Jobs.DeliverySync do
-  use Job,
+  use Bedrock.JobQueue.Job,
     topic: "delivery:sync",
     max_retries: 5
 
@@ -151,7 +161,7 @@ defmodule CoffeeShop.Jobs.DeliverySync do
 end
 
 defmodule CoffeeShop.Jobs.AdminCleanup do
-  use Job,
+  use Bedrock.JobQueue.Job,
     topic: "admin:cleanup",
     priority: 200
 
@@ -195,7 +205,7 @@ Start the consumer:
 <!-- livebook:{"reevaluate_automatically":true} -->
 
 ```elixir
-Kino.start_child!({JobQueue, concurrency: 2, batch_size: 5})
+Kino.start_child!({CoffeeShop.JobQueue, concurrency: 2, batch_size: 5})
 
 # Give it a moment to initialize
 Process.sleep(500)
@@ -207,7 +217,7 @@ Process.sleep(500)
 Let's enqueue our first job - an order confirmation:
 
 ```elixir
-{:ok, job} = JobQueue.enqueue("main_shop", "order:confirm",
+{:ok, job} = CoffeeShop.JobQueue.enqueue("main_shop", "order:confirm",
   %{order_id: "ORD-001", customer: "Alice"})
 
 IO.puts("Enqueued job: #{Base.encode16(job.id, case: :lower) |> binary_part(0, 8)}...")
@@ -234,12 +244,12 @@ Let's see priorities in action:
 # This ensures priority ordering is demonstrated correctly - otherwise
 # jobs get processed as they arrive (race between enqueue and consumer).
 
-Repo.transact(fn ->
-  JobQueue.enqueue("main_shop", "admin:cleanup",
+CoffeeShop.Repo.transact(fn ->
+  CoffeeShop.JobQueue.enqueue("main_shop", "admin:cleanup",
     %{task: "clear_old_orders"}, priority: 200)
-  JobQueue.enqueue("main_shop", "order:brewing",
+  CoffeeShop.JobQueue.enqueue("main_shop", "order:brewing",
     %{order_id: "ORD-002", drink: "Latte"}, priority: 50)
-  JobQueue.enqueue("main_shop", "order:ready",
+  CoffeeShop.JobQueue.enqueue("main_shop", "order:ready",
     %{order_id: "ORD-003", customer: "Bob"}, priority: 10)
 end)
 
@@ -257,7 +267,7 @@ Sometimes you want a job to run at a specific time:
 # Schedule a job for 2 seconds from now
 scheduled_time = DateTime.utc_now() |> DateTime.add(2, :second)
 
-{:ok, _} = JobQueue.enqueue("main_shop", "order:confirm",
+{:ok, _} = CoffeeShop.JobQueue.enqueue("main_shop", "order:confirm",
   %{order_id: "ORD-SCHEDULED", customer: "Charlie"},
   at: scheduled_time)
 
@@ -271,7 +281,7 @@ Or use a delay in milliseconds:
 
 ```elixir
 # Enqueue with a 1 second delay
-{:ok, _} = JobQueue.enqueue("main_shop", "order:confirm",
+{:ok, _} = CoffeeShop.JobQueue.enqueue("main_shop", "order:confirm",
   %{order_id: "ORD-DELAYED", customer: "Diana"},
   in: 1000)
 
@@ -286,10 +296,10 @@ Each coffee shop location can have its own queue, completely isolated:
 
 ```elixir
 # Different shops, different queues
-{:ok, _} = JobQueue.enqueue("downtown_shop", "order:confirm",
+{:ok, _} = CoffeeShop.JobQueue.enqueue("downtown_shop", "order:confirm",
   %{order_id: "DT-001", customer: "Eve"})
 
-{:ok, _} = JobQueue.enqueue("airport_kiosk", "order:confirm",
+{:ok, _} = CoffeeShop.JobQueue.enqueue("airport_kiosk", "order:confirm",
   %{order_id: "AP-001", customer: "Frank"})
 
 IO.puts("Enqueued to downtown_shop and airport_kiosk")
@@ -303,7 +313,7 @@ You can inspect queue status at any time:
 
 ```elixir
 for queue_id <- ["main_shop", "downtown_shop", "airport_kiosk"] do
-  stats = JobQueue.stats(queue_id)
+  stats = CoffeeShop.JobQueue.stats(queue_id)
   IO.puts("#{queue_id}: pending=#{stats.pending_count}, processing=#{stats.processing_count}")
 end
 
